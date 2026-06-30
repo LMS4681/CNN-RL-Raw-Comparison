@@ -2,6 +2,8 @@ import unittest
 from datetime import date
 from unittest.mock import patch
 
+import numpy as np
+
 import alloc_env.alloc_env as alloc_env_module
 from alloc_env.alloc_env import BlockPlacementEnv
 from alloc_env.block import Block
@@ -143,6 +145,41 @@ class RlRegressionTests(unittest.TestCase):
         self.assertFalse(terminated)
         self.assertEqual(1, len(env._workspaces[0].blocks))
         self.assertGreater(obs["grids"][0, 0].sum(), before)
+
+    def test_step_rerenders_only_changed_workspace_when_date_is_unchanged(self):
+        blocks = [
+            make_block("A001", date(2026, 1, 5)),
+            make_block("A002", date(2026, 1, 5)),
+        ]
+        ws_a = make_workspace()
+        ws_b = make_workspace()
+        ws_b.code = "PE002"
+        env = BlockPlacementEnv(
+            blocks,
+            [ws_a, ws_b],
+            BaseGridStrategy(step=10.0),
+            grid_size=32,
+        )
+
+        env.reset()
+        render_calls = []
+        original_render = env._renderer.render
+
+        def counting_render(ws, env_date, max_remaining_days=60):
+            render_calls.append(ws.code)
+            return original_render(ws, env_date, max_remaining_days)
+
+        env._renderer.render = counting_render
+
+        obs, _, terminated, _, _ = env.step(0)
+
+        self.assertFalse(terminated)
+        self.assertEqual(date(2026, 1, 5), env._env_date)
+        self.assertEqual(["PE001"], render_calls)
+        expected_grids = np.stack([
+            original_render(ws, env._env_date) for ws in env._workspaces
+        ], axis=0)
+        np.testing.assert_array_equal(obs["grids"], expected_grids)
 
     def test_step_moves_observation_date_to_next_block(self):
         blocks = [

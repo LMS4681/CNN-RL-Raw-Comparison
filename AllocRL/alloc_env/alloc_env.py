@@ -240,7 +240,7 @@ class BlockPlacementEnv(gym.Env):
         # 면적·스케일 재계산
         self._update_ws_areas()
 
-    def _sync_from_simulator(self) -> None:
+    def _sync_from_simulator(self, invalidate_grids: bool = True) -> None:
         """시뮬레이터의 실제 상태를 Env 관측 상태로 동기화합니다."""
         if self._placement_simulator is None:
             return
@@ -259,7 +259,46 @@ class BlockPlacementEnv(gym.Env):
             sum(b.length * b.breadth for b in ws.blocks)
             for ws in self._workspaces
         ], dtype=np.float32)
-        self._grid_cache.invalidate_all()
+        if invalidate_grids:
+            self._grid_cache.invalidate_all()
+
+    def _workspace_grid_signature(self, ws: Workspace, env_date: date) -> Tuple:
+        """Return the workspace state that affects occupancy-grid rendering."""
+        block_sig = tuple(
+            (
+                b.ref_x,
+                b.ref_y,
+                b.length,
+                b.breadth,
+                b.out_date,
+            )
+            for b in ws.blocks
+        )
+        preplaced_sig = tuple(
+            (
+                pp.label,
+                pp.pos_x,
+                pp.pos_y,
+                pp.length,
+                pp.breadth,
+                pp.end_date,
+            )
+            for pp in ws.get_active_pre_placements(env_date)
+        )
+        return (
+            ws.origin_x,
+            ws.origin_y,
+            ws.length,
+            ws.breadth,
+            block_sig,
+            preplaced_sig,
+        )
+
+    def _workspace_grid_signatures(self, env_date: date) -> List[Tuple]:
+        return [
+            self._workspace_grid_signature(ws, env_date)
+            for ws in self._workspaces
+        ]
 
     # ── reset / step ──────────────────────────────────────────────
 
@@ -317,8 +356,21 @@ class BlockPlacementEnv(gym.Env):
         if self._placement_simulator is None:
             raise RuntimeError("Environment must be reset before step().")
 
+        prev_env_date = self._env_date
+        prev_grid_signatures = self._workspace_grid_signatures(prev_env_date)
+
         step_result = self._placement_simulator.assign_current(action)
-        self._sync_from_simulator()
+        self._sync_from_simulator(invalidate_grids=False)
+
+        if self._env_date != prev_env_date:
+            self._grid_cache.invalidate_all()
+        else:
+            next_grid_signatures = self._workspace_grid_signatures(self._env_date)
+            for i, (before, after) in enumerate(
+                zip(prev_grid_signatures, next_grid_signatures)
+            ):
+                if before != after:
+                    self._grid_cache.invalidate(i)
 
         terminated = self._placement_simulator.is_done
         truncated = False
