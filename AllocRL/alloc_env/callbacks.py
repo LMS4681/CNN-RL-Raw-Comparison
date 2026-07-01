@@ -9,10 +9,11 @@ from __future__ import annotations
 import csv
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.logger import KVWriter
 
 from .simulator import SimulationResult
 
@@ -21,6 +22,79 @@ from .simulator import SimulationResult
 
 DELAY_THRESHOLD = 2
 DROPOUT_THRESHOLD = 7
+
+
+class TrainingMetricsCsvWriter(KVWriter):
+    """Write SB3 train/* loss metrics to loss_log.csv."""
+
+    METRIC_COLUMNS = [
+        ("train/policy_gradient_loss", "policy_gradient_loss"),
+        ("train/value_loss", "value_loss"),
+        ("train/entropy_loss", "entropy_loss"),
+        ("train/approx_kl", "approx_kl"),
+        ("train/clip_fraction", "clip_fraction"),
+        ("train/loss", "loss"),
+        ("train/explained_variance", "explained_variance"),
+    ]
+
+    def __init__(self, log_dir: str):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._csv_path = self.log_dir / "loss_log.csv"
+        self._csv_file = open(self._csv_path, "w", newline="", encoding="utf-8")
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow(
+            ["timestep"] + [column for _, column in self.METRIC_COLUMNS]
+        )
+
+    def write(
+        self,
+        key_values: Dict[str, Any],
+        key_excluded: Dict[str, tuple[str, ...]],
+        step: int = 0,
+    ) -> None:
+        if not any(key in key_values for key, _ in self.METRIC_COLUMNS):
+            return
+
+        row = [int(step)]
+        for key, _ in self.METRIC_COLUMNS:
+            value = key_values.get(key, "")
+            if isinstance(value, (int, float, np.number)):
+                row.append(f"{float(value):.6f}")
+            else:
+                row.append(value)
+        self._csv_writer.writerow(row)
+        self._csv_file.flush()
+
+    def close(self) -> None:
+        if not self._csv_file.closed:
+            self._csv_file.close()
+
+
+class TrainingMetricsCallback(BaseCallback):
+    """Attach TrainingMetricsCsvWriter after SB3 configures its logger."""
+
+    def __init__(self, log_dir: str = "./output", verbose: int = 1):
+        super().__init__(verbose)
+        self.log_dir = log_dir
+        self._writer: Optional[TrainingMetricsCsvWriter] = None
+
+    def _on_training_start(self) -> None:
+        self._writer = TrainingMetricsCsvWriter(self.log_dir)
+        self.model.logger.output_formats.append(self._writer)
+        if self.verbose:
+            print(f"[Callback] Loss CSV 로그: {Path(self.log_dir) / 'loss_log.csv'}")
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_training_end(self) -> None:
+        if self._writer is None:
+            return
+        self.model.logger.dump(step=self.num_timesteps)
+        if self._writer in self.model.logger.output_formats:
+            self.model.logger.output_formats.remove(self._writer)
+        self._writer.close()
 
 
 class AllocationCallback(BaseCallback):
@@ -171,4 +245,3 @@ class AllocationCallback(BaseCallback):
         if self.verbose:
             print(f"[Callback] 총 {self._episode_count} 에피소드 학습 완료")
             print(f"[Callback] CSV 로그 저장: {self._csv_path}")
-

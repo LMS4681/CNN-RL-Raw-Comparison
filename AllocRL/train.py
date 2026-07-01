@@ -66,7 +66,38 @@ def build_policy_kwargs(
     }
 
 
-def make_env(blocks, workspaces, strategy, use_synthetic=False, generator=None):
+def estimate_rollout_buffer_mb(
+    n_workspaces: int,
+    grid_size: int,
+    n_steps: int,
+    n_envs: int = 1,
+) -> float:
+    obs_bytes = (10 + n_workspaces * 3 * grid_size * grid_size + n_workspaces * 2) * 4
+    return obs_bytes * n_steps * n_envs / 1024 / 1024
+
+
+def resolve_vec_env_type(vec_env: str, n_envs: int) -> str:
+    if n_envs < 1:
+        raise ValueError("--n-envs must be at least 1")
+    if n_envs == 1:
+        return "single"
+    if vec_env == "auto":
+        return "dummy" if sys.platform == "win32" else "subproc"
+    if vec_env in {"dummy", "subproc"}:
+        return vec_env
+    raise ValueError(f"Unknown vec env type: {vec_env}")
+
+
+def make_env(
+    blocks,
+    workspaces,
+    strategy,
+    use_synthetic=False,
+    generator=None,
+    synthetic_n_blocks=None,
+    vary_layout=True,
+    grid_size=64,
+):
     """환경 팩토리 (SubprocVecEnv용)."""
     from alloc_env.alloc_env import BlockPlacementEnv
 
@@ -75,8 +106,45 @@ def make_env(blocks, workspaces, strategy, use_synthetic=False, generator=None):
             blocks, workspaces, strategy,
             use_synthetic=use_synthetic,
             generator=generator,
+            synthetic_n_blocks=synthetic_n_blocks,
+            vary_layout=vary_layout,
+            grid_size=grid_size,
         )
     return _init
+
+
+def create_training_env(
+    blocks,
+    workspaces,
+    strategy,
+    generator,
+    grid_size: int = 64,
+    n_envs: int = 1,
+    vec_env: str = "auto",
+):
+    """Create the training env, optionally vectorized for parallel rollout."""
+    from sb3_contrib.common.wrappers import ActionMasker
+    from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+
+    resolved_vec_env = resolve_vec_env_type(vec_env, n_envs)
+    env_kwargs = {
+        "blocks": blocks,
+        "workspaces": workspaces,
+        "strategy": strategy,
+        "use_synthetic": True,
+        "generator": generator,
+        "synthetic_n_blocks": len(blocks),
+        "vary_layout": True,
+        "grid_size": grid_size,
+    }
+
+    if resolved_vec_env == "single":
+        return ActionMasker(make_env(**env_kwargs)(), mask_fn)
+
+    env_fns = [make_env(**env_kwargs) for _ in range(n_envs)]
+    if resolved_vec_env == "dummy":
+        return DummyVecEnv(env_fns)
+    return SubprocVecEnv(env_fns)
 
 
 def create_evaluation_env(blocks, workspaces, strategy, grid_size: int = 64):
@@ -98,14 +166,12 @@ def create_evaluation_env(blocks, workspaces, strategy, grid_size: int = 64):
 def train(args):
     """MaskablePPO 학습 실행."""
     from sb3_contrib import MaskablePPO
-    from sb3_contrib.common.wrappers import ActionMasker
 
-    from alloc_env.alloc_env import BlockPlacementEnv
     from alloc_env.data_loader import (
         load_workspaces, load_blocks, apply_allowable_block_patterns,
     )
     from alloc_env.strategy import BaseGridStrategy
-    from alloc_env.callbacks import AllocationCallback
+    from alloc_env.callbacks import AllocationCallback, TrainingMetricsCallback
     from alloc_env.block_generator import SyntheticBlockGenerator
 
     data_dir = Path(args.data_dir)
@@ -130,24 +196,31 @@ def train(args):
     print("[Synthetic] CSV 분포 기반 블록 생성기 초기화 완료")
 
     # ── 3. 환경 생성 (학습: synthetic, 평가: CSV 원본) ────────────
-    env = BlockPlacementEnv(
-        blocks, workspaces, strategy,
-        use_synthetic=True,
-        generator=generator,
-        synthetic_n_blocks=len(blocks),
-        vary_layout=True,
+    env = create_training_env(
+        blocks,
+        workspaces,
+        strategy,
+        generator,
         grid_size=args.grid_size,
+        n_envs=args.n_envs,
+        vec_env=args.vec_env,
     )
-    env = ActionMasker(env, mask_fn)
+    resolved_vec_env = resolve_vec_env_type(args.vec_env, args.n_envs)
 
     # 메모리 사용량 예측
     N = len(workspaces)
     G = args.grid_size
-    obs_bytes = (10 + N * 3 * G * G + N * 2) * 4  # float32
-    buffer_mb = obs_bytes * args.n_steps / 1024 / 1024
+    buffer_mb = estimate_rollout_buffer_mb(N, G, args.n_steps, args.n_envs)
     print(f"Obs space: {env.observation_space}")
     print(f"Action space: {env.action_space}")
-    print(f"Rollout buffer 예상 메모리: {buffer_mb:.0f} MB (grid={G}×{G}, n_steps={args.n_steps})")
+    print(
+        f"Training envs: {args.n_envs} ({resolved_vec_env}), "
+        f"device={args.device}"
+    )
+    print(
+        f"Rollout buffer 예상 메모리: {buffer_mb:.0f} MB "
+        f"(grid={G}×{G}, n_steps={args.n_steps}, n_envs={args.n_envs})"
+    )
 
     # ── 3. 출력 디렉토리 사전 생성 ────────────────────────────────
     output_dir = Path(args.output_dir).resolve()
@@ -170,6 +243,7 @@ def train(args):
         model = MaskablePPO.load(
             str(resume_path),
             env=env,
+            device=args.device,
             tensorboard_log=str(output_dir / "tb_logs"),
         )
     else:
@@ -183,11 +257,15 @@ def train(args):
             n_epochs=args.n_epochs,
             gamma=args.gamma,
             policy_kwargs=policy_kwargs,
+            device=args.device,
             tensorboard_log=str(output_dir / "tb_logs"),
         )
 
     # ── 5. 콜백 설정 ──────────────────────────────────────────────
-    callback = AllocationCallback(log_dir=args.output_dir, verbose=1)
+    callback = [
+        AllocationCallback(log_dir=args.output_dir, verbose=1),
+        TrainingMetricsCallback(log_dir=args.output_dir, verbose=1),
+    ]
 
     # ── 6. 학습 ──────────────────────────────────────────────────
     print(f"\n학습 시작: {args.timesteps} timesteps")
@@ -350,6 +428,14 @@ def main():
                         help="pointer-attn token embedding dimension")
     parser.add_argument("--extractor-heads", type=int, default=4,
                         help="pointer-attn attention head count")
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda"],
+                        help="PyTorch device for policy training")
+    parser.add_argument("--n-envs", type=int, default=1,
+                        help="number of parallel training environments")
+    parser.add_argument("--vec-env", type=str, default="auto",
+                        choices=["auto", "dummy", "subproc"],
+                        help="vector env backend when --n-envs > 1")
     parser.add_argument("--resume-from", type=str, default=None,
                         help="이어 학습할 기존 SB3 모델 zip 경로")
     parser.add_argument("--export-onnx", action="store_true", default=True,
