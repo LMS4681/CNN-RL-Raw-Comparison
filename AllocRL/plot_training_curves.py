@@ -37,7 +37,7 @@ def _plot_reward(ax, reward_df: pd.DataFrame, smooth_window: int) -> None:
             va="center",
             transform=ax.transAxes,
         )
-        ax.set_title("Cumulative Reward")
+        ax.set_title("Reward")
         ax.set_xlabel("Timestep")
         ax.set_ylabel("Reward")
         ax.grid(True, alpha=0.3)
@@ -49,12 +49,15 @@ def _plot_reward(ax, reward_df: pd.DataFrame, smooth_window: int) -> None:
     x = _to_numeric(reward_df, x_col)
     y = _to_numeric(reward_df, y_col)
     ax.plot(x, y, label=y_col, linewidth=1.5)
+    if "reward" in reward_df.columns and y_col != "reward":
+        terminal = _to_numeric(reward_df, "reward")
+        ax.plot(x, terminal, label="terminal_reward", linewidth=1.2, alpha=0.75)
 
     if smooth_window > 1 and len(y) >= smooth_window:
         smoothed = y.rolling(smooth_window, min_periods=1).mean()
         ax.plot(x, smoothed, label=f"{smooth_window}-episode mean", linewidth=2.0)
 
-    ax.set_title("Cumulative Reward")
+    ax.set_title("Reward")
     ax.set_xlabel("Timestep")
     ax.set_ylabel("Reward")
     ax.grid(True, alpha=0.3)
@@ -108,6 +111,87 @@ def _plot_loss(ax, loss_df: pd.DataFrame, smooth_window: int) -> None:
         ax.legend()
 
 
+def _plot_success_rate(ax, reward_df: pd.DataFrame, smooth_window: int) -> None:
+    if reward_df.empty or "success_rate" not in reward_df.columns:
+        ax.text(
+            0.5,
+            0.5,
+            "success_rate is not available yet",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_title("Success Rate")
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("Success Rate")
+        ax.grid(True, alpha=0.3)
+        return
+
+    x_col = "timestep" if "timestep" in reward_df.columns else "episode"
+    x = _to_numeric(reward_df, x_col)
+    y = _to_numeric(reward_df, "success_rate")
+    ax.plot(x, y, label="success_rate", linewidth=1.5)
+    if smooth_window > 1 and len(y) >= smooth_window:
+        ax.plot(
+            x,
+            y.rolling(smooth_window, min_periods=1).mean(),
+            label=f"{smooth_window}-episode mean",
+            linewidth=2.0,
+        )
+    ax.set_title("Success Rate")
+    ax.set_xlabel("Timestep")
+    ax.set_ylabel("Rate")
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+
+def _plot_delay_dropout(ax, reward_df: pd.DataFrame, smooth_window: int) -> None:
+    if reward_df.empty:
+        ax.text(
+            0.5,
+            0.5,
+            "delay/dropout metrics are not available yet",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_title("Delay and Dropout")
+        ax.set_xlabel("Timestep")
+        ax.set_ylabel("Block Count")
+        ax.grid(True, alpha=0.3)
+        return
+
+    x_col = "timestep" if "timestep" in reward_df.columns else "episode"
+    x = _to_numeric(reward_df, x_col)
+    plotted = False
+    for column in ["delayed_count", "dropout_count"]:
+        if column not in reward_df.columns:
+            continue
+        y = _to_numeric(reward_df, column)
+        if smooth_window > 1 and len(y) >= smooth_window:
+            y = y.rolling(smooth_window, min_periods=1).mean()
+        ax.plot(x, y, label=column, linewidth=1.5)
+        plotted = True
+
+    if not plotted:
+        ax.text(
+            0.5,
+            0.5,
+            "No delay/dropout columns found",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+
+    ax.set_title("Delay and Dropout")
+    ax.set_xlabel("Timestep")
+    ax.set_ylabel("Block Count")
+    ax.grid(True, alpha=0.3)
+    if plotted:
+        ax.legend()
+
+
 def plot_training_curves(
     output_dir: str | Path = "./output",
     reward_smooth_window: int = 10,
@@ -122,9 +206,12 @@ def plot_training_curves(
     reward_df = _read_csv(output_dir / "training_log.csv", required=True)
     loss_df = _read_csv(output_dir / "loss_log.csv", required=False)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
-    _plot_reward(axes[0], reward_df, reward_smooth_window)
-    _plot_loss(axes[1], loss_df, loss_smooth_window)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    flat_axes = axes.ravel()
+    _plot_reward(flat_axes[0], reward_df, reward_smooth_window)
+    _plot_loss(flat_axes[1], loss_df, loss_smooth_window)
+    _plot_success_rate(flat_axes[2], reward_df, reward_smooth_window)
+    _plot_delay_dropout(flat_axes[3], reward_df, reward_smooth_window)
     fig.tight_layout()
 
     if save_path is not None:

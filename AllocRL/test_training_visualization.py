@@ -51,7 +51,7 @@ class TrainingVisualizationTests(unittest.TestCase):
 
         self.assertEqual([], rows)
 
-    def test_plot_training_curves_creates_reward_and_loss_axes(self):
+    def test_plot_training_curves_creates_quality_axes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
             with open(output_dir / "training_log.csv", "w", newline="", encoding="utf-8") as f:
@@ -74,11 +74,15 @@ class TrainingVisualizationTests(unittest.TestCase):
 
             fig = plot_training_curves(output_dir, show=False)
 
-        self.assertEqual(2, len(fig.axes))
-        self.assertEqual("Cumulative Reward", fig.axes[0].get_title())
+        self.assertEqual(4, len(fig.axes))
+        self.assertEqual("Reward", fig.axes[0].get_title())
         self.assertEqual("Training Loss", fig.axes[1].get_title())
+        self.assertEqual("Success Rate", fig.axes[2].get_title())
+        self.assertEqual("Delay and Dropout", fig.axes[3].get_title())
         self.assertGreaterEqual(len(fig.axes[0].lines), 1)
         self.assertGreaterEqual(len(fig.axes[1].lines), 1)
+        self.assertGreaterEqual(len(fig.axes[2].lines), 1)
+        self.assertGreaterEqual(len(fig.axes[3].lines), 2)
 
     def test_plot_training_curves_explains_empty_reward_log(self):
         with tempfile.TemporaryDirectory() as tmpdir:
