@@ -159,6 +159,20 @@ class SafetyAndWorkspaceLimitTests(unittest.TestCase):
 
         self.assertIn("overlap", {item["type"] for item in violations})
 
+    def test_visualization_prefers_target_workspace_name_over_code(self):
+        workspace = Workspace(
+            code="PE001",
+            origin_x=0.0,
+            origin_y=0.0,
+            breadth=100.0,
+            length=100.0,
+            name="target1",
+            strategy=BaseGridStrategy(step=10.0),
+        )
+        module = _load_visualize_eval_without_matplotlib()
+
+        self.assertEqual("target1", module._workspace_display_name(workspace))
+
     def test_load_workspaces_limits_to_seven_and_renames_targets(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -199,6 +213,11 @@ class SafetyAndWorkspaceLimitTests(unittest.TestCase):
 
 
 def _find_placement_violations_without_matplotlib(result: SimulationResult):
+    module = _load_visualize_eval_without_matplotlib()
+    return module.find_placement_violations(result)
+
+
+def _load_visualize_eval_without_matplotlib():
     old_modules = {
         "matplotlib": sys.modules.get("matplotlib"),
         "matplotlib.pyplot": sys.modules.get("matplotlib.pyplot"),
@@ -214,8 +233,7 @@ def _find_placement_violations_without_matplotlib(result: SimulationResult):
     sys.modules["numpy"] = fake_numpy
     sys.modules.pop("visualize_eval_placement", None)
     try:
-        module = importlib.import_module("visualize_eval_placement")
-        return module.find_placement_violations(result)
+        return importlib.import_module("visualize_eval_placement")
     finally:
         sys.modules.pop("visualize_eval_placement", None)
         for name, module in old_modules.items():

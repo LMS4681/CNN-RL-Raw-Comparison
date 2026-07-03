@@ -97,6 +97,10 @@ def _workspace_contains(ws: Workspace, bounds: tuple[float, float, float, float]
     )
 
 
+def _workspace_display_name(ws: Workspace) -> str:
+    return ws.name or ws.code
+
+
 def _iter_dates(start: date, end: date, stride: int = 1) -> Iterable[date]:
     stride = max(1, stride)
     current = start
@@ -265,7 +269,7 @@ def _plot_workspace_frame(result: SimulationResult, env_date: date, save_path: P
             blocks_by_workspace.setdefault(block.workspace_code, []).append(block)
 
     for ax, ws in zip(axes_list, workspaces):
-        ax.set_title(ws.code, fontsize=9)
+        ax.set_title(_workspace_display_name(ws), fontsize=9)
         ax.set_xlim(ws.origin_x, ws.origin_x + ws.length)
         ax.set_ylim(ws.origin_y, ws.origin_y + ws.breadth)
         ax.set_aspect("equal", adjustable="box")
