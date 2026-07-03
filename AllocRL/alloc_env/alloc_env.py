@@ -5,7 +5,7 @@
 - Obs:     Dict {
               "block":   블록 속성 + 시간 + 스케일 정보,
               "grids":   작업장별 3채널 점유 그리드 (N, 3, 128, 128),
-              "ws_meta": 작업장별 메타데이터 (N, 2),
+              "ws_meta": 작업장별 메타데이터 (N, 3),
            }
 - Reward:  Terminal + shaped reward (즉시 배치 가능성 + 부분 replay)
 - Mask:    하드 제약 위반 작업장 마스킹 (sb3-contrib MaskablePPO 호환)
@@ -52,6 +52,10 @@ SHAPING_PLACEMENT_FAILURE = -0.002
 PARTIAL_REPLAY_WEIGHT = 0.1
 PARTIAL_REPLAY_INTERVAL = 8
 
+# 입고 긴급도 정규화 기준. SyntheticBlockGenerator.generate(spread_days=)의
+# 기본값과 일치시켜야 관측 semantics가 일관됩니다.
+DEFAULT_SYNTHETIC_SPREAD_DAYS = 60
+
 
 class BlockPlacementEnv(gym.Env):
     """
@@ -70,7 +74,7 @@ class BlockPlacementEnv(gym.Env):
     Observation: Dict
       "block"  : (10,)           - 블록 물리 속성 5 + 시간 3 + 진행률 + 블록 스케일
       "grids"  : (N, 3, 128, 128) - 작업장별 3채널 점유 그리드
-      "ws_meta": (N, 2)          - 작업장별 (scale, occupancy_ratio)
+      "ws_meta": (N, 3)          - 작업장별 (scale, occupancy_ratio, placeable_now)
 
     use_synthetic=True일 때 매 에피소드마다 랜덤 블록 + 레이아웃 변형.
     """
@@ -147,12 +151,12 @@ class BlockPlacementEnv(gym.Env):
             ),
             "ws_meta": spaces.Box(
                 low=0.0, high=1.0,
-                shape=(N, 2), dtype=np.float32
+                shape=(N, 3), dtype=np.float32
             ),
         })
 
         # ── 정규화 상수 ───────────────────────────────────────────
-        self._update_norm_constants()
+        self._init_norm_constants()
         self._update_ws_areas()
 
         # ── 에피소드 상태 ─────────────────────────────────────────
@@ -170,26 +174,47 @@ class BlockPlacementEnv(gym.Env):
 
     # ── 정규화 상수 갱신 ──────────────────────────────────────────
 
-    def _update_norm_constants(self):
-        """블록 속성 및 시간 정규화 상수 갱신."""
-        blocks = self._blocks
-        self._max_length  = max((b.length  for b in blocks), default=1.0) or 1.0
-        self._max_breadth = max((b.breadth for b in blocks), default=1.0) or 1.0
-        self._max_height  = max((b.height  for b in blocks), default=1.0) or 1.0
-        self._max_weight  = max((b.weight  for b in blocks), default=1.0) or 1.0
-        self._max_duration = max(
-            (b.original_duration for b in blocks), default=1
-        ) or 1
+    def _init_norm_constants(self):
+        """
+        블록 속성·시간 정규화 상수를 '고정값'으로 1회 계산합니다.
 
-        # 입고일 분산 범위 (긴급도 정규화에 사용)
-        if blocks:
-            min_in = min(b.in_date for b in blocks)
-            max_in = max(b.in_date for b in blocks)
-            self._base_date = min_in
-            self._date_spread = max((max_in - min_in).days, 1)
+        synthetic 모드에서 매 에피소드 max(...)를 재계산하면, 동일한 물리
+        블록이 에피소드마다 다른 정규화 값을 갖게 되어(관측 semantics 드리프트)
+        정책·가치 함수 학습이 불안정해집니다. 따라서 안정적인 기준
+        (생성기 분포 상한 또는 원본 블록 최댓값)에서 상수를 한 번만 구합니다.
+        """
+        gen = self._generator
+        if self._use_synthetic and gen is not None:
+            dist = gen.dist
+            self._max_length  = max(float(dist.length.high), 1.0)
+            self._max_breadth = max(float(dist.breadth.high), 1.0)
+            self._max_height  = max(float(dist.height.high), 1.0)
+            self._max_weight  = max(float(dist.weight.high), 1.0)
+            # duration_days는 달력일 분포. 생성기는 근무일 공기를
+            # working_dur ≈ dur*0.7 (최소 2)로 만든다(block_generator.generate).
+            self._max_duration = max(int(dist.duration_days.high * 0.7), 1)
+            # 입고 긴급도 기준: synthetic base_date와 생성기 분산 범위
+            self._base_date = self._synthetic_base_date
+            self._date_spread = max(DEFAULT_SYNTHETIC_SPREAD_DAYS, 1)
         else:
-            self._base_date = date(2026, 4, 1)
-            self._date_spread = 1
+            blocks = self._original_blocks
+            self._max_length  = max((b.length  for b in blocks), default=1.0) or 1.0
+            self._max_breadth = max((b.breadth for b in blocks), default=1.0) or 1.0
+            self._max_height  = max((b.height  for b in blocks), default=1.0) or 1.0
+            self._max_weight  = max((b.weight  for b in blocks), default=1.0) or 1.0
+            self._max_duration = max(
+                (b.original_duration for b in blocks), default=1
+            ) or 1
+
+            # 입고일 분산 범위 (긴급도 정규화에 사용)
+            if blocks:
+                min_in = min(b.in_date for b in blocks)
+                max_in = max(b.in_date for b in blocks)
+                self._base_date = min_in
+                self._date_spread = max((max_in - min_in).days, 1)
+            else:
+                self._base_date = date(2026, 4, 1)
+                self._date_spread = 1
 
     def _update_ws_areas(self):
         """작업장 면적 및 스케일 정보 갱신."""
@@ -308,13 +333,13 @@ class BlockPlacementEnv(gym.Env):
         super().reset(seed=seed)
 
         # ── Synthetic 모드: 매 에피소드마다 새 블록 + 레이아웃 ────
+        # 정규화 상수는 __init__에서 고정 계산됨(에피소드 간 관측 일관성).
         if self._use_synthetic and self._generator:
             self._blocks = self._generator.generate(
                 self._synthetic_n_blocks,
                 self._synthetic_base_date,
             )
             self._num_blocks = len(self._blocks)
-            self._update_norm_constants()
             self._rebuild_workspaces()
             self._picker = ValidWorkspacePicker(
                 self._blocks, self._workspaces, self._constraints
@@ -322,7 +347,6 @@ class BlockPlacementEnv(gym.Env):
         else:
             self._blocks = [b.clone() for b in self._original_blocks]
             self._num_blocks = len(self._blocks)
-            self._update_norm_constants()
             self._rebuild_workspaces()
             self._picker = ValidWorkspacePicker(
                 self._blocks, self._workspaces, self._constraints
@@ -339,6 +363,7 @@ class BlockPlacementEnv(gym.Env):
             self._blocks,
             self._workspaces,
             DROPOUT_THRESHOLD,
+            infeasible_indices=self._picker.get_infeasible_blocks(),
         )
         self._sync_from_simulator()
 
@@ -486,6 +511,40 @@ class BlockPlacementEnv(gym.Env):
 
     # ── 관측 헬퍼 ────────────────────────────────────────────────
 
+    def _compute_placeability(self, blk: Block) -> np.ndarray:
+        """
+        현재 블록을 각 작업장에 'env_date 기준 지금' 즉시 배치할 수 있는지 여부.
+
+        시뮬레이터가 실제 배치에 쓰는 strategy.determine_position을 그대로 호출하므로
+        즉시 배치 성공을 정확히 예측한다(90° 회전 재시도 포함). 하드 제약(치수/패턴)에
+        걸리는 작업장은 계산을 건너뛰고 0으로 둔다.
+
+        이 신호는 '피처'이지 '마스크'가 아니다 — 지금 꽉 차 있어도 나중에 블록이
+        출고되어 자리가 나길 기다리는 전략이 유효하므로 하드 마스킹하지 않는다.
+
+        성능: 결정마다 최대 N번의 determine_position 탐색이 든다. 빈 작업장은 즉시
+        반환되어 저렴하지만 꽉 찬 작업장은 탐색을 소진한다(백로그 D의 캐싱 대상).
+        """
+        n = self._num_workspaces
+        placeable = np.zeros(n, dtype=np.float32)
+        if self._current_block_index is None:
+            return placeable
+
+        mask = self.action_masks()  # 하드 제약(치수/패턴) 통과 여부
+        env_date = self._env_date
+        for i, ws in enumerate(self._workspaces):
+            if not mask[i]:
+                continue  # 치수/패턴상 애초에 배치 불가 → 0
+            pos = ws.determine_placement_position(blk, env_date)
+            if pos is None:
+                # 시뮬레이터와 동일하게 90° 회전 후 재시도
+                blk.turn()
+                pos = ws.determine_placement_position(blk, env_date)
+                blk.turn()  # 원래 방향 복원 (turn은 자기 역연산)
+            if pos is not None:
+                placeable[i] = 1.0
+        return placeable
+
     def _get_obs(self) -> Dict[str, np.ndarray]:
         """
         Dict 관측 구성.
@@ -497,7 +556,7 @@ class BlockPlacementEnv(gym.Env):
           [3]  중량 / max_weight
           [4]  공기(근무일) / max_duration
           [5]  입고 긴급도               시간/진행 정보
-          [6]  공기 여유도
+          [6]  블록 종횡비 (min/max)      형상 정보 (회전 적합성)
           [7]  진행률
           [8]  현재 블록 면적 스케일      (블록 면적 / 최대 작업장 면적)
           [9]  현재 블록 최대 축 비율     (max(L,B) / 최대 작업장 축)
@@ -507,9 +566,10 @@ class BlockPlacementEnv(gym.Env):
           Ch1: 잔여 출고 공기 (정규화)
           Ch2: 작업장 경계 마스크
 
-        "ws_meta" (N, 2):
+        "ws_meta" (N, 3):
           [0] scale (1px당 m, 정규화)
           [1] occupancy_ratio (면적 점유율)
+          [2] placeable_now (현재 env_date에 즉시 배치 가능하면 1, 아니면 0)
         """
         if self._current_block_index is None:
             return self._get_terminal_obs()
@@ -528,8 +588,8 @@ class BlockPlacementEnv(gym.Env):
                 (blk.in_date - self._base_date).days / self._date_spread,
                 0.0, 1.0
             ),
-            # 공기 여유도
-            blk.original_duration / self._max_duration,
+            # 블록 종횡비 (min/max) — 정사각(≈1)인지 길쭉한지, 회전 적합성 판단
+            min(blk.length, blk.breadth) / max(blk.length, blk.breadth, 1e-6),
             # 진행률
             self._current_step / max(self._num_blocks - 1, 1),
             # 블록 면적 스케일 (최대 작업장 대비)
@@ -554,11 +614,12 @@ class BlockPlacementEnv(gym.Env):
             self._workspaces, self._env_date
         )
 
-        # ── Workspace meta (N, 2) ────────────────────────────────
+        # ── Workspace meta (N, 3) ────────────────────────────────
         occupancy = np.clip(
             self._ws_used_area / self._ws_areas, 0.0, 1.0
         )
-        ws_meta = np.stack([self._ws_scales, occupancy], axis=1)
+        placeable = self._compute_placeability(blk)
+        ws_meta = np.stack([self._ws_scales, occupancy, placeable], axis=1)
 
         return {
             "block": block_features,
@@ -573,7 +634,7 @@ class BlockPlacementEnv(gym.Env):
         return {
             "block": np.zeros(10, dtype=np.float32),
             "grids": np.zeros((N, 3, G, G), dtype=np.float32),
-            "ws_meta": np.zeros((N, 2), dtype=np.float32),
+            "ws_meta": np.zeros((N, 3), dtype=np.float32),
         }
 
     def _get_info(self) -> Dict[str, Any]:

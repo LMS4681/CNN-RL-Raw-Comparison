@@ -8,8 +8,13 @@ import alloc_env.alloc_env as alloc_env_module
 from alloc_env.alloc_env import BlockPlacementEnv
 from alloc_env.block import Block
 from alloc_env.data_loader import apply_allowable_block_patterns
+from alloc_env.constraints import (
+    BlockPatternConstraint,
+    DimensionConstraint,
+    ValidWorkspacePicker,
+)
 from alloc_env.incremental_simulator import IncrementalPlacementSimulator
-from alloc_env.simulator import PlacementSimulator
+from alloc_env.simulator import PlacementSimulator, SimulationResult
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import Workspace
 from train import create_evaluation_env
@@ -99,6 +104,53 @@ class RlRegressionTests(unittest.TestCase):
             [b.workspace_code for b in result.blocks],
         )
 
+    def test_infeasible_block_is_auto_dropped_and_never_presented(self):
+        """어느 작업장에도 배치 불가한 블록은 agent에 제시되지 않고 즉시 탈락.
+
+        이 가드가 없으면 action_masks()가 전부 False가 되어 MaskablePPO가
+        불안정해진다(전-마스킹). infeasible 블록은 도착일에 DROPOUT 처리되며,
+        agent에게 제시되는 모든 블록은 유효 작업장이 최소 1개 있어야 한다.
+        """
+        # 유일한 작업장은 30x30, OVERSIZE 블록은 50x50 → 회전해도 배치 불가.
+        workspaces = [make_sized_workspace(30.0, 30.0)]
+        blocks = [
+            make_sized_block("OK1", date(2026, 1, 5), date(2026, 1, 30), 10.0, 10.0),
+            make_sized_block("OVERSIZE", date(2026, 1, 6), date(2026, 1, 30), 50.0, 50.0),
+            make_sized_block("OK2", date(2026, 1, 7), date(2026, 1, 30), 10.0, 10.0),
+        ]
+        picker = ValidWorkspacePicker(
+            blocks, workspaces,
+            [DimensionConstraint(), BlockPatternConstraint()],
+        )
+        infeasible = set(picker.get_infeasible_blocks())
+        self.assertEqual(infeasible, {1})
+
+        assignments = [0, 0, 0]
+        sim = IncrementalPlacementSimulator(
+            blocks, workspaces, dropout_threshold=7,
+            infeasible_indices=infeasible,
+        )
+        presented = []
+        while not sim.is_done:
+            idx = sim.current_block_index
+            presented.append(idx)
+            # 제시되는 모든 블록은 유효 작업장이 최소 1개 있어야 한다.
+            self.assertTrue(any(picker.get_action_mask(idx, len(workspaces))))
+            sim.assign_current(assignments[idx])
+
+        # 배치 불가 블록은 결코 결정 지점으로 제시되지 않는다.
+        self.assertNotIn(1, presented)
+        self.assertEqual(presented, [0, 2])
+
+        result = sim.result()
+        self.assertEqual(result.delay_days[1], SimulationResult.DROPOUT)
+
+        # incremental과 batch replay가 동일 assignment에서 같은 결과(둘 다 DROPOUT).
+        batch = PlacementSimulator().replay(
+            blocks, workspaces, assignments, dropout_threshold=7
+        )
+        self.assertEqual(batch.delay_days, result.delay_days)
+
     def test_env_requests_blocks_in_simulator_due_order(self):
         later = make_sized_block(
             "LATER",
@@ -125,6 +177,27 @@ class RlRegressionTests(unittest.TestCase):
 
         self.assertEqual(1, env._current_block_index)
         self.assertEqual(0.5, obs["block"][0])
+
+    def test_ws_meta_exposes_placeability_column(self):
+        # B2: ws_meta는 (N, 3) = [scale, occupancy_ratio, placeable_now].
+        blocks = [
+            make_block("A001", date(2026, 1, 5)),
+            make_block("A002", date(2026, 1, 6)),
+        ]
+        env = BlockPlacementEnv(
+            blocks,
+            [make_workspace()],
+            BaseGridStrategy(step=10.0),
+            grid_size=32,
+        )
+        obs, _ = env.reset()
+
+        self.assertEqual(obs["ws_meta"].shape, (1, 3))
+        placeable = obs["ws_meta"][:, 2]
+        # 이진 신호(0/1)여야 한다.
+        self.assertTrue(bool(((placeable == 0.0) | (placeable == 1.0)).all()))
+        # 빈 100x100 작업장에 10x10 블록은 즉시 배치 가능 → 1.
+        self.assertEqual(obs["ws_meta"][0, 2], 1.0)
 
     def test_step_updates_simulator_workspace_and_cnn_grid(self):
         blocks = [

@@ -108,14 +108,14 @@ check("SharedCNN output shape", out.shape == (2, 64), f"got {out.shape}")
 obs_space = spaces.Dict({
     "block": spaces.Box(0, 1, shape=(10,), dtype=np.float32),
     "grids": spaces.Box(0, 1, shape=(N, 3, G, G), dtype=np.float32),
-    "ws_meta": spaces.Box(0, 1, shape=(N, 2), dtype=np.float32),
+    "ws_meta": spaces.Box(0, 1, shape=(N, 3), dtype=np.float32),
 })
 
 extractor = OccupancyCnnExtractor(obs_space, features_dim=256, cnn_out_dim=64)
 dummy_obs = {
     "block": torch.randn(1, 10),
     "grids": torch.randn(1, N, 3, G, G),
-    "ws_meta": torch.randn(1, N, 2),
+    "ws_meta": torch.randn(1, N, 3),
 }
 feat = extractor(dummy_obs)
 check("Extractor output shape", feat.shape == (1, 256), f"got {feat.shape}")
@@ -167,7 +167,7 @@ check("obs['grids'] shape",
       obs["grids"].shape == (N, 3, G, G),
       f"got {obs['grids'].shape}")
 check("obs['ws_meta'] shape",
-      obs["ws_meta"].shape == (N, 2),
+      obs["ws_meta"].shape == (N, 3),
       f"got {obs['ws_meta'].shape}")
 check("obs 값 범위 [0,1]",
       obs["block"].min() >= -0.01 and obs["block"].max() <= 1.01)

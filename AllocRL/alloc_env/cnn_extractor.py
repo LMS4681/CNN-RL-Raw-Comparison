@@ -6,7 +6,7 @@ SB3 MultiInputPolicy와 호환되는 커스텀 Feature Extractor.
 구조:
   obs["block"]   → MLP      → block_feat   (64,)
   obs["grids"]   → SharedCNN → ws_cnn_feats (N × cnn_out_dim)
-  obs["ws_meta"] → Flatten   → ws_meta_flat (N × 2)
+  obs["ws_meta"] → Flatten   → ws_meta_flat (N × 3)
 
   concat → FusionLinear → features_dim (256)
 
@@ -107,7 +107,7 @@ class OccupancyCnnExtractor(BaseFeaturesExtractor):
     관측 공간 구조:
       "block"   : Box(block_dim,)            ← 블록 속성 + 시간 + 스케일
       "grids"   : Box(N, 3, 128, 128)        ← 작업장별 3채널 그리드
-      "ws_meta" : Box(N, 2)                  ← 작업장별 (scale, occupancy_ratio)
+      "ws_meta" : Box(N, 3)                  ← 작업장별 (scale, occupancy_ratio, placeable_now)
     """
 
     def __init__(
@@ -141,7 +141,7 @@ class OccupancyCnnExtractor(BaseFeaturesExtractor):
         )
 
         # ── Fusion Layer ──────────────────────────────────────────
-        # block_feat(64) + ws_cnn(N*cnn_out_dim) + ws_meta(N*2)
+        # block_feat(64) + ws_cnn(N*cnn_out_dim) + ws_meta(N*3)
         fusion_in = 64 + n_workspaces * cnn_out_dim + ws_meta_dim
         self.fusion = nn.Sequential(
             nn.Linear(fusion_in, features_dim),

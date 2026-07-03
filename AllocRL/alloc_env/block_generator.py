@@ -121,6 +121,11 @@ class SyntheticBlockGenerator:
         self._rng = np.random.default_rng(seed)
         self._block_counter = 0
 
+    @property
+    def dist(self) -> BlockDistribution:
+        """블록 속성 분포(정규화 상수 등 외부 참조용)."""
+        return self._dist
+
     @classmethod
     def from_csv(cls, csv_path: str, seed: Optional[int] = None):
         """CSV 파일의 분포를 학습하여 생성기 초기화."""

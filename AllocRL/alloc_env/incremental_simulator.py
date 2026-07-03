@@ -37,10 +37,15 @@ class IncrementalPlacementSimulator:
         original_blocks: List[Block],
         original_workspaces: List[Workspace],
         dropout_threshold: int,
+        infeasible_indices: Optional[set] = None,
     ):
         self._original_blocks = original_blocks
         self._original_workspaces = original_workspaces
         self._dropout_threshold = dropout_threshold
+        # 어느 작업장에도 하드 제약상 배치 불가한 블록 인덱스.
+        # 이런 블록은 agent에 묻지 않고(action mask가 전부 False가 되는 것을
+        # 방지) 도착일에 즉시 탈락 처리한다.
+        self._infeasible: set = set(infeasible_indices or ())
 
         self.blocks: List[Block] = []
         self.workspaces: List[Workspace] = []
@@ -57,11 +62,14 @@ class IncrementalPlacementSimulator:
         self,
         original_blocks: Optional[List[Block]] = None,
         original_workspaces: Optional[List[Workspace]] = None,
+        infeasible_indices: Optional[set] = None,
     ) -> None:
         if original_blocks is not None:
             self._original_blocks = original_blocks
         if original_workspaces is not None:
             self._original_workspaces = original_workspaces
+        if infeasible_indices is not None:
+            self._infeasible = set(infeasible_indices)
 
         self.blocks = [b.clone() for b in self._original_blocks]
         self.workspaces = Workspace.deep_copy_list(self._original_workspaces)
@@ -142,6 +150,18 @@ class IncrementalPlacementSimulator:
                     continue
 
                 if self.assignments[idx] is None:
+                    # 배치 가능한 작업장이 하나도 없는 블록은 agent에 묻지 않고
+                    # 즉시 탈락 처리한다(action mask가 전부 False가 되는 것을 방지).
+                    if idx in self._infeasible:
+                        self.delay_days[idx] = SimulationResult.DROPOUT
+                        self.pending.discard(idx)
+                        self.last_internal_results.append(
+                            PlacementStepResult(
+                                idx, -1, placed=False, delayed=False,
+                                dropped=True, delay_days=SimulationResult.DROPOUT,
+                            )
+                        )
+                        continue
                     self.current_block_index = idx
                     return
 

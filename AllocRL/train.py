@@ -72,7 +72,7 @@ def estimate_rollout_buffer_mb(
     n_steps: int,
     n_envs: int = 1,
 ) -> float:
-    obs_bytes = (10 + n_workspaces * 3 * grid_size * grid_size + n_workspaces * 2) * 4
+    obs_bytes = (10 + n_workspaces * 3 * grid_size * grid_size + n_workspaces * 3) * 4
     return obs_bytes * n_steps * n_envs / 1024 / 1024
 
 

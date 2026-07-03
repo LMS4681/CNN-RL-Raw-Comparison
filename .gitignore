@@ -40,7 +40,9 @@ venv/
 env/
 
 # AllocRL generated artifacts
+AllocRL/.claude/
 AllocRL/output/
+AllocRL/output*/
 AllocRL/tb_logs/
 AllocRL/runs/
 AllocRL/**/training_log.csv
