@@ -15,7 +15,11 @@ from alloc_env.simulator import SimulationResult
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import Workspace
 from diagnose_synthetic_data import build_diagnostic_report, write_diagnostic_report
-from visualize_eval_placement import export_evaluation_visualization, find_placement_violations
+from visualize_eval_placement import (
+    block_plot_label,
+    export_evaluation_visualization,
+    find_placement_violations,
+)
 
 
 def make_block(
@@ -98,6 +102,14 @@ class DiagnosticsAndPlacementVisualizationTests(unittest.TestCase):
                 rows = list(csv.DictReader(f))
 
         self.assertEqual({"csv", "synthetic"}, {row["dataset"] for row in rows})
+
+    def test_block_plot_label_includes_placement_dates(self):
+        block = make_block("A001")
+
+        self.assertEqual(
+            "A001\n2026-01-05~2026-01-10",
+            block_plot_label(block),
+        )
 
     def test_find_placement_violations_detects_bounds_and_overlap(self):
         workspace = make_workspace()

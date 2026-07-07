@@ -109,6 +109,10 @@ def _workspace_display_name(ws: Workspace) -> str:
     return ws.name or ws.code
 
 
+def block_plot_label(block: Block) -> str:
+    return f"{block.name}\n{block.in_date.isoformat()}~{block.out_date.isoformat()}"
+
+
 def _iter_dates(start: date, end: date, stride: int = 1) -> Iterable[date]:
     stride = max(1, stride)
     current = start
@@ -341,10 +345,10 @@ def _plot_workspace_frame(
             ax.text(
                 block.ref_x,
                 block.ref_y,
-                block.name,
+                block_plot_label(block),
                 ha="center",
                 va="center",
-                fontsize=5,
+                fontsize=4,
                 color="white",
             )
 
