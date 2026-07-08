@@ -204,6 +204,113 @@ def create_evaluation_env(
     return ActionMasker(env, mask_fn)
 
 
+# ── 체크포인트 / 자동 이어학습 유틸 ─────────────────────────────────
+
+# 관측 공간·네트워크 구조에 영향을 주는 키. 이어학습하려면 이 값들이 모두 같아야 한다.
+ARCH_CONFIG_KEYS = (
+    "extractor",
+    "n_future_blocks",
+    "grid_size",
+    "features_dim",
+    "cnn_out_dim",
+    "extractor_embed_dim",
+    "extractor_heads",
+    "active_workspace_codes",
+)
+
+
+def current_run_config(args, active_workspace_codes) -> dict:
+    return {
+        "extractor": args.extractor,
+        "n_future_blocks": args.n_future_blocks,
+        "grid_size": args.grid_size,
+        "features_dim": args.features_dim,
+        "cnn_out_dim": args.cnn_out_dim,
+        "extractor_embed_dim": args.extractor_embed_dim,
+        "extractor_heads": args.extractor_heads,
+        "active_workspace_codes": list(active_workspace_codes or []),
+    }
+
+
+def write_run_config(output_dir, config) -> None:
+    import json
+    with open(Path(output_dir) / "run_config.json", "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+def find_resumable_model(output_dir):
+    """이어학습 가능한 최신 산출물 경로를 찾는다.
+
+    우선순위: 완주 모델(block_placement_ppo.zip) > checkpoints/ 중 최대 step.
+    완주 모델은 항상 가장 많은 step을 가지므로 우선한다. 완주 모델이 없으면
+    (예: 세션 끊김/크래시) checkpoints/ 중 step이 가장 큰 파일을 쓴다.
+    """
+    import re
+    output_dir = Path(output_dir)
+    final = output_dir / "block_placement_ppo.zip"
+    if final.exists():
+        return final
+    ckpt_dir = output_dir / "checkpoints"
+    if ckpt_dir.is_dir():
+        best, best_steps = None, -1
+        for p in ckpt_dir.glob("*.zip"):
+            m = re.search(r"(\d+)_steps", p.stem)
+            steps = int(m.group(1)) if m else 0
+            if steps > best_steps:
+                best_steps, best = steps, p
+        return best
+    return None
+
+
+def configs_compatible(saved: dict, current: dict):
+    for key in ARCH_CONFIG_KEYS:
+        if saved.get(key) != current.get(key):
+            return False, key
+    return True, None
+
+
+def resolve_resume_path(args, output_dir, current_config):
+    """이어학습 경로를 결정한다.
+
+    - --resume-from 이 명시되면 그 경로(없으면 에러).
+    - 아니고 --auto-resume 이면 output-dir에서 호환 가능한 최신 모델을 자동 탐지.
+      기존 설정과 구조가 다르면 관측/네트워크 불일치를 막기 위해 ValueError.
+    반환: Path(이어학습) 또는 None(새로 학습).
+    """
+    import json
+
+    if args.resume_from:
+        resume_path = Path(args.resume_from).resolve()
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume model not found: {resume_path}")
+        return resume_path
+
+    if not getattr(args, "auto_resume", False):
+        return None
+
+    candidate = find_resumable_model(output_dir)
+    if candidate is None:
+        print("[auto-resume] 기존 체크포인트 없음 → 새로 학습합니다.")
+        return None
+
+    cfg_path = Path(output_dir) / "run_config.json"
+    if not cfg_path.exists():
+        print("[auto-resume] run_config.json 없음 → 호환성 확인 불가, 새로 학습합니다.")
+        return None
+
+    saved_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    ok, bad_key = configs_compatible(saved_cfg, current_config)
+    if not ok:
+        raise ValueError(
+            f"[auto-resume] 기존 모델과 설정이 다릅니다 (key='{bad_key}': "
+            f"saved={saved_cfg.get(bad_key)} != now={current_config.get(bad_key)}). "
+            f"관측/네트워크 구조가 달라 이어학습할 수 없습니다. "
+            f"OUTPUT_DIR을 새 폴더로 바꾸거나 자동 이어학습을 끄세요."
+        )
+    print(f"[auto-resume] 호환 체크포인트 발견 → 이어학습: {candidate}")
+    return candidate
+
+
 def train(args):
     """MaskablePPO 학습 실행."""
     from sb3_contrib import MaskablePPO
@@ -295,11 +402,15 @@ def train(args):
         embed_dim=args.extractor_embed_dim,
         num_heads=args.extractor_heads,
     )
+    # 이어학습 경로 결정: --resume-from(명시) 우선, 없으면 --auto-resume 자동 탐지
+    run_config = current_run_config(args, active_workspace_codes)
+    resume_path = resolve_resume_path(args, output_dir, run_config)
+    is_resume = resume_path is not None
+    # 현재 설정 기록 (다음 auto-resume 호환성 검사 + 크래시 후 복구용)
+    write_run_config(output_dir, run_config)
+
     print(f"Feature extractor: {args.extractor}")
-    if args.resume_from:
-        resume_path = Path(args.resume_from).resolve()
-        if not resume_path.exists():
-            raise FileNotFoundError(f"Resume model not found: {resume_path}")
+    if is_resume:
         print(f"기존 모델에서 이어 학습: {resume_path}")
         model = MaskablePPO.load(
             str(resume_path),
@@ -327,15 +438,32 @@ def train(args):
         AllocationCallback(log_dir=args.output_dir, verbose=1),
         TrainingMetricsCallback(log_dir=args.output_dir, verbose=1),
     ]
+    if args.checkpoint_freq > 0:
+        from stable_baselines3.common.callbacks import CheckpointCallback
+
+        # SB3 CheckpointCallback은 콜백 호출 횟수 기준이라 n_envs로 나눠 step 단위를 맞춘다.
+        save_freq = max(args.checkpoint_freq // max(args.n_envs, 1), 1)
+        callback.append(CheckpointCallback(
+            save_freq=save_freq,
+            save_path=str(output_dir / "checkpoints"),
+            name_prefix="block_placement_ppo",
+            verbose=1,
+        ))
+        print(
+            f"중간 체크포인트: 약 {args.checkpoint_freq} step마다 "
+            f"→ {output_dir / 'checkpoints'}"
+        )
 
     # ── 6. 학습 ──────────────────────────────────────────────────
-    print(f"\n학습 시작: {args.timesteps} timesteps")
+    # 이어학습이면 reset_num_timesteps=False → 기존 step 뒤에 args.timesteps 만큼 추가 학습.
+    print(f"\n학습 시작: {args.timesteps} timesteps "
+          f"({'이어학습(추가)' if is_resume else '신규'})")
     print(f"TensorBoard: tensorboard --logdir {Path(args.output_dir) / 'tb_logs'}")
     model.learn(
         total_timesteps=args.timesteps,
         progress_bar=True,
         callback=callback,
-        reset_num_timesteps=not bool(args.resume_from),
+        reset_num_timesteps=not is_resume,
     )
 
     # ── 7. 모델 저장 ─────────────────────────────────────────────
@@ -515,7 +643,13 @@ def main():
                             "to enable all workspaces."
                         ))
     parser.add_argument("--resume-from", type=str, default=None,
-                        help="이어 학습할 기존 SB3 모델 zip 경로")
+                        help="이어 학습할 기존 SB3 모델 zip 경로(명시적)")
+    parser.add_argument("--auto-resume", action="store_true", default=False,
+                        help=("output-dir에 호환 가능한 기존 모델/체크포인트가 있으면 "
+                              "자동으로 이어학습. 설정(추출기/관측/구조)이 다르면 중단."))
+    parser.add_argument("--checkpoint-freq", type=int, default=0,
+                        help=("중간 체크포인트 저장 주기(env step 단위). 0=비활성. "
+                              "예: 10000. 세션 끊김 대비 + auto-resume 복구 지점."))
     parser.add_argument("--export-onnx", action="store_true", default=True,
                         help="ONNX export 수행")
     parser.add_argument("--no-export-onnx", action="store_false", dest="export_onnx")
