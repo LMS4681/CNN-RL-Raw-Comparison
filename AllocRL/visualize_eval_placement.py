@@ -35,6 +35,35 @@ def parse_workspace_codes(value: str | None) -> list[str] | None:
     return codes or None
 
 
+def _setup_korean_font() -> None:
+    """한글 라벨이 tofu(□)로 깨지지 않도록 사용 가능한 한글 폰트를 선택.
+
+    Colab에서는 `apt-get install -y fonts-nanum` 후 이 함수가 NanumGothic을 찾아 씀.
+    폰트가 없으면 조용히 무시(기존 동작 유지).
+    """
+    import matplotlib
+    from matplotlib import font_manager
+
+    # 알려진 경로의 폰트를 직접 등록 (matplotlib 폰트 캐시가 오래된 경우 대비)
+    known_paths = [
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
+    ]
+    for p in known_paths:
+        try:
+            if Path(p).exists():
+                font_manager.fontManager.addfont(p)
+        except Exception:
+            pass
+
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    for name in ["NanumGothic", "Malgun Gothic", "AppleGothic", "NanumBarunGothic"]:
+        if name in available:
+            matplotlib.rcParams["font.family"] = name
+            matplotlib.rcParams["axes.unicode_minus"] = False
+            return
+
+
 def _rect_bounds(cx: float, cy: float, length: float, breadth: float) -> tuple[float, float, float, float]:
     return (
         cx - length / 2.0,
@@ -408,6 +437,8 @@ def evaluate_model_and_export(
     from alloc_env.data_loader import apply_allowable_block_patterns, load_blocks, load_workspaces
     from alloc_env.strategy import BaseGridStrategy
     from train import create_evaluation_env
+
+    _setup_korean_font()  # 한글 라벨 깨짐 방지 (폰트 없으면 무시)
 
     data_dir = Path(data_dir)
     strategy = BaseGridStrategy(step=5.0)
