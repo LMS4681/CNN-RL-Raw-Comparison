@@ -401,6 +401,7 @@ def evaluate_model_and_export(
     grid_size: int = 64,
     frame_stride_days: int = 1,
     active_workspace_codes: str | list[str] | None = DEFAULT_ACTIVE_WORKSPACE_CODES,
+    n_future_blocks: int = 0,
 ) -> list[dict[str, str]]:
     from sb3_contrib import MaskablePPO
 
@@ -429,6 +430,7 @@ def evaluate_model_and_export(
         strategy,
         grid_size=grid_size,
         active_workspace_codes=active_codes,
+        n_future_blocks=n_future_blocks,
     )
     model = MaskablePPO.load(str(model_path), env=env, device="auto")
 
@@ -462,6 +464,13 @@ def main() -> None:
     parser.add_argument("--grid-size", type=int, default=64)
     parser.add_argument("--frame-stride-days", type=int, default=1)
     parser.add_argument(
+        "--n-future-blocks", type=int, default=0,
+        help=(
+            "학습 때 사용한 미래 블록 관측 수와 반드시 동일하게 지정. "
+            "block-attn 모델은 학습 시 값(예: 4)을 그대로 주어야 관측 공간이 일치."
+        ),
+    )
+    parser.add_argument(
         "--active-workspace-codes",
         default=DEFAULT_ACTIVE_WORKSPACE_CODES,
         help=(
@@ -478,6 +487,7 @@ def main() -> None:
         grid_size=args.grid_size,
         frame_stride_days=args.frame_stride_days,
         active_workspace_codes=args.active_workspace_codes,
+        n_future_blocks=args.n_future_blocks,
     )
     print(f"Visualization files saved to: {Path(args.output_dir).resolve()}")
     print(f"Violation count: {len(violations)}")
