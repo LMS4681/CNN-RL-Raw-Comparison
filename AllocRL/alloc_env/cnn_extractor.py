@@ -179,21 +179,32 @@ class CandidateCnnExtractor(_WorkspaceExtractor):
                 f"CandidateCnnExtractor requires 4 grid channels, got {grid_channels}."
             )
 
-        # Fixed grids let AvgPool match adaptive 8x8 pooling while remaining
-        # exportable with a dynamic ONNX batch axis.
+        # Integral fixed-grid resize matches adaptive 8x8 pooling while
+        # remaining exportable with a dynamic ONNX batch axis.
         conv_height = (grid_shape[-2] + 3) // 4
         conv_width = (grid_shape[-1] + 3) // 4
         if (
-            conv_height < 8
-            or conv_width < 8
-            or conv_height % 8 != 0
-            or conv_width % 8 != 0
+            conv_height >= 8
+            and conv_width >= 8
+            and conv_height % 8 == 0
+            and conv_width % 8 == 0
         ):
+            pool_kernel = (conv_height // 8, conv_width // 8)
+            spatial_pool = nn.AvgPool2d(
+                kernel_size=pool_kernel, stride=pool_kernel
+            )
+        elif (
+            conv_height <= 8
+            and conv_width <= 8
+            and 8 % conv_height == 0
+            and 8 % conv_width == 0
+        ):
+            spatial_pool = nn.Upsample(size=(8, 8), mode="nearest")
+        else:
             raise ValueError(
                 "CandidateCnnExtractor grid dimensions must produce CNN "
-                "feature maps divisible into 8x8 cells."
+                "feature maps that divide or are divisible by 8x8."
             )
-        pool_kernel = (conv_height // 8, conv_width // 8)
 
         super().__init__(
             observation_space,
@@ -210,7 +221,7 @@ class CandidateCnnExtractor(_WorkspaceExtractor):
             nn.Conv2d(64, 64, 3, stride=2, padding=1),
             nn.GroupNorm(8, 64),
             nn.ReLU(),
-            nn.AvgPool2d(kernel_size=pool_kernel, stride=pool_kernel),
+            spatial_pool,
             nn.Flatten(),
             nn.Linear(64 * 8 * 8, self.image_feature_dim),
             nn.ReLU(),

@@ -175,23 +175,28 @@ class FeatureExtractorTests(unittest.TestCase):
             def forward(self, grids):
                 return self.extractor.encode_grids(grids)
 
-        output = io.BytesIO()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", torch.jit.TracerWarning)
-            torch.onnx.export(
-                GridEncoder(self.space),
-                observation(batch_size=1)["grids"],
-                output,
-                input_names=["grids"],
-                output_names=["workspace_features"],
-                dynamic_axes={
-                    "grids": {0: "batch"},
-                    "workspace_features": {0: "batch"},
-                },
-                opset_version=17,
-            )
+        for grid_size in (16, 32, 64):
+            with self.subTest(grid_size=grid_size):
+                space = observation_space(grid_size=grid_size)
+                output = io.BytesIO()
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", torch.jit.TracerWarning)
+                    torch.onnx.export(
+                        GridEncoder(space),
+                        observation(
+                            batch_size=1, grid_size=grid_size
+                        )["grids"],
+                        output,
+                        input_names=["grids"],
+                        output_names=["workspace_features"],
+                        dynamic_axes={
+                            "grids": {0: "batch"},
+                            "workspace_features": {0: "batch"},
+                        },
+                        opset_version=17,
+                    )
 
-        self.assertGreater(len(output.getvalue()), 0)
+                self.assertGreater(len(output.getvalue()), 0)
 
 
 if __name__ == "__main__":
