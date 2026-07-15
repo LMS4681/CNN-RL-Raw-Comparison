@@ -50,22 +50,20 @@ def mask_fn(env):
 
 
 def build_policy_kwargs(
-    extractor: str = "cnn",
+    extractor: str = "candidate-cnn",
     features_dim: int = 256,
-    cnn_out_dim: int = 64,
-    embed_dim: int = 64,
-    num_heads: int = 4,
+    **_unused_kwargs,
 ) -> dict:
     from alloc_env.cnn_extractor import (
-        BlockSetAttentionCnnExtractor,
-        OccupancyCnnExtractor,
-        PointerAttentionCnnExtractor,
+        CandidateCnnExtractor,
+        FixedGridExtractor,
+        StructuredExtractor,
     )
 
     extractors = {
-        "cnn": OccupancyCnnExtractor,
-        "pointer-attn": PointerAttentionCnnExtractor,
-        "block-attn": BlockSetAttentionCnnExtractor,
+        "structured": StructuredExtractor,
+        "fixed-grid": FixedGridExtractor,
+        "candidate-cnn": CandidateCnnExtractor,
     }
     if extractor not in extractors:
         raise ValueError(
@@ -73,19 +71,10 @@ def build_policy_kwargs(
             f"Choose one of: {', '.join(extractors)}"
         )
 
-    extractor_kwargs = {
-        "features_dim": features_dim,
-        "cnn_out_dim": cnn_out_dim,
-    }
-    if extractor in ("pointer-attn", "block-attn"):
-        extractor_kwargs.update({
-            "embed_dim": embed_dim,
-            "num_heads": num_heads,
-        })
-
     return {
         "features_extractor_class": extractors[extractor],
-        "features_extractor_kwargs": extractor_kwargs,
+        "features_extractor_kwargs": {"features_dim": features_dim},
+        "share_features_extractor": True,
     }
 
 
@@ -396,14 +385,6 @@ def train(args):
     )
     resolved_vec_env = resolve_vec_env_type(args.vec_env, args.n_envs)
 
-    if args.extractor == "block-attn" and args.n_future_blocks == 0:
-        print(
-            "[경고] --extractor block-attn 인데 --n-future-blocks 0 입니다. "
-            "미래 블록 없이는 블록-집합 attention이 단일 토큰으로 퇴화하여 "
-            "MLP와 유사하게 동작합니다. lookahead 이점을 보려면 "
-            "--n-future-blocks 3~5 를 권장합니다."
-        )
-
     # 메모리 사용량 예측
     N = len(workspaces)
     G = args.grid_size
@@ -643,10 +624,13 @@ def main():
                         help="감가율 (discount factor)")
     parser.add_argument("--n-eval", type=int, default=5,
                         help="평가 에피소드 수")
-    parser.add_argument("--extractor", type=str, default="cnn",
-                        choices=["cnn", "pointer-attn", "block-attn"],
-                        help="feature extractor: cnn, pointer-attn, or "
-                             "block-attn (블록-집합 attention, 미래 lookahead)")
+    parser.add_argument(
+        "--extractor",
+        type=str,
+        default="candidate-cnn",
+        choices=["structured", "fixed-grid", "candidate-cnn"],
+        help="feature extractor ablation mode",
+    )
     parser.add_argument("--n-future-blocks", type=int, default=0,
                         help="관측에 포함할 미래 블록 개수 (0=미포함, 기존 계약 유지). "
                              "block-attn extractor와 함께 3~5 권장.")

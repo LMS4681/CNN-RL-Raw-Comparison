@@ -3,7 +3,7 @@
 CNN + Dict Obs 통합 스모크 테스트.
 
 1. OccupancyGridRenderer 렌더링 검증
-2. OccupancyCnnExtractor forward pass 검증
+2. Three approved feature extractors forward pass 검증
 3. BlockPlacementEnv reset/step 동작 검증
 4. SyntheticBlockGenerator.generate_workspaces() 검증
 """
@@ -89,37 +89,53 @@ cached2 = cache.get_grids(workspaces, env_date)
 check("캐시 hit 일관성", np.allclose(cached, cached2))
 
 # ── 3. CNN Feature Extractor ──────────────────────────────────────
-print("\n[3] OccupancyCnnExtractor 테스트")
+print("\n[3] Feature extractor 테스트")
 import torch
 import gymnasium as gym
 from gymnasium import spaces
-from alloc_env.cnn_extractor import OccupancyCnnExtractor, SharedCNN
+from alloc_env.alloc_env import FUTURE_BLOCK_FEATURE_DIM
+from alloc_env.cnn_extractor import (
+    CandidateCnnExtractor,
+    FixedGridExtractor,
+    StructuredExtractor,
+)
 
 N = len(workspaces)
 G = 128
-
-# SharedCNN 단독 테스트
-shared = SharedCNN(in_channels=3, cnn_out_dim=64)
-dummy_grid = torch.randn(2, 3, G, G)  # batch=2
-out = shared(dummy_grid)
-check("SharedCNN output shape", out.shape == (2, 64), f"got {out.shape}")
-
-# OccupancyCnnExtractor 테스트
+K = 4
+extractor_grid_size = 32
 obs_space = spaces.Dict({
     "block": spaces.Box(0, 1, shape=(10,), dtype=np.float32),
-    "grids": spaces.Box(0, 1, shape=(N, 3, G, G), dtype=np.float32),
+    "grids": spaces.Box(
+        0, 1, shape=(N, 4, extractor_grid_size, extractor_grid_size),
+        dtype=np.float32,
+    ),
     "ws_meta": spaces.Box(0, 1, shape=(N, 3), dtype=np.float32),
+    "future_blocks": spaces.Box(
+        0, 1, shape=(K, FUTURE_BLOCK_FEATURE_DIM), dtype=np.float32,
+    ),
+    "future_mask": spaces.Box(0, 1, shape=(K,), dtype=np.float32),
 })
 
-extractor = OccupancyCnnExtractor(obs_space, features_dim=256, cnn_out_dim=64)
 dummy_obs = {
     "block": torch.randn(1, 10),
-    "grids": torch.randn(1, N, 3, G, G),
+    "grids": torch.randn(
+        1, N, 4, extractor_grid_size, extractor_grid_size
+    ),
     "ws_meta": torch.randn(1, N, 3),
+    "future_blocks": torch.randn(1, K, FUTURE_BLOCK_FEATURE_DIM),
+    "future_mask": torch.ones(1, K),
 }
-feat = extractor(dummy_obs)
-check("Extractor output shape", feat.shape == (1, 256), f"got {feat.shape}")
-check("Extractor output finite", torch.isfinite(feat).all().item())
+for extractor_class in (
+    StructuredExtractor,
+    FixedGridExtractor,
+    CandidateCnnExtractor,
+):
+    extractor = extractor_class(obs_space, features_dim=256)
+    feat = extractor(dummy_obs)
+    name = extractor_class.__name__
+    check(f"{name} output shape", feat.shape == (1, 256), f"got {feat.shape}")
+    check(f"{name} output finite", torch.isfinite(feat).all().item())
 
 # ── 4. 작업장 레이아웃 합성 생성 ──────────────────────────────────
 print("\n[4] generate_workspaces() 테스트")
