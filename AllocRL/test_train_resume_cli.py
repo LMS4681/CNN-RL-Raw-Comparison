@@ -5,12 +5,25 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import train as train_module
 
 
 class TrainResumeCliTest(unittest.TestCase):
+    @staticmethod
+    def _run_config(observation_schema_version=2):
+        return {
+            "observation_schema_version": observation_schema_version,
+            "reward_schema_version": 2,
+            "extractor": "candidate-cnn",
+            "n_future_blocks": 4,
+            "grid_size": 32,
+            "features_dim": 256,
+            "active_workspace_codes": ["PE001"],
+        }
+
     def test_primary_model_filename_avoids_security_filtered_zip_suffix(self):
         self.assertEqual(
             "block_placement_ppo.sb3", train_module.MODEL_FILENAME
@@ -111,6 +124,55 @@ class TrainResumeCliTest(unittest.TestCase):
             ".\\data\\fixed_eval_scenarios.json",
             captured["eval_scenarios"],
         )
+
+    def test_explicit_resume_rejects_incompatible_run_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "block_placement_ppo.sb3"
+            with zipfile.ZipFile(model_path, "w") as archive:
+                archive.writestr("probe", "model")
+            train_module.write_run_config(
+                tmpdir, self._run_config(observation_schema_version=1)
+            )
+            args = SimpleNamespace(
+                resume_from=str(model_path), auto_resume=False
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "observation_schema_version"
+            ):
+                train_module.resolve_resume_path(
+                    args, tmpdir, self._run_config()
+                )
+
+    def test_explicit_resume_requires_recorded_run_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "block_placement_ppo.sb3"
+            with zipfile.ZipFile(model_path, "w") as archive:
+                archive.writestr("probe", "model")
+            args = SimpleNamespace(
+                resume_from=str(model_path), auto_resume=False
+            )
+
+            with self.assertRaisesRegex(FileNotFoundError, "run_config.json"):
+                train_module.resolve_resume_path(
+                    args, tmpdir, self._run_config()
+                )
+
+    def test_explicit_resume_accepts_compatible_run_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "block_placement_ppo.sb3"
+            with zipfile.ZipFile(model_path, "w") as archive:
+                archive.writestr("probe", "model")
+            train_module.write_run_config(tmpdir, self._run_config())
+            args = SimpleNamespace(
+                resume_from=str(model_path), auto_resume=False
+            )
+
+            resolved = train_module.resolve_resume_path(
+                args, tmpdir, self._run_config()
+            )
+
+        self.assertEqual(model_path.resolve(), resolved)
 
 
 if __name__ == "__main__":

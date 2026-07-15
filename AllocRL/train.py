@@ -361,6 +361,22 @@ def configs_compatible(saved: dict, current: dict):
     return True, None
 
 
+def require_compatible_run_config(
+    saved: dict,
+    current: dict,
+    source: str,
+) -> None:
+    compatible, bad_key = configs_compatible(saved, current)
+    if compatible:
+        return
+    raise ValueError(
+        f"[{source}] Saved model configuration is incompatible "
+        f"(key='{bad_key}': saved={saved.get(bad_key)} != "
+        f"current={current.get(bad_key)}). Use a matching configuration "
+        "or a new output directory."
+    )
+
+
 def resolve_resume_path(args, output_dir, current_config):
     """이어학습 경로를 결정한다.
 
@@ -372,7 +388,12 @@ def resolve_resume_path(args, output_dir, current_config):
     import json
 
     if args.resume_from:
-        return resolve_model_archive_path(args.resume_from)
+        candidate = resolve_model_archive_path(args.resume_from)
+        saved_config = load_model_run_config(candidate)
+        require_compatible_run_config(
+            saved_config, current_config, source="resume-from"
+        )
+        return candidate
 
     if not getattr(args, "auto_resume", False):
         return None
@@ -388,14 +409,9 @@ def resolve_resume_path(args, output_dir, current_config):
         return None
 
     saved_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    ok, bad_key = configs_compatible(saved_cfg, current_config)
-    if not ok:
-        raise ValueError(
-            f"[auto-resume] 기존 모델과 설정이 다릅니다 (key='{bad_key}': "
-            f"saved={saved_cfg.get(bad_key)} != now={current_config.get(bad_key)}). "
-            f"관측/네트워크 구조가 달라 이어학습할 수 없습니다. "
-            f"OUTPUT_DIR을 새 폴더로 바꾸거나 자동 이어학습을 끄세요."
-        )
+    require_compatible_run_config(
+        saved_cfg, current_config, source="auto-resume"
+    )
     print(f"[auto-resume] 호환 체크포인트 발견 → 이어학습: {candidate}")
     return candidate
 
