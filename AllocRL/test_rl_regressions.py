@@ -6,6 +6,7 @@ import numpy as np
 from alloc_env.alloc_env import BlockPlacementEnv
 from alloc_env.block import Block
 from alloc_env.block_generator import SyntheticBlockGenerator
+from alloc_env.data_loader import select_workspaces
 from alloc_env.data_loader import apply_allowable_block_patterns
 from alloc_env.constraints import (
     BlockPatternConstraint,
@@ -232,28 +233,26 @@ class RlRegressionTests(unittest.TestCase):
         self.assertEqual(expected, captured["spread_days"])
         self.assertEqual(expected[1], env._date_spread)
 
-    def test_active_workspace_mask_limits_actions_without_changing_shape(self):
+    def test_filtered_workspaces_define_action_and_observation_shape(self):
         ws_a = make_workspace()
         ws_b = make_workspace()
         ws_b.code = "PE002"
+        selected = select_workspaces([ws_a, ws_b], ["PE001"])
         env = BlockPlacementEnv(
             [make_block("A001", date(2026, 1, 5))],
-            [ws_a, ws_b],
+            selected,
             BaseGridStrategy(step=10.0),
-            active_workspace_codes=["PE001"],
             grid_size=32,
         )
 
         obs, _ = env.reset()
 
-        self.assertEqual((2, 4, 32, 32), obs["grids"].shape)
-        self.assertEqual((2, 3), obs["ws_meta"].shape)
-        self.assertEqual([True, False], env.action_masks().tolist())
+        self.assertEqual((1, 4, 32, 32), obs["grids"].shape)
+        self.assertEqual((1, 3), obs["ws_meta"].shape)
+        self.assertEqual([True], env.action_masks().tolist())
         self.assertGreater(float(obs["grids"][0].sum()), 0.0)
-        self.assertEqual(float(obs["grids"][1].sum()), 0.0)
-        np.testing.assert_array_equal(obs["ws_meta"][1], np.zeros(3, dtype=np.float32))
 
-    def test_blocks_without_active_valid_workspace_are_not_presented(self):
+    def test_blocks_without_filtered_valid_workspace_are_not_presented(self):
         small = make_sized_workspace(10.0, 10.0)
         large = make_sized_workspace(100.0, 100.0)
         large.code = "PE002"
@@ -263,16 +262,15 @@ class RlRegressionTests(unittest.TestCase):
         ]
         env = BlockPlacementEnv(
             blocks,
-            [small, large],
+            select_workspaces([small, large], ["PE001"]),
             BaseGridStrategy(step=5.0),
-            active_workspace_codes=["PE001"],
             grid_size=32,
         )
 
         env.reset()
 
         self.assertEqual(1, env._current_block_index)
-        self.assertEqual([True, False], env.action_masks().tolist())
+        self.assertEqual([True], env.action_masks().tolist())
 
     def test_step_updates_simulator_workspace_and_cnn_grid(self):
         blocks = [

@@ -101,7 +101,6 @@ class BlockPlacementEnv(gym.Env):
         synthetic_n_blocks: Optional[int] = None,
         synthetic_base_date: Optional[date] = None,
         synthetic_n_preplaced: int = 0,
-        active_workspace_codes: Optional[List[str]] = None,
         vary_layout: bool = True,
         grid_size: int = GRID_SIZE,
         n_future_blocks: int = 0,
@@ -131,28 +130,6 @@ class BlockPlacementEnv(gym.Env):
         self._num_blocks = len(blocks)
         self._num_workspaces = len(workspaces)
         self._workspaces = workspaces
-        self._active_workspace_codes = (
-            {code.strip().upper() for code in active_workspace_codes if code.strip()}
-            if active_workspace_codes else None
-        )
-        if self._active_workspace_codes:
-            workspace_codes = {ws.code.upper() for ws in workspaces}
-            unknown_codes = sorted(self._active_workspace_codes - workspace_codes)
-            if unknown_codes:
-                raise ValueError(
-                    "Unknown active workspace code(s): "
-                    + ", ".join(unknown_codes)
-                )
-            self._active_workspace_mask = np.array(
-                [ws.code.upper() in self._active_workspace_codes for ws in workspaces],
-                dtype=bool,
-            )
-            if not self._active_workspace_mask.any():
-                raise ValueError("At least one active workspace is required.")
-        else:
-            self._active_workspace_mask = np.ones(
-                self._num_workspaces, dtype=bool
-            )
 
         # 전략 주입 (원본에)
         for ws in self._original_workspaces:
@@ -170,7 +147,7 @@ class BlockPlacementEnv(gym.Env):
         if (
             not self._use_synthetic
             and self._num_blocks > 0
-            and len(self._get_active_infeasible_blocks()) == self._num_blocks
+            and len(self._get_infeasible_blocks()) == self._num_blocks
         ):
             raise ValueError(
                 "Environment has no agent decision: all blocks are infeasible."
@@ -254,16 +231,8 @@ class BlockPlacementEnv(gym.Env):
         )
         return (spread_min, spread_max)
 
-    def _get_active_infeasible_blocks(self) -> List[int]:
-        infeasible = set(self._picker.get_infeasible_blocks())
-        if self._active_workspace_mask.all():
-            return sorted(infeasible)
-
-        for block_index in range(self._num_blocks):
-            valid_workspaces = self._picker.get_valid_workspaces(block_index)
-            if not any(self._active_workspace_mask[i] for i in valid_workspaces):
-                infeasible.add(block_index)
-        return sorted(infeasible)
+    def _get_infeasible_blocks(self) -> List[int]:
+        return self._picker.get_infeasible_blocks()
 
     def _init_norm_constants(self):
         """
@@ -437,7 +406,7 @@ class BlockPlacementEnv(gym.Env):
                 self._picker = ValidWorkspacePicker(
                     self._blocks, self._workspaces, self._constraints
                 )
-                if len(self._get_active_infeasible_blocks()) < self._num_blocks:
+                if len(self._get_infeasible_blocks()) < self._num_blocks:
                     break
             else:
                 raise RuntimeError(
@@ -462,7 +431,7 @@ class BlockPlacementEnv(gym.Env):
             self._blocks,
             self._workspaces,
             DROPOUT_THRESHOLD,
-            infeasible_indices=self._get_active_infeasible_blocks(),
+            infeasible_indices=self._get_infeasible_blocks(),
         )
         self._sync_from_simulator()
 
@@ -531,12 +500,12 @@ class BlockPlacementEnv(gym.Env):
     def action_masks(self) -> np.ndarray:
         """현재 블록에 대한 유효 작업장 마스크."""
         if self._current_block_index is None:
-            return self._active_workspace_mask.copy()
+            return np.ones(self._num_workspaces, dtype=bool)
 
         mask = self._picker.get_action_mask(
             self._current_block_index, self._num_workspaces
         )
-        return np.array(mask, dtype=bool) & self._active_workspace_mask
+        return np.array(mask, dtype=bool)
 
     # ── 보상 계산 ─────────────────────────────────────────────────
 
@@ -768,9 +737,6 @@ class BlockPlacementEnv(gym.Env):
             )
         ])
         grids = np.concatenate([base_grids, candidate_masks], axis=1)
-        if not self._active_workspace_mask.all():
-            grids = grids.copy()
-            grids[~self._active_workspace_mask] = 0.0
 
         # ── Workspace meta (N, 3) ────────────────────────────────
         occupancy = np.clip(
@@ -781,8 +747,6 @@ class BlockPlacementEnv(gym.Env):
             dtype=np.float32,
         )
         ws_meta = np.stack([self._ws_scales, occupancy, placeable], axis=1)
-        if not self._active_workspace_mask.all():
-            ws_meta[~self._active_workspace_mask] = 0.0
 
         obs = {
             "block": block_features,

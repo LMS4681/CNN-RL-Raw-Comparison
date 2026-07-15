@@ -126,6 +126,35 @@ def apply_allowable_block_patterns(
     return workspaces
 
 
+def select_workspaces(
+    workspaces: List[Workspace],
+    active_codes: Optional[List[str]],
+) -> List[Workspace]:
+    if not active_codes:
+        return list(workspaces)
+
+    wanted = {
+        code.strip().upper()
+        for code in active_codes
+        if code.strip()
+    }
+    known = {workspace.code.upper() for workspace in workspaces}
+    unknown = sorted(wanted - known)
+    if unknown:
+        raise ValueError(
+            "Unknown active workspace code(s): " + ", ".join(unknown)
+        )
+
+    selected = [
+        workspace
+        for workspace in workspaces
+        if workspace.code.upper() in wanted
+    ]
+    if not selected:
+        raise ValueError("At least one active workspace is required.")
+    return selected
+
+
 def load_blocks(
     block_csv: str,
     workspaces: List[Workspace],

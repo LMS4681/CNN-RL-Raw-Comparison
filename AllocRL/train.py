@@ -34,6 +34,17 @@ def parse_workspace_codes(value: str | None) -> list[str] | None:
     return codes or None
 
 
+def set_global_seed(seed: int) -> None:
+    import random
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def mask_fn(env):
     return env.action_masks()
 
@@ -93,7 +104,7 @@ def estimate_rollout_buffer_mb(
     )
     obs_bytes = (
         10
-        + n_workspaces * 3 * grid_size * grid_size
+        + n_workspaces * 4 * grid_size * grid_size
         + n_workspaces * 3
         + future_floats
     ) * 4
@@ -117,27 +128,35 @@ def make_env(
     workspaces,
     strategy,
     use_synthetic=False,
-    generator=None,
+    generator_dist=None,
     synthetic_n_blocks=None,
     vary_layout=True,
     grid_size=64,
-    active_workspace_codes=None,
-    n_future_blocks=0,
+    n_future_blocks=4,
+    env_seed=0,
 ):
     """환경 팩토리 (SubprocVecEnv용)."""
     from alloc_env.alloc_env import BlockPlacementEnv
+    from alloc_env.block_generator import SyntheticBlockGenerator
 
     def _init():
-        return BlockPlacementEnv(
+        local_generator = (
+            SyntheticBlockGenerator(dist=generator_dist, seed=env_seed)
+            if generator_dist is not None
+            else None
+        )
+        env = BlockPlacementEnv(
             blocks, workspaces, strategy,
             use_synthetic=use_synthetic,
-            generator=generator,
+            generator=local_generator,
             synthetic_n_blocks=synthetic_n_blocks,
-            active_workspace_codes=active_workspace_codes,
             vary_layout=vary_layout,
             grid_size=grid_size,
             n_future_blocks=n_future_blocks,
         )
+        env.action_space.seed(env_seed)
+        env.observation_space.seed(env_seed)
+        return env
     return _init
 
 
@@ -149,8 +168,8 @@ def create_training_env(
     grid_size: int = 64,
     n_envs: int = 1,
     vec_env: str = "auto",
-    active_workspace_codes=None,
-    n_future_blocks: int = 0,
+    n_future_blocks: int = 4,
+    seed: int = 0,
 ):
     """Create the training env, optionally vectorized for parallel rollout."""
     from sb3_contrib.common.wrappers import ActionMasker
@@ -162,18 +181,22 @@ def create_training_env(
         "workspaces": workspaces,
         "strategy": strategy,
         "use_synthetic": True,
-        "generator": generator,
+        "generator_dist": generator.dist if generator is not None else None,
         "synthetic_n_blocks": len(blocks),
-        "active_workspace_codes": active_workspace_codes,
         "vary_layout": True,
         "grid_size": grid_size,
         "n_future_blocks": n_future_blocks,
     }
 
     if resolved_vec_env == "single":
-        return ActionMasker(make_env(**env_kwargs)(), mask_fn)
+        return ActionMasker(
+            make_env(**env_kwargs, env_seed=seed)(), mask_fn
+        )
 
-    env_fns = [make_env(**env_kwargs) for _ in range(n_envs)]
+    env_fns = [
+        make_env(**env_kwargs, env_seed=seed + rank)
+        for rank in range(n_envs)
+    ]
     if resolved_vec_env == "dummy":
         return DummyVecEnv(env_fns)
     return SubprocVecEnv(env_fns)
@@ -184,8 +207,8 @@ def create_evaluation_env(
     workspaces,
     strategy,
     grid_size: int = 64,
-    active_workspace_codes=None,
-    n_future_blocks: int = 0,
+    n_future_blocks: int = 4,
+    seed: int = 0,
 ):
     """CSV 원본 블록으로 평가하는 마스크 적용 환경을 생성합니다."""
     from sb3_contrib.common.wrappers import ActionMasker
@@ -197,10 +220,11 @@ def create_evaluation_env(
         workspaces,
         strategy,
         use_synthetic=False,
-        active_workspace_codes=active_workspace_codes,
         grid_size=grid_size,
         n_future_blocks=n_future_blocks,
     )
+    env.action_space.seed(seed)
+    env.observation_space.seed(seed)
     return ActionMasker(env, mask_fn)
 
 
@@ -316,11 +340,16 @@ def train(args):
     from sb3_contrib import MaskablePPO
 
     from alloc_env.data_loader import (
-        load_workspaces, load_blocks, apply_allowable_block_patterns,
+        apply_allowable_block_patterns,
+        load_blocks,
+        load_workspaces,
+        select_workspaces,
     )
     from alloc_env.strategy import BaseGridStrategy
     from alloc_env.callbacks import AllocationCallback, TrainingMetricsCallback
     from alloc_env.block_generator import SyntheticBlockGenerator
+
+    set_global_seed(args.seed)
 
     data_dir = Path(args.data_dir)
     ws_csv   = str(data_dir / "선행건조 작업장 기준정보.csv")
@@ -337,18 +366,20 @@ def train(args):
     apply_allowable_block_patterns(workspaces)
     blocks = load_blocks(blk_csv, workspaces)
     active_workspace_codes = parse_workspace_codes(args.active_workspace_codes)
+    total_workspace_count = len(workspaces)
+    workspaces = select_workspaces(workspaces, active_workspace_codes)
 
     print(f"블록 {len(blocks)}개, 작업장 {len(workspaces)}개")
     if active_workspace_codes:
         print(
-            f"Active workspaces: {len(active_workspace_codes)}/{len(workspaces)} "
-            f"({', '.join(active_workspace_codes)})"
+            f"Active workspaces: {len(workspaces)}/{total_workspace_count} "
+            f"({', '.join(ws.code for ws in workspaces)})"
         )
     else:
         print(f"Active workspaces: all {len(workspaces)}")
 
     # ── 2. Synthetic 블록 생성기 ─────────────────────────────────
-    generator = SyntheticBlockGenerator.from_csv(blk_csv)
+    generator = SyntheticBlockGenerator.from_csv(blk_csv, seed=args.seed)
     print("[Synthetic] CSV 분포 기반 블록 생성기 초기화 완료")
 
     # ── 3. 환경 생성 (학습: synthetic, 평가: CSV 원본) ────────────
@@ -360,8 +391,8 @@ def train(args):
         grid_size=args.grid_size,
         n_envs=args.n_envs,
         vec_env=args.vec_env,
-        active_workspace_codes=active_workspace_codes,
         n_future_blocks=args.n_future_blocks,
+        seed=args.seed,
     )
     resolved_vec_env = resolve_vec_env_type(args.vec_env, args.n_envs)
 
@@ -429,6 +460,7 @@ def train(args):
             n_epochs=args.n_epochs,
             gamma=args.gamma,
             policy_kwargs=policy_kwargs,
+            seed=args.seed,
             device=args.device,
             tensorboard_log=str(output_dir / "tb_logs"),
         )
@@ -486,8 +518,8 @@ def train(args):
         workspaces,
         strategy,
         grid_size=args.grid_size,
-        active_workspace_codes=active_workspace_codes,
         n_future_blocks=args.n_future_blocks,
+        seed=args.seed,
     )
     evaluate(model, eval_env, n_eval=args.n_eval)
 
@@ -629,6 +661,8 @@ def main():
     parser.add_argument("--device", type=str, default="auto",
                         choices=["auto", "cpu", "cuda"],
                         help="PyTorch device for policy training")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="global and environment random seed")
     parser.add_argument("--n-envs", type=int, default=1,
                         help="number of parallel training environments")
     parser.add_argument("--vec-env", type=str, default="auto",
@@ -638,9 +672,9 @@ def main():
                         default=DEFAULT_ACTIVE_WORKSPACE_CODES,
                         help=(
                             "comma-separated active workspace codes. "
-                            "Observation/action shape keeps all workspaces; "
-                            "inactive workspaces are masked. Use empty string "
-                            "to enable all workspaces."
+                            "Only selected workspaces enter observation and "
+                            "action spaces. Use empty string to enable all "
+                            "workspaces."
                         ))
     parser.add_argument("--resume-from", type=str, default=None,
                         help="이어 학습할 기존 SB3 모델 zip 경로(명시적)")

@@ -47,6 +47,7 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             captured["n_envs"] = args.n_envs
             captured["vec_env"] = args.vec_env
             captured["active_workspace_codes"] = args.active_workspace_codes
+            captured["seed"] = args.seed
 
         argv = [
             "train.py",
@@ -58,6 +59,8 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             "subproc",
             "--active-workspace-codes",
             "PE001,PE002",
+            "--seed",
+            "41",
             "--no-export-onnx",
         ]
 
@@ -68,6 +71,7 @@ class ParallelTrainingConfigTests(unittest.TestCase):
         self.assertEqual(4, captured["n_envs"])
         self.assertEqual("subproc", captured["vec_env"])
         self.assertEqual("PE001,PE002", captured["active_workspace_codes"])
+        self.assertEqual(41, captured["seed"])
 
     def test_auto_vec_env_selection_is_platform_aware(self):
         with patch.object(train_module.sys, "platform", "win32"):
@@ -112,6 +116,7 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             grid_size=16,
             n_envs=2,
             vec_env="dummy",
+            seed=5,
         )
         try:
             env.reset()
