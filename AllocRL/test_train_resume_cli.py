@@ -88,11 +88,14 @@ class TrainResumeCliTest(unittest.TestCase):
             captured["n_future_blocks"] = args.n_future_blocks
             captured["gae_lambda"] = args.gae_lambda
             captured["seed"] = args.seed
+            captured["eval_scenarios"] = args.eval_scenarios
 
         argv = [
             "train.py",
             "--resume-from",
             ".\\output\\block_placement_ppo.zip",
+            "--eval-scenarios",
+            ".\\data\\fixed_eval_scenarios.json",
             "--no-export-onnx",
         ]
 
@@ -104,6 +107,10 @@ class TrainResumeCliTest(unittest.TestCase):
         self.assertEqual(4, captured["n_future_blocks"])
         self.assertEqual(0.98, captured["gae_lambda"])
         self.assertEqual(0, captured["seed"])
+        self.assertEqual(
+            ".\\data\\fixed_eval_scenarios.json",
+            captured["eval_scenarios"],
+        )
 
 
 if __name__ == "__main__":

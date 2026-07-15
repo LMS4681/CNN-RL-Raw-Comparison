@@ -10,7 +10,7 @@
               "future_blocks": 다음 k개 블록 피처 (k, FUTURE_BLOCK_FEATURE_DIM),
               "future_mask":   미래 블록 유효 마스크 (k,), 1=유효/0=패딩,
            }
-- Reward:  Terminal + shaped reward (즉시 배치 가능성 + 부분 replay)
+- Reward:  Resolved block outcomes + terminal conservation residual
 - Mask:    하드 제약 위반 작업장 마스킹 (sb3-contrib MaskablePPO 호환)
 
 CNN 관측 핵심:
@@ -26,7 +26,7 @@ import gymnasium as gym
 import numpy as np
 from datetime import date
 from gymnasium import spaces
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .block import Block
 from .workspace import Workspace
@@ -506,6 +506,58 @@ class BlockPlacementEnv(gym.Env):
             self._current_block_index, self._num_workspaces
         )
         return np.array(mask, dtype=bool)
+
+    # ── Evaluation-only future optionality diagnostics ────────────
+
+    def future_workspace_choice_indices(self) -> List[int]:
+        """Return the exact future block set used by the current observation."""
+        if self._placement_simulator is None:
+            return []
+        return self._placement_simulator.upcoming_block_indices(
+            self._n_future_blocks
+        )
+
+    def future_workspace_choice_count(
+        self,
+        block_indices: Optional[Iterable[int]] = None,
+    ) -> int:
+        """Count immediately usable workspaces for a fixed future block set."""
+        simulator = self._placement_simulator
+        if simulator is None:
+            return 0
+        indices = (
+            self.future_workspace_choice_indices()
+            if block_indices is None
+            else list(block_indices)
+        )
+
+        total = 0
+        for block_index in indices:
+            if not 0 <= block_index < len(self._blocks):
+                continue
+            if (
+                block_index not in simulator.pending
+                or simulator.delay_days[block_index] is not None
+            ):
+                continue
+            block = self._blocks[block_index]
+            for workspace in self._workspaces:
+                if not all(
+                    constraint.is_feasible(block, workspace)
+                    for constraint in self._constraints
+                ):
+                    continue
+                trial = block.clone()
+                position = workspace.determine_placement_position(
+                    trial, self._env_date
+                )
+                if position is None:
+                    trial.turn()
+                    position = workspace.determine_placement_position(
+                        trial, self._env_date
+                    )
+                total += int(position is not None)
+        return total
 
     # ── 보상 계산 ─────────────────────────────────────────────────
 

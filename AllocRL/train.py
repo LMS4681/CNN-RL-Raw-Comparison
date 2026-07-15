@@ -256,6 +256,7 @@ def current_run_config(args, active_workspace_codes) -> dict:
         "features_dim": args.features_dim,
         "active_workspace_codes": list(active_workspace_codes or []),
         "seed": args.seed,
+        "eval_scenarios": getattr(args, "eval_scenarios", None),
     }
 
 
@@ -399,6 +400,69 @@ def resolve_resume_path(args, output_dir, current_config):
     return candidate
 
 
+def load_requested_evaluation_scenarios(
+    path: str | Path | None,
+) -> list[dict] | None:
+    if path is None:
+        return None
+    scenario_path = Path(path).expanduser().resolve()
+    if not scenario_path.is_file():
+        raise FileNotFoundError(
+            f"Fixed evaluation scenarios not found: {scenario_path}. "
+            "Run `py -B run_ablation.py --prepare-eval-scenarios` first."
+        )
+    from evaluation_scenarios import read_scenarios
+
+    return read_scenarios(scenario_path)
+
+
+def write_evaluation_metrics(
+    path: str | Path,
+    rows: list[dict],
+) -> None:
+    import csv
+
+    if not rows:
+        raise ValueError("At least one evaluation metric row is required")
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def evaluate_fixed_scenarios(
+    model,
+    scenario_records: list[dict],
+    grid_size: int,
+    n_future_blocks: int,
+) -> list[dict]:
+    from alloc_env.strategy import BaseGridStrategy
+    from evaluation_scenarios import materialize_scenario
+
+    rows = []
+    for scenario in scenario_records:
+        strategy = BaseGridStrategy(step=5.0)
+        blocks, workspaces = materialize_scenario(scenario, strategy)
+        env = create_evaluation_env(
+            blocks=blocks,
+            workspaces=workspaces,
+            strategy=strategy,
+            grid_size=grid_size,
+            n_future_blocks=n_future_blocks,
+            seed=int(scenario["seed"]),
+        )
+        try:
+            metrics = evaluate(
+                model, env, n_eval=1, return_metrics=True
+            )
+        finally:
+            env.close()
+        rows.append({"seed": int(scenario["seed"]), **metrics})
+    return rows
+
+
 def train(args):
     """MaskablePPO 학습 실행."""
     from sb3_contrib import MaskablePPO
@@ -413,6 +477,9 @@ def train(args):
     from alloc_env.callbacks import AllocationCallback, TrainingMetricsCallback
     from alloc_env.block_generator import SyntheticBlockGenerator
 
+    fixed_scenarios = load_requested_evaluation_scenarios(
+        getattr(args, "eval_scenarios", None)
+    )
     set_global_seed(args.seed)
 
     data_dir = Path(args.data_dir)
@@ -575,22 +642,81 @@ def train(args):
         n_future_blocks=args.n_future_blocks,
         seed=args.seed,
     )
-    evaluate(model, eval_env, n_eval=args.n_eval)
+    try:
+        csv_metrics = evaluate(
+            model, eval_env, n_eval=args.n_eval, return_metrics=True
+        )
+    finally:
+        eval_env.close()
+    write_evaluation_metrics(
+        output_dir / "evaluation_csv.csv",
+        [{"source": "original_csv", **csv_metrics}],
+    )
+
+    if fixed_scenarios is not None:
+        print("\n  Fixed evaluation scenarios")
+        scenario_rows = evaluate_fixed_scenarios(
+            model,
+            fixed_scenarios,
+            grid_size=args.grid_size,
+            n_future_blocks=args.n_future_blocks,
+        )
+        write_evaluation_metrics(
+            output_dir / "evaluation_scenarios.csv", scenario_rows
+        )
 
 
-def evaluate(model, env, n_eval: int = 5):
-    """학습된 모델로 n_eval 에피소드 평가."""
+def evaluate(model, env, n_eval: int = 5, return_metrics: bool = False):
+    """Evaluate deterministic episodes and optionally return quality metrics."""
+    from alloc_env.alloc_env import DELAY_THRESHOLD
+    from alloc_env.simulator import SimulationResult
+    from evaluation_scenarios import compute_retained_choice_ratio
+
+    if n_eval < 1:
+        raise ValueError("n_eval must be at least 1")
+
     rewards = []
     terminal_scores = []
+    dropout_rates = []
+    mean_delay_days = []
+    delayed_counts = []
+    retained_choice_ratios = []
     for ep in range(n_eval):
         obs, info = env.reset()
         total_reward = 0.0
         done = False
+        episode_choice_ratios = []
+        diagnostic_env = getattr(env, "unwrapped", env)
         while not done:
             action_masks = env.action_masks() if hasattr(env, 'action_masks') else None
             action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
+            if hasattr(diagnostic_env, "future_workspace_choice_indices"):
+                future_indices = (
+                    diagnostic_env.future_workspace_choice_indices()
+                )
+                choices_before = (
+                    diagnostic_env.future_workspace_choice_count(
+                        future_indices
+                    )
+                )
+            else:
+                future_indices = []
+                choices_before = 0
             obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
+            if hasattr(diagnostic_env, "future_workspace_choice_count"):
+                choices_after = (
+                    diagnostic_env.future_workspace_choice_count(
+                        future_indices
+                    )
+                )
+            else:
+                choices_after = 0
+            episode_choice_ratios.append(
+                compute_retained_choice_ratio(
+                    choices_before, choices_after
+                )
+            )
+            total_reward += float(reward)
             done = terminated or truncated
 
         rewards.append(total_reward)
@@ -598,19 +724,54 @@ def evaluate(model, env, n_eval: int = 5):
             "terminal_score", info.get("terminal_reward", total_reward)
         )
         terminal_scores.append(terminal_score)
+        result = info.get("raw_result")
+        delay_days = list(result.delay_days) if result is not None else []
+        dropout_count = sum(
+            delay == SimulationResult.DROPOUT for delay in delay_days
+        )
+        placed_delays = [
+            delay
+            for delay in delay_days
+            if delay != SimulationResult.DROPOUT
+        ]
+        dropout_rates.append(
+            dropout_count / len(delay_days) if delay_days else 0.0
+        )
+        mean_delay_days.append(
+            float(np.mean(placed_delays)) if placed_delays else 0.0
+        )
+        delayed_counts.append(
+            sum(delay > DELAY_THRESHOLD for delay in placed_delays)
+        )
+        retained_choice_ratios.append(
+            float(np.mean(episode_choice_ratios))
+            if episode_choice_ratios
+            else 1.0
+        )
         print(
             f"  Episode {ep+1}: "
             f"total reward = {total_reward:.2f}, "
             f"terminal score = {terminal_score:.2f}"
         )
 
-    mean_r = np.mean(rewards)
-    mean_terminal = np.mean(terminal_scores)
+    metrics = {
+        "mean_reward": float(np.mean(rewards)),
+        "mean_terminal_score": float(np.mean(terminal_scores)),
+        "mean_dropout_rate": float(np.mean(dropout_rates)),
+        "mean_delay_days": float(np.mean(mean_delay_days)),
+        "mean_delayed_count": float(np.mean(delayed_counts)),
+        "mean_retained_choice_ratio": float(
+            np.mean(retained_choice_ratios)
+        ),
+    }
     print(
-        f"\n  평균 reward: total={mean_r:.2f}, "
-        f"terminal score={mean_terminal:.2f} (n={n_eval})"
+        f"\n  Mean evaluation: reward={metrics['mean_reward']:.2f}, "
+        f"terminal score={metrics['mean_terminal_score']:.2f}, "
+        f"dropout={metrics['mean_dropout_rate']:.1%}, "
+        f"retained choices={metrics['mean_retained_choice_ratio']:.3f} "
+        f"(n={n_eval})"
     )
-    return mean_r
+    return metrics if return_metrics else metrics["mean_reward"]
 
 
 def export_to_onnx(model, env, onnx_path: str):
@@ -700,6 +861,12 @@ def main():
                         help="GAE bias-variance parameter")
     parser.add_argument("--n-eval", type=int, default=5,
                         help="평가 에피소드 수")
+    parser.add_argument(
+        "--eval-scenarios",
+        type=str,
+        default=None,
+        help="fixed evaluation scenario JSON prepared by run_ablation.py",
+    )
     parser.add_argument(
         "--extractor",
         type=str,
