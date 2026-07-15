@@ -37,7 +37,6 @@ from .constraints import (
 )
 from .incremental_simulator import (
     IncrementalPlacementSimulator,
-    PlacementStepResult,
 )
 from .simulator import SimulationResult
 from .strategy import BaseGridStrategy
@@ -54,10 +53,6 @@ FUTURE_BLOCK_FEATURE_DIM = 8
 # ── Reward 설정 ──────────────────────────────────────────────────
 REWARD_COMPLIANT = 1.0     # 준수(지연 <= 2일)
 REWARD_DROPOUT = -2.0      # 탈락(지연 > 7일)
-SHAPING_PLACEMENT_SUCCESS = 0.0002
-SHAPING_PLACEMENT_FAILURE = -0.002
-PARTIAL_REPLAY_WEIGHT = 0.1
-PARTIAL_REPLAY_INTERVAL = 8
 
 # 원본 착수일 폭이 없을 때 쓰는 synthetic 날짜 분산 fallback.
 # 실제 학습 synthetic은 원본 블록 착수일 폭의 0.5~1.2배 범위를 사용합니다.
@@ -167,6 +162,14 @@ class BlockPlacementEnv(gym.Env):
         self._picker = ValidWorkspacePicker(
             blocks, workspaces, self._constraints
         )
+        if (
+            not self._use_synthetic
+            and self._num_blocks > 0
+            and len(self._get_active_infeasible_blocks()) == self._num_blocks
+        ):
+            raise ValueError(
+                "Environment has no agent decision: all blocks are infeasible."
+            )
 
         # ── 점유 그리드 렌더러 + 캐시 ─────────────────────────────
         self._grid_size = grid_size
@@ -217,8 +220,8 @@ class BlockPlacementEnv(gym.Env):
             self._num_workspaces, dtype=np.float32
         )
         self._env_date: date = self._base_date
-        self._step_reward_sum = 0.0
-        self._last_replay_potential = 0.0
+        self._emitted_resolved_indices: set[int] = set()
+        self._resolved_reward_sum = 0.0
         self._last_result: Optional[SimulationResult] = None
         self._placement_simulator: Optional[IncrementalPlacementSimulator] = None
         self._current_block_index: Optional[int] = None
@@ -417,16 +420,23 @@ class BlockPlacementEnv(gym.Env):
         # ── Synthetic 모드: 매 에피소드마다 새 블록 + 레이아웃 ────
         # 정규화 상수는 __init__에서 고정 계산됨(에피소드 간 관측 일관성).
         if self._use_synthetic and self._generator:
-            self._blocks = self._generator.generate(
-                self._synthetic_n_blocks,
-                self._synthetic_base_date,
-                spread_days=self._synthetic_spread_range,
-            )
-            self._num_blocks = len(self._blocks)
-            self._rebuild_workspaces()
-            self._picker = ValidWorkspacePicker(
-                self._blocks, self._workspaces, self._constraints
-            )
+            for _ in range(10):
+                self._blocks = self._generator.generate(
+                    self._synthetic_n_blocks,
+                    self._synthetic_base_date,
+                    spread_days=self._synthetic_spread_range,
+                )
+                self._num_blocks = len(self._blocks)
+                self._rebuild_workspaces()
+                self._picker = ValidWorkspacePicker(
+                    self._blocks, self._workspaces, self._constraints
+                )
+                if len(self._get_active_infeasible_blocks()) < self._num_blocks:
+                    break
+            else:
+                raise RuntimeError(
+                    "Synthetic environment has no agent decision after 10 attempts."
+                )
         else:
             self._blocks = [b.clone() for b in self._original_blocks]
             self._num_blocks = len(self._blocks)
@@ -439,8 +449,8 @@ class BlockPlacementEnv(gym.Env):
         self._assignments = []
         self._ws_used_area = np.zeros(self._num_workspaces, dtype=np.float32)
         self._env_date = self._base_date
-        self._step_reward_sum = 0.0
-        self._last_replay_potential = 0.0
+        self._emitted_resolved_indices = set()
+        self._resolved_reward_sum = 0.0
         self._last_result = None
         self._placement_simulator = IncrementalPlacementSimulator(
             self._blocks,
@@ -467,7 +477,7 @@ class BlockPlacementEnv(gym.Env):
         prev_env_date = self._env_date
         prev_grid_signatures = self._workspace_grid_signatures(prev_env_date)
 
-        step_result = self._placement_simulator.assign_current(action)
+        self._placement_simulator.assign_current(action)
         self._sync_from_simulator(invalidate_grids=False)
 
         if self._env_date != prev_env_date:
@@ -482,25 +492,31 @@ class BlockPlacementEnv(gym.Env):
 
         terminated = self._placement_simulator.is_done
         truncated = False
-        step_reward = self._compute_intermediate_reward(step_result)
-        self._step_reward_sum += step_reward
-        reward = step_reward
+        resolved_reward, newly_resolved = self._collect_resolved_reward()
+        reward = resolved_reward
 
         if terminated:
-            terminal_reward = self._compute_terminal_reward()
-            reward += terminal_reward
+            terminal_score = self._compute_terminal_reward()
+            terminal_residual = terminal_score - self._resolved_reward_sum
+            reward += terminal_residual
 
         obs = self._get_obs() if not terminated else self._get_terminal_obs()
         info = self._get_info()
+        info["newly_resolved_indices"] = newly_resolved
+        info["resolved_step_reward"] = resolved_reward
 
         if terminated:
             info["assignments"] = [
                 int(a) for a in self._placement_simulator.assignments
             ]
             info["raw_result"] = self._last_result
-            info["terminal_reward"] = terminal_reward
-            info["step_reward_sum"] = self._step_reward_sum
-            info["episode_reward"] = self._step_reward_sum + terminal_reward
+            info["resolved_reward"] = self._resolved_reward_sum
+            info["terminal_residual"] = terminal_residual
+            info["terminal_score"] = terminal_score
+            info["terminal_reward"] = terminal_score
+            info["episode_reward"] = (
+                self._resolved_reward_sum + terminal_residual
+            )
 
         return obs, reward, terminated, truncated, info
 
@@ -540,38 +556,27 @@ class BlockPlacementEnv(gym.Env):
             return 0.0
         return sum(self._score_delay_day(dd) for dd in delay_days) / score_divisor
 
-    def _compute_intermediate_reward(
-        self,
-        step_result: PlacementStepResult,
-    ) -> float:
-        reward = (
-            SHAPING_PLACEMENT_SUCCESS
-            if step_result.placed
-            else SHAPING_PLACEMENT_FAILURE
-        )
-        reward += self._compute_partial_replay_reward()
-        return reward
+    def _collect_resolved_reward(self) -> Tuple[float, List[int]]:
+        if self._placement_simulator is None:
+            return 0.0, []
 
-    def _compute_partial_replay_reward(self) -> float:
-        if self._placement_simulator is None or self._current_step <= 0:
-            return 0.0
+        score = 0.0
+        newly_resolved: List[int] = []
+        for result in self._placement_simulator.drain_transition_results():
+            block_index = result.block_index
+            if (
+                result.delay_days is None
+                or block_index in self._emitted_resolved_indices
+            ):
+                continue
+            self._emitted_resolved_indices.add(block_index)
+            newly_resolved.append(block_index)
+            score += self._score_delay_day(result.delay_days) / max(
+                self._num_blocks, 1
+            )
 
-        should_replay = (
-            self._placement_simulator.is_done
-            or self._current_step % PARTIAL_REPLAY_INTERVAL == 0
-        )
-        if not should_replay:
-            return 0.0
-
-        potential = self._score_delay_days(
-            self._placement_simulator.resolved_delay_days(),
-            divisor=max(self._num_blocks, 1),
-        )
-        reward = PARTIAL_REPLAY_WEIGHT * (
-            potential - self._last_replay_potential
-        )
-        self._last_replay_potential = potential
-        return reward
+        self._resolved_reward_sum += score
+        return score, newly_resolved
 
     def _compute_terminal_reward(self) -> float:
         """

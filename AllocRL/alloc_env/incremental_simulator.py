@@ -54,7 +54,7 @@ class IncrementalPlacementSimulator:
         self.pending: set[int] = set()
         self.env_date: date = date(2026, 4, 1)
         self.current_block_index: Optional[int] = None
-        self.last_internal_results: List[PlacementStepResult] = []
+        self._transition_results: List[PlacementStepResult] = []
 
         self.reset(original_blocks, original_workspaces)
 
@@ -77,7 +77,7 @@ class IncrementalPlacementSimulator:
         self.delay_days = [None] * len(self.blocks)
         self.pending = set(range(len(self.blocks)))
         self.current_block_index = None
-        self.last_internal_results = []
+        self._transition_results = []
 
         if self.blocks:
             earliest = min(b.in_date for b in self.blocks)
@@ -112,9 +112,17 @@ class IncrementalPlacementSimulator:
         block_index = self.current_block_index
         self.assignments[block_index] = int(workspace_index)
         result = self._process_assigned_block(block_index)
-        self.last_internal_results = [result]
+        self._record_result(result)
         self._advance_to_next_decision()
         return result
+
+    def _record_result(self, result: PlacementStepResult) -> None:
+        self._transition_results.append(result)
+
+    def drain_transition_results(self) -> List[PlacementStepResult]:
+        results = self._transition_results
+        self._transition_results = []
+        return results
 
     def result(self) -> SimulationResult:
         return SimulationResult(
@@ -179,7 +187,7 @@ class IncrementalPlacementSimulator:
                     if idx in self._infeasible:
                         self.delay_days[idx] = SimulationResult.DROPOUT
                         self.pending.discard(idx)
-                        self.last_internal_results.append(
+                        self._record_result(
                             PlacementStepResult(
                                 idx, -1, placed=False, delayed=False,
                                 dropped=True, delay_days=SimulationResult.DROPOUT,
@@ -190,7 +198,7 @@ class IncrementalPlacementSimulator:
                     return
 
                 result = self._process_assigned_block(idx)
-                self.last_internal_results.append(result)
+                self._record_result(result)
 
             self.env_date = cal.next_working_day(self.env_date)
 

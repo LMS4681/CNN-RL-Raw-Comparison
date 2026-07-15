@@ -201,14 +201,16 @@ while not done:
 
 check("전체 에피소드 완료", done, f"steps={total_steps}")
 if done:
-    check("Terminal reward 존재", "terminal_reward" in info,
+    check("Terminal score 존재", "terminal_score" in info,
           f"keys={list(info.keys())}")
-    check("Shaped reward 합계 존재", "step_reward_sum" in info,
+    check("Resolved reward 존재", "resolved_reward" in info,
+          f"keys={list(info.keys())}")
+    check("Terminal residual 존재", "terminal_residual" in info,
           f"keys={list(info.keys())}")
     check("Episode reward 존재", "episode_reward" in info,
           f"keys={list(info.keys())}")
-    if "terminal_reward" in info:
-        print(f"  Terminal reward: {info['terminal_reward']:.4f}")
+    if "terminal_score" in info:
+        print(f"  Terminal score: {info['terminal_score']:.4f}")
 
 # ── 6. Synthetic 모드 ─────────────────────────────────────────────
 print("\n[6] Synthetic 모드 (블록+레이아웃 변형)")

@@ -55,8 +55,9 @@ while not done:
 print(f"\n=== Terminal Reward ===")
 print(f"  Steps: {step}")
 print(f"  Total reward: {total_r:+.4f}")
-print(f"  Terminal reward (from info): {info.get('terminal_reward', 'N/A')}")
-print(f"  Step reward sum (from info): {info.get('step_reward_sum', 'N/A')}")
+print(f"  Resolved reward (from info): {info.get('resolved_reward', 'N/A')}")
+print(f"  Terminal residual (from info): {info.get('terminal_residual', 'N/A')}")
+print(f"  Terminal score (from info): {info.get('terminal_score', 'N/A')}")
 print(f"  Episode reward (from info): {info.get('episode_reward', 'N/A')}")
 
 # 분석
@@ -79,7 +80,7 @@ for _ in range(20):
         mask = env.action_masks()
         valid = np.where(mask)[0]
         obs, r, done, _, info = env.step(np.random.choice(valid))
-    rewards.append(info['terminal_reward'])
+    rewards.append(info['terminal_score'])
 
 print(f"\n=== Reward Stats (20 episodes) ===")
 print(f"  Min: {min(rewards):.4f}, Max: {max(rewards):.4f}")

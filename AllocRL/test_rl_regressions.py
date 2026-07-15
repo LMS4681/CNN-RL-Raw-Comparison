@@ -1,10 +1,8 @@
 import unittest
 from datetime import date
-from unittest.mock import patch
 
 import numpy as np
 
-import alloc_env.alloc_env as alloc_env_module
 from alloc_env.alloc_env import BlockPlacementEnv
 from alloc_env.block import Block
 from alloc_env.block_generator import SyntheticBlockGenerator
@@ -413,7 +411,7 @@ class RlRegressionTests(unittest.TestCase):
         self.assertFalse(env.unwrapped._use_synthetic)
         self.assertEqual("CSV-001", env.unwrapped._blocks[0].name)
 
-    def test_partial_replay_shaping_adds_intermediate_reward(self):
+    def test_resolved_rewards_conserve_terminal_score(self):
         blocks = [
             make_block("A001", date(2026, 1, 5)),
             make_block("A002", date(2026, 1, 6)),
@@ -425,17 +423,20 @@ class RlRegressionTests(unittest.TestCase):
             grid_size=32,
         )
 
-        with patch.object(
-            alloc_env_module,
-            "PARTIAL_REPLAY_INTERVAL",
-            1,
-            create=True,
-        ):
-            env.reset()
-            _, reward, terminated, _, _ = env.step(0)
+        env.reset()
+        _, first_reward, terminated, _, first_info = env.step(0)
 
         self.assertFalse(terminated)
-        self.assertGreater(reward, 0.05)
+        self.assertEqual([0], first_info["newly_resolved_indices"])
+        self.assertAlmostEqual(0.5, first_reward)
+
+        _, final_reward, terminated, _, final_info = env.step(0)
+
+        self.assertTrue(terminated)
+        self.assertEqual([1], final_info["newly_resolved_indices"])
+        self.assertAlmostEqual(
+            final_info["terminal_score"], first_reward + final_reward
+        )
 
     def test_terminal_reward_uses_incremental_simulator_state(self):
         block = make_sized_block(
