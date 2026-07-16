@@ -50,6 +50,23 @@ class TrainingVisualizationTests(unittest.TestCase):
         self.assertIn("N_FUTURE_BLOCKS = 4", notebook_text)
         self.assertIn("GAE_LAMBDA", notebook_text)
         self.assertIn("SEED", notebook_text)
+        self.assertIn("N_STEPS     = 960", notebook_text)
+        self.assertIn("MONTHLY_JITTER = 20", notebook_text)
+        self.assertIn(
+            "EMPIRICAL_PROFILE_PROBABILITY = 0.2", notebook_text
+        )
+        self.assertIn(
+            'ACTIVE_WORKSPACE_CODES = "PE049,PE050,PE055,PE054,'
+            'PE056,PE048,PE044,PE059,PE060,PE061"',
+            notebook_text,
+        )
+        self.assertIn(
+            "/content/drive/MyDrive/CNN-RL-outputs/"
+            "candidate_cnn_10ws_empty_v1",
+            notebook_text,
+        )
+        self.assertIn("--monthly-jitter", notebook_text)
+        self.assertIn("--empirical-profile-probability", notebook_text)
         self.assertNotIn("EMBED_DIM", notebook_text)
         self.assertNotIn("NUM_HEADS", notebook_text)
 

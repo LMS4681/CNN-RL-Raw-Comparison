@@ -15,6 +15,7 @@ class TrainResumeCliTest(unittest.TestCase):
     @staticmethod
     def _run_config(observation_schema_version=2):
         return {
+            "training_data_schema_version": 1,
             "observation_schema_version": observation_schema_version,
             "reward_schema_version": 2,
             "extractor": "candidate-cnn",
@@ -22,6 +23,9 @@ class TrainResumeCliTest(unittest.TestCase):
             "grid_size": 32,
             "features_dim": 256,
             "active_workspace_codes": ["PE001"],
+            "excluded_start_months": [7, 11],
+            "monthly_jitter": 20,
+            "empirical_profile_probability": 0.2,
         }
 
     def test_primary_model_filename_avoids_security_filtered_zip_suffix(self):
@@ -173,6 +177,33 @@ class TrainResumeCliTest(unittest.TestCase):
             )
 
         self.assertEqual(model_path.resolve(), resolved)
+
+    def test_resume_rejects_changed_monthly_training_profile(self):
+        saved = self._run_config()
+        current = self._run_config()
+        saved["monthly_jitter"] = 10
+
+        compatible, bad_key = train_module.configs_compatible(
+            saved, current
+        )
+
+        self.assertFalse(compatible)
+        self.assertEqual("monthly_jitter", bad_key)
+
+    def test_model_tools_reject_legacy_training_data_schema(self):
+        validator = getattr(
+            train_module, "require_current_training_data_schema", None
+        )
+        self.assertIsNotNone(validator)
+
+        with self.assertRaisesRegex(ValueError, "training_data_schema_version"):
+            validator({}, source="test")
+        with self.assertRaisesRegex(ValueError, "training_data_schema_version"):
+            validator({"training_data_schema_version": 0}, source="test")
+
+        validator(
+            {"training_data_schema_version": 1}, source="test"
+        )
 
 
 if __name__ == "__main__":

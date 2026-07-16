@@ -76,6 +76,10 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             captured["vec_env"] = args.vec_env
             captured["active_workspace_codes"] = args.active_workspace_codes
             captured["seed"] = args.seed
+            captured["monthly_jitter"] = args.monthly_jitter
+            captured["empirical_profile_probability"] = (
+                args.empirical_profile_probability
+            )
 
         argv = [
             "train.py",
@@ -89,6 +93,10 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             "PE001,PE002",
             "--seed",
             "41",
+            "--monthly-jitter",
+            "12",
+            "--empirical-profile-probability",
+            "0.35",
             "--no-export-onnx",
         ]
 
@@ -100,6 +108,33 @@ class ParallelTrainingConfigTests(unittest.TestCase):
         self.assertEqual("subproc", captured["vec_env"])
         self.assertEqual("PE001,PE002", captured["active_workspace_codes"])
         self.assertEqual(41, captured["seed"])
+        self.assertEqual(12, captured["monthly_jitter"])
+        self.assertEqual(0.35, captured["empirical_profile_probability"])
+
+    def test_cli_defaults_match_ten_workspace_episode_shape(self):
+        captured = {}
+
+        def fake_train(args):
+            captured["n_steps"] = args.n_steps
+            captured["active_workspace_codes"] = args.active_workspace_codes
+            captured["monthly_jitter"] = args.monthly_jitter
+            captured["empirical_profile_probability"] = (
+                args.empirical_profile_probability
+            )
+
+        with (
+            patch.object(sys, "argv", ["train.py", "--no-export-onnx"]),
+            patch.object(train_module, "train", fake_train),
+        ):
+            train_module.main()
+
+        self.assertEqual(960, captured["n_steps"])
+        self.assertEqual(
+            train_module.DEFAULT_ACTIVE_WORKSPACE_CODES,
+            captured["active_workspace_codes"],
+        )
+        self.assertEqual(20, captured["monthly_jitter"])
+        self.assertEqual(0.2, captured["empirical_profile_probability"])
 
     def test_auto_vec_env_selection_is_platform_aware(self):
         with patch.object(train_module.sys, "platform", "win32"):

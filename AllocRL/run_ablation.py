@@ -54,29 +54,21 @@ def build_ablation_commands(
 
 def prepare_evaluation_file(data_dir: Path, output_path: Path) -> None:
     from alloc_env.block_generator import BlockDistribution
-    from alloc_env.data_loader import (
-        apply_allowable_block_patterns,
-        load_blocks,
-        load_workspaces,
-        select_workspaces,
-    )
     from alloc_env.strategy import BaseGridStrategy
     from evaluation_scenarios import generate_scenarios, write_scenarios
-    from train import DEFAULT_ACTIVE_WORKSPACE_CODES, parse_workspace_codes
+    from train import (
+        DEFAULT_ACTIVE_WORKSPACE_CODES,
+        load_allocation_scenario,
+        parse_workspace_codes,
+    )
 
     strategy = BaseGridStrategy(step=5.0)
-    workspaces = load_workspaces(
-        str(data_dir / "선행건조 작업장 기준정보.csv"),
-        str(data_dir / "선행건조 지번 기준정보.csv"),
+    csv_blocks, active = load_allocation_scenario(
+        data_dir,
         strategy,
+        parse_workspace_codes(DEFAULT_ACTIVE_WORKSPACE_CODES),
     )
-    apply_allowable_block_patterns(workspaces)
-    csv_path = data_dir / "블록데이터.csv"
-    csv_blocks = load_blocks(str(csv_path), workspaces)
-    active = select_workspaces(
-        workspaces, parse_workspace_codes(DEFAULT_ACTIVE_WORKSPACE_CODES)
-    )
-    distribution = BlockDistribution.from_csv(str(csv_path))
+    distribution = BlockDistribution.from_blocks(csv_blocks)
     base_date = min(block.in_date for block in csv_blocks)
     spread_days = max(
         (max(block.in_date for block in csv_blocks) - base_date).days,
@@ -89,6 +81,9 @@ def prepare_evaluation_file(data_dir: Path, output_path: Path) -> None:
         n_blocks=len(csv_blocks),
         base_date=base_date,
         spread_days=spread_days,
+        source_blocks=csv_blocks,
+        vary_layout=False,
+        empirical_profile_probability=1.0,
     )
     write_scenarios(output_path, scenarios)
 

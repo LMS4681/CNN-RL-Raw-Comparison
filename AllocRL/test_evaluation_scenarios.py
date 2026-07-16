@@ -7,7 +7,7 @@ from pathlib import Path
 
 import train as train_module
 from alloc_env.alloc_env import BlockPlacementEnv
-from alloc_env.block import Block
+from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.block_generator import BlockDistribution
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import LotRegion, Workspace
@@ -122,11 +122,53 @@ class EvaluationScenarioTests(unittest.TestCase):
         self.assertEqual("L1", workspaces[0].lots[0].lot_id)
         self.assertTrue(all(isinstance(block.in_date, date) for block in blocks))
 
+    def test_source_scenarios_keep_workspace_geometry_and_remove_obstacles(self):
+        workspace = make_workspace()
+        workspace.add_pre_placement(PrePlacedBlock(
+            label="old",
+            pos_x=10.0,
+            pos_y=10.0,
+            length=5.0,
+            breadth=5.0,
+            start_date=date(2026, 1, 1),
+            end_date=date(2026, 1, 31),
+        ))
+        source = make_blocks()
+
+        scenarios = generate_scenarios(
+            distribution=BlockDistribution.from_blocks(source),
+            workspaces=[workspace],
+            seeds=[100],
+            n_blocks=3,
+            base_date=date(2026, 1, 5),
+            spread_days=30,
+            source_blocks=source,
+            vary_layout=False,
+            empirical_profile_probability=1.0,
+        )
+
+        record = scenarios[0]["workspaces"][0]
+        self.assertEqual(100.0, record["length"])
+        self.assertEqual(80.0, record["breadth"])
+        self.assertEqual([], record["pre_placements"])
+        self.assertEqual(3, len(scenarios[0]["blocks"]))
+
     def test_scenario_reader_rejects_unknown_schema(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "scenarios.json"
             path.write_text(
                 json.dumps({"schema_version": 999, "scenarios": []}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "schema"):
+                read_scenarios(path)
+
+    def test_scenario_reader_rejects_legacy_five_workspace_schema(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "legacy_scenarios.json"
+            path.write_text(
+                json.dumps({"schema_version": 1, "scenarios": []}),
                 encoding="utf-8",
             )
 

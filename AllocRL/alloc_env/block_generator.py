@@ -7,10 +7,12 @@
 
 from __future__ import annotations
 
+import calendar as month_calendar
 import csv
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -101,6 +103,21 @@ class BlockDistribution:
             duration_days=_fit_dist(durations, floor=2.0),
         )
 
+    @staticmethod
+    def from_blocks(blocks: Sequence[Block]) -> BlockDistribution:
+        """Fit normalization bounds from complete source block records."""
+        if not blocks:
+            raise ValueError("At least one source block is required")
+        return BlockDistribution(
+            length=_fit_observed_dist([block.length for block in blocks], 1.0),
+            breadth=_fit_observed_dist([block.breadth for block in blocks], 1.0),
+            height=_fit_observed_dist([block.height for block in blocks], 0.5),
+            weight=_fit_observed_dist([block.weight for block in blocks], 1.0),
+            duration_days=_fit_observed_dist(
+                [block.original_duration for block in blocks], 1.0
+            ),
+        )
+
 
 # ── 블록 생성기 ──────────────────────────────────────────────────
 
@@ -116,21 +133,71 @@ class SyntheticBlockGenerator:
         self,
         dist: Optional[BlockDistribution] = None,
         seed: Optional[int] = None,
+        source_blocks: Optional[Sequence[Block]] = None,
+        monthly_jitter: int = 20,
+        empirical_profile_probability: float = 0.2,
     ):
         self._dist = dist or BlockDistribution.from_defaults()
         self._rng = np.random.default_rng(seed)
         self._block_counter = 0
+        if monthly_jitter < 0:
+            raise ValueError("monthly_jitter must be non-negative")
+        if not 0.0 <= empirical_profile_probability <= 1.0:
+            raise ValueError(
+                "empirical_profile_probability must be between 0 and 1"
+            )
+        self._source_blocks = tuple(
+            block.clone() for block in (source_blocks or ())
+        )
+        self._monthly_jitter = int(monthly_jitter)
+        self._empirical_profile_probability = float(
+            empirical_profile_probability
+        )
+        self._source_month_counts = Counter(
+            (block.in_date.year, block.in_date.month)
+            for block in self._source_blocks
+        )
 
     @property
     def dist(self) -> BlockDistribution:
         """블록 속성 분포(정규화 상수 등 외부 참조용)."""
         return self._dist
 
+    @property
+    def source_blocks(self) -> Tuple[Block, ...]:
+        return self._source_blocks
+
+    @property
+    def monthly_jitter(self) -> int:
+        return self._monthly_jitter
+
+    @property
+    def empirical_profile_probability(self) -> float:
+        return self._empirical_profile_probability
+
     @classmethod
     def from_csv(cls, csv_path: str, seed: Optional[int] = None):
         """CSV 파일의 분포를 학습하여 생성기 초기화."""
         dist = BlockDistribution.from_csv(csv_path)
         return cls(dist=dist, seed=seed)
+
+    @classmethod
+    def from_blocks(
+        cls,
+        blocks: Sequence[Block],
+        seed: Optional[int] = None,
+        monthly_jitter: int = 20,
+        empirical_profile_probability: float = 0.2,
+    ) -> SyntheticBlockGenerator:
+        """Create a row-bootstrap generator from allocation targets."""
+        source = list(blocks)
+        return cls(
+            dist=BlockDistribution.from_blocks(source),
+            seed=seed,
+            source_blocks=source,
+            monthly_jitter=monthly_jitter,
+            empirical_profile_probability=empirical_profile_probability,
+        )
 
     @classmethod
     def from_defaults(cls, seed: Optional[int] = None):
@@ -153,6 +220,9 @@ class SyntheticBlockGenerator:
                         (min, max) 범위에서 에피소드별 샘플링.
                         기본값 90은 기존 30~90일 랜덤 동작을 유지.
         """
+        if self._source_blocks:
+            return self._generate_monthly_bootstrap(n_blocks)
+
         dist = self._dist
 
         if isinstance(spread_days, tuple):
@@ -204,6 +274,107 @@ class SyntheticBlockGenerator:
             blocks.append(block)
 
         return blocks
+
+    def _generate_monthly_bootstrap(self, n_blocks: int) -> List[Block]:
+        if n_blocks < 1:
+            return []
+
+        month_keys = sorted(self._source_month_counts)
+        if self._rng.random() < self._empirical_profile_probability:
+            month_counts = self._empirical_month_counts(n_blocks, month_keys)
+        else:
+            month_counts = self._balanced_month_counts(n_blocks, month_keys)
+
+        source_by_month = {
+            key: [
+                block for block in self._source_blocks
+                if (block.in_date.year, block.in_date.month) == key
+            ]
+            for key in month_keys
+        }
+        blocks: List[Block] = []
+        for key, count in zip(month_keys, month_counts):
+            year, month = key
+            templates = source_by_month[key]
+            working_dates = _working_dates_in_month(year, month)
+            template_indices = self._rng.integers(
+                0, len(templates), size=int(count)
+            )
+            date_indices = self._rng.integers(
+                0, len(working_dates), size=int(count)
+            )
+            for template_index, date_index in zip(
+                template_indices, date_indices
+            ):
+                self._block_counter += 1
+                template = templates[int(template_index)]
+                in_date = working_dates[int(date_index)]
+                duration = max(int(template.original_duration), 1)
+                out_date = cal.calculate_end_date(in_date, duration)
+                blocks.append(Block(
+                    name=f"SYN-{self._block_counter:05d}",
+                    ship_no=template.ship_no,
+                    block_type=template.block_type,
+                    length=template.length,
+                    breadth=template.breadth,
+                    height=template.height,
+                    weight=template.weight,
+                    in_date=in_date,
+                    out_date=out_date,
+                ))
+
+        blocks.sort(key=lambda block: (block.in_date, block.name))
+        return blocks
+
+    def _balanced_month_counts(
+        self, n_blocks: int, month_keys: Sequence[Tuple[int, int]]
+    ) -> np.ndarray:
+        n_months = len(month_keys)
+        base = np.full(n_months, n_blocks // n_months, dtype=np.int64)
+        remainder = n_blocks % n_months
+        if remainder:
+            indices = self._rng.choice(n_months, size=remainder, replace=False)
+            base[indices] += 1
+
+        jitter = self._monthly_jitter
+        if jitter == 0:
+            return base
+        lower = -np.minimum(base, jitter)
+        offsets = np.array([
+            self._rng.integers(int(low), jitter + 1)
+            for low in lower
+        ], dtype=np.int64)
+        correction = -int(offsets.sum())
+        while correction != 0:
+            if correction > 0:
+                candidates = np.flatnonzero(offsets < jitter)
+                index = int(self._rng.choice(candidates))
+                step = min(correction, jitter - int(offsets[index]))
+                offsets[index] += step
+                correction -= step
+            else:
+                candidates = np.flatnonzero(offsets > lower)
+                index = int(self._rng.choice(candidates))
+                step = min(-correction, int(offsets[index] - lower[index]))
+                offsets[index] -= step
+                correction += step
+        return base + offsets
+
+    def _empirical_month_counts(
+        self, n_blocks: int, month_keys: Sequence[Tuple[int, int]]
+    ) -> np.ndarray:
+        source_counts = np.array(
+            [self._source_month_counts[key] for key in month_keys],
+            dtype=np.float64,
+        )
+        raw = source_counts * (float(n_blocks) / float(source_counts.sum()))
+        counts = np.floor(raw).astype(np.int64)
+        remainder = n_blocks - int(counts.sum())
+        if remainder:
+            fractions = raw - counts
+            order = np.argsort(-fractions, kind="stable")
+            counts[order[:remainder]] += 1
+        return counts
 
     def generate_preplaced(
         self,
@@ -359,3 +530,27 @@ def _fit_dist(values: list, floor: float = 0.0) -> DistParam:
         low=max(floor, float(p5)),
         high=float(p95),
     )
+
+
+def _fit_observed_dist(values: Sequence[float], floor: float) -> DistParam:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        raise ValueError("Cannot fit an empty observed distribution")
+    return DistParam(
+        mean=float(arr.mean()),
+        std=float(arr.std()),
+        low=max(floor, float(arr.min())),
+        high=max(floor, float(arr.max())),
+    )
+
+
+def _working_dates_in_month(year: int, month: int) -> List[date]:
+    last_day = month_calendar.monthrange(year, month)[1]
+    result = [
+        date(year, month, day)
+        for day in range(1, last_day + 1)
+        if cal.is_working_day(date(year, month, day))
+    ]
+    if not result:
+        raise ValueError(f"Month has no working dates: {year:04d}-{month:02d}")
+    return result

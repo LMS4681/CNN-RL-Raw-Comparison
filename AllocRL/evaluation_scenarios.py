@@ -9,11 +9,12 @@ from pathlib import Path
 
 from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.block_generator import BlockDistribution, SyntheticBlockGenerator
+from alloc_env.data_loader import clone_empty_workspaces
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import LotRegion, Workspace
 
 
-SCENARIO_SCHEMA_VERSION = 1
+SCENARIO_SCHEMA_VERSION = 2
 
 
 def _block_record(block: Block) -> dict:
@@ -81,16 +82,28 @@ def generate_scenarios(
     n_blocks: int,
     base_date: date,
     spread_days: int,
+    source_blocks: list[Block] | None = None,
+    vary_layout: bool = True,
+    empirical_profile_probability: float = 0.2,
 ) -> list[dict]:
     scenarios = []
     for seed in seeds:
-        generator = SyntheticBlockGenerator(dist=distribution, seed=seed)
+        generator = SyntheticBlockGenerator(
+            dist=distribution,
+            seed=seed,
+            source_blocks=source_blocks,
+            empirical_profile_probability=empirical_profile_probability,
+        )
         blocks = generator.generate(
             n_blocks=n_blocks,
             base_date=base_date,
             spread_days=spread_days,
         )
-        scenario_workspaces = generator.generate_workspaces(workspaces)
+        scenario_workspaces = (
+            generator.generate_workspaces(workspaces)
+            if vary_layout
+            else clone_empty_workspaces(workspaces)
+        )
         scenarios.append(
             {
                 "seed": int(seed),

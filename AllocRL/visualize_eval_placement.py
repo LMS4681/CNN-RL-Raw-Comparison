@@ -23,7 +23,11 @@ import numpy as np
 from alloc_env.block import Block, PrePlacedBlock, SAFETY_DISTANCE
 from alloc_env.simulator import SimulationResult
 from alloc_env.workspace import Workspace
-from train import load_model_run_config, resolve_model_archive_path
+from train import (
+    load_model_run_config,
+    require_current_training_data_schema,
+    resolve_model_archive_path,
+)
 
 EPSILON = 1e-5
 
@@ -434,19 +438,16 @@ def evaluate_model_and_export(
 ) -> list[dict[str, str]]:
     from sb3_contrib import MaskablePPO
 
-    from alloc_env.data_loader import (
-        apply_allowable_block_patterns,
-        load_blocks,
-        load_workspaces,
-        select_workspaces_in_order,
-    )
     from alloc_env.strategy import BaseGridStrategy
-    from train import create_evaluation_env
+    from train import create_evaluation_env, load_allocation_scenario
 
     _setup_korean_font()  # 한글 라벨 깨짐 방지 (폰트 없으면 무시)
 
     model_path = resolve_model_archive_path(model_path)
     run_config = load_model_run_config(model_path)
+    require_current_training_data_schema(
+        run_config, source="placement visualization"
+    )
     grid_size = int(run_config.get("grid_size", grid_size or 64))
     n_future_blocks = int(
         run_config.get(
@@ -466,14 +467,9 @@ def evaluate_model_and_export(
 
     data_dir = Path(data_dir)
     strategy = BaseGridStrategy(step=5.0)
-    workspaces = load_workspaces(
-        str(data_dir / "선행건조 작업장 기준정보.csv"),
-        str(data_dir / "선행건조 지번 기준정보.csv"),
-        strategy,
+    blocks, workspaces = load_allocation_scenario(
+        data_dir, strategy, active_codes
     )
-    apply_allowable_block_patterns(workspaces)
-    blocks = load_blocks(str(data_dir / "블록데이터.csv"), workspaces)
-    workspaces = select_workspaces_in_order(workspaces, active_codes)
 
     env = create_evaluation_env(
         blocks,

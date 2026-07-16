@@ -9,6 +9,7 @@ C# DataLoader의 Python 재구현.
 
 from __future__ import annotations
 
+import copy
 import csv
 from datetime import datetime, date
 from pathlib import Path
@@ -60,6 +61,9 @@ def load_workspaces(
     strategy: Optional[BaseGridStrategy] = None,
     workspace_limit: Optional[int] = DEFAULT_WORKSPACE_LIMIT,
     target_name_prefix: Optional[str] = DEFAULT_TARGET_NAME_PREFIX,
+    supplemental_workspaces: Optional[
+        Mapping[str, Tuple[str, float, float]]
+    ] = None,
 ) -> List[Workspace]:
     """작업장 CSV + 지번 CSV → Workspace 목록 생성."""
     if strategy is None:
@@ -69,6 +73,10 @@ def load_workspaces(
 
     ws_master = _parse_workspace_csv(workspace_csv)
     lots_per_ws = _parse_lot_csv(lot_csv)
+    for code, spec in (supplemental_workspaces or {}).items():
+        normalized_code = code.strip().upper()
+        if normalized_code and normalized_code not in ws_master:
+            ws_master[normalized_code] = spec
     workspace_items = list(ws_master.items())
     if workspace_limit is not None:
         workspace_items = workspace_items[:workspace_limit]
@@ -102,6 +110,15 @@ def load_workspaces(
     total_lots = sum(len(ws.lots) for ws in workspaces)
     print(f"[DataLoader] 작업장 {len(workspaces)}개 로드 (지번 총 {total_lots}개)")
     return workspaces
+
+
+def clone_empty_workspaces(workspaces: Sequence[Workspace]) -> List[Workspace]:
+    """Clone workspace geometry while removing all placement state."""
+    result = copy.deepcopy(list(workspaces))
+    for workspace in result:
+        workspace.blocks.clear()
+        workspace.pre_placements.clear()
+    return result
 
 
 def apply_allowable_block_patterns(
@@ -260,6 +277,76 @@ def load_blocks(
     print(f"[DataLoader] 기배치 {pre_placed_count}개, "
           f"미배치 {len(unplaced)}개, 스킵 {skipped}개")
     return unplaced
+
+
+def load_target_blocks(
+    block_csv: str,
+    excluded_start_months: Sequence[int] = (7, 11),
+) -> List[Block]:
+    """Load every eligible CSV row as a new allocation target.
+
+    Every row uses its construction start/end dates. Historical workspace
+    codes, coordinates, actual placement dates, and placement state are
+    deliberately ignored.
+    """
+    excluded = {int(month) for month in excluded_start_months}
+    if any(month < 1 or month > 12 for month in excluded):
+        raise ValueError("excluded_start_months must contain months 1 through 12")
+
+    targets: List[Block] = []
+    skipped = 0
+    excluded_count = 0
+    with _open_csv(block_csv) as file:
+        reader = csv.reader(file)
+        next(reader)
+        for row in reader:
+            if len(row) < 19:
+                skipped += 1
+                continue
+
+            length = _parse_float(row[COL_LENGTH])
+            breadth = _parse_float(row[COL_BREADTH])
+            if length <= 0 or breadth <= 0:
+                skipped += 1
+                continue
+
+            scheduled_pair = (
+                _try_parse_date(row[COL_SCHEDULE_IN]),
+                _try_parse_date(row[COL_SCHEDULE_OUT]),
+            )
+            if not all(scheduled_pair):
+                skipped += 1
+                continue
+            start_date, end_date = scheduled_pair
+
+            assert start_date is not None and end_date is not None
+            if start_date.month in excluded:
+                excluded_count += 1
+                continue
+            if end_date < start_date:
+                skipped += 1
+                continue
+
+            start_date = cal.adjust_to_working_day(start_date, forward=True)
+            end_date = cal.adjust_to_working_day(end_date, forward=True)
+            targets.append(Block(
+                name=row[COL_BLOCK_NAME].strip(),
+                ship_no=row[COL_SHIP_NO].strip(),
+                block_type="BUILD",
+                length=length,
+                breadth=breadth,
+                height=_parse_float(row[COL_HEIGHT]),
+                weight=_parse_float(row[COL_WEIGHT]),
+                in_date=start_date,
+                out_date=end_date,
+            ))
+
+    targets.sort(key=lambda block: (block.in_date, block.ship_no, block.name))
+    print(
+        f"[DataLoader] allocation targets={len(targets)}, "
+        f"excluded_month={excluded_count}, skipped={skipped}"
+    )
+    return targets
 
 
 # ── 내부 파서 ─────────────────────────────────────────────────────

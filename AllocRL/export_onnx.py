@@ -15,34 +15,26 @@ def export_saved_model(
     """Recreate the saved observation space and export the actor to ONNX."""
     from sb3_contrib import MaskablePPO
 
-    from alloc_env.data_loader import (
-        apply_allowable_block_patterns,
-        load_blocks,
-        load_workspaces,
-        select_workspaces_in_order,
-    )
     from alloc_env.strategy import BaseGridStrategy
     from train import (
         create_evaluation_env,
         export_to_onnx,
+        load_allocation_scenario,
         load_model_run_config,
+        require_current_training_data_schema,
         resolve_model_archive_path,
     )
 
     model_path = resolve_model_archive_path(model_path)
     run_config = load_model_run_config(model_path)
+    require_current_training_data_schema(run_config, source="ONNX export")
     data_dir = Path(data_dir).expanduser().resolve()
 
     strategy = BaseGridStrategy(step=5.0)
-    workspaces = load_workspaces(
-        str(data_dir / "선행건조 작업장 기준정보.csv"),
-        str(data_dir / "선행건조 지번 기준정보.csv"),
+    blocks, workspaces = load_allocation_scenario(
+        data_dir,
         strategy,
-    )
-    apply_allowable_block_patterns(workspaces)
-    blocks = load_blocks(str(data_dir / "블록데이터.csv"), workspaces)
-    workspaces = select_workspaces_in_order(
-        workspaces, run_config.get("active_workspace_codes")
+        run_config.get("active_workspace_codes"),
     )
 
     env = create_evaluation_env(

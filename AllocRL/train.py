@@ -25,7 +25,16 @@ import numpy as np
 from stable_baselines3.common.callbacks import CheckpointCallback
 
 
-DEFAULT_ACTIVE_WORKSPACE_CODES = "PE052,PE055,PE051,PE050,PE049"
+DEFAULT_ACTIVE_WORKSPACE_CODES = (
+    "PE049,PE050,PE055,PE054,PE056,PE048,PE044,PE059,PE060,PE061"
+)
+DEFAULT_SUPPLEMENTAL_WORKSPACES = {
+    "PE054": ("500-B", 51.0, 31.0),
+}
+DEFAULT_EXCLUDED_START_MONTHS = (7, 11)
+DEFAULT_MONTHLY_JITTER = 20
+DEFAULT_EMPIRICAL_PROFILE_PROBABILITY = 0.2
+TRAINING_DATA_SCHEMA_VERSION = 1
 OBSERVATION_SCHEMA_VERSION = 2
 REWARD_SCHEMA_VERSION = 2
 MODEL_FILENAME = "block_placement_ppo.sb3"
@@ -48,6 +57,38 @@ def parse_workspace_codes(value: str | None) -> list[str] | None:
         return None
     codes = [code.strip().upper() for code in value.split(",") if code.strip()]
     return codes or None
+
+
+def load_allocation_scenario(
+    data_dir: str | Path,
+    strategy,
+    active_workspace_codes: list[str] | None = None,
+):
+    """Load the fixed ten-yard scenario used by training and model tools."""
+    from alloc_env.data_loader import (
+        apply_allowable_block_patterns,
+        clone_empty_workspaces,
+        load_target_blocks,
+        load_workspaces,
+        select_workspaces_in_order,
+    )
+
+    data_dir = Path(data_dir)
+    workspaces = load_workspaces(
+        str(data_dir / "선행건조 작업장 기준정보.csv"),
+        str(data_dir / "선행건조 지번 기준정보.csv"),
+        strategy,
+        supplemental_workspaces=DEFAULT_SUPPLEMENTAL_WORKSPACES,
+    )
+    apply_allowable_block_patterns(workspaces)
+    blocks = load_target_blocks(
+        str(data_dir / "블록데이터.csv"),
+        excluded_start_months=DEFAULT_EXCLUDED_START_MONTHS,
+    )
+    selected = select_workspaces_in_order(
+        workspaces, active_workspace_codes
+    )
+    return blocks, clone_empty_workspaces(selected)
 
 
 def set_global_seed(seed: int) -> None:
@@ -133,6 +174,11 @@ def make_env(
     strategy,
     use_synthetic=False,
     generator_dist=None,
+    generator_source_blocks=None,
+    generator_monthly_jitter=DEFAULT_MONTHLY_JITTER,
+    generator_empirical_profile_probability=(
+        DEFAULT_EMPIRICAL_PROFILE_PROBABILITY
+    ),
     synthetic_n_blocks=None,
     vary_layout=True,
     grid_size=64,
@@ -145,7 +191,15 @@ def make_env(
 
     def _init():
         local_generator = (
-            SyntheticBlockGenerator(dist=generator_dist, seed=env_seed)
+            SyntheticBlockGenerator(
+                dist=generator_dist,
+                seed=env_seed,
+                source_blocks=generator_source_blocks,
+                monthly_jitter=generator_monthly_jitter,
+                empirical_profile_probability=(
+                    generator_empirical_profile_probability
+                ),
+            )
             if generator_dist is not None
             else None
         )
@@ -186,8 +240,20 @@ def create_training_env(
         "strategy": strategy,
         "use_synthetic": True,
         "generator_dist": generator.dist if generator is not None else None,
+        "generator_source_blocks": (
+            generator.source_blocks if generator is not None else None
+        ),
+        "generator_monthly_jitter": (
+            generator.monthly_jitter
+            if generator is not None else DEFAULT_MONTHLY_JITTER
+        ),
+        "generator_empirical_profile_probability": (
+            generator.empirical_profile_probability
+            if generator is not None
+            else DEFAULT_EMPIRICAL_PROFILE_PROBABILITY
+        ),
         "synthetic_n_blocks": len(blocks),
-        "vary_layout": True,
+        "vary_layout": False,
         "grid_size": grid_size,
         "n_future_blocks": n_future_blocks,
     }
@@ -236,6 +302,7 @@ def create_evaluation_env(
 
 # 관측 공간·네트워크 구조에 영향을 주는 키. 이어학습하려면 이 값들이 모두 같아야 한다.
 ARCH_CONFIG_KEYS = (
+    "training_data_schema_version",
     "observation_schema_version",
     "reward_schema_version",
     "extractor",
@@ -243,11 +310,15 @@ ARCH_CONFIG_KEYS = (
     "grid_size",
     "features_dim",
     "active_workspace_codes",
+    "excluded_start_months",
+    "monthly_jitter",
+    "empirical_profile_probability",
 )
 
 
 def current_run_config(args, active_workspace_codes) -> dict:
     return {
+        "training_data_schema_version": TRAINING_DATA_SCHEMA_VERSION,
         "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
         "reward_schema_version": REWARD_SCHEMA_VERSION,
         "extractor": args.extractor,
@@ -255,6 +326,15 @@ def current_run_config(args, active_workspace_codes) -> dict:
         "grid_size": args.grid_size,
         "features_dim": args.features_dim,
         "active_workspace_codes": list(active_workspace_codes or []),
+        "excluded_start_months": list(DEFAULT_EXCLUDED_START_MONTHS),
+        "monthly_jitter": getattr(
+            args, "monthly_jitter", DEFAULT_MONTHLY_JITTER
+        ),
+        "empirical_profile_probability": getattr(
+            args,
+            "empirical_profile_probability",
+            DEFAULT_EMPIRICAL_PROFILE_PROBABILITY,
+        ),
         "seed": args.seed,
         "eval_scenarios": getattr(args, "eval_scenarios", None),
     }
@@ -359,6 +439,21 @@ def configs_compatible(saved: dict, current: dict):
         if saved.get(key) != current.get(key):
             return False, key
     return True, None
+
+
+def require_current_training_data_schema(
+    config: dict,
+    source: str,
+) -> None:
+    saved_version = config.get("training_data_schema_version")
+    if saved_version == TRAINING_DATA_SCHEMA_VERSION:
+        return
+    raise ValueError(
+        f"[{source}] Saved model training_data_schema_version is "
+        f"incompatible: saved={saved_version}, "
+        f"current={TRAINING_DATA_SCHEMA_VERSION}. Use the matching legacy "
+        "code or train a new model."
+    )
 
 
 def require_compatible_run_config(
@@ -488,12 +583,6 @@ def train(args):
     """MaskablePPO 학습 실행."""
     from sb3_contrib import MaskablePPO
 
-    from alloc_env.data_loader import (
-        apply_allowable_block_patterns,
-        load_blocks,
-        load_workspaces,
-        select_workspaces,
-    )
     from alloc_env.strategy import BaseGridStrategy
     from alloc_env.callbacks import AllocationCallback, TrainingMetricsCallback
     from alloc_env.block_generator import SyntheticBlockGenerator
@@ -504,35 +593,41 @@ def train(args):
     set_global_seed(args.seed)
 
     data_dir = Path(args.data_dir)
-    ws_csv   = str(data_dir / "선행건조 작업장 기준정보.csv")
-    lot_csv  = str(data_dir / "선행건조 지번 기준정보.csv")
-    blk_csv  = str(data_dir / "블록데이터.csv")
-
     print("=" * 60)
     print("  블록 배치 강화학습 - MaskablePPO")
     print("=" * 60)
 
     # ── 1. 데이터 로드 ────────────────────────────────────────────
     strategy = BaseGridStrategy(step=5.0)
-    workspaces = load_workspaces(ws_csv, lot_csv, strategy)
-    apply_allowable_block_patterns(workspaces)
-    blocks = load_blocks(blk_csv, workspaces)
     active_workspace_codes = parse_workspace_codes(args.active_workspace_codes)
-    total_workspace_count = len(workspaces)
-    workspaces = select_workspaces(workspaces, active_workspace_codes)
+    blocks, workspaces = load_allocation_scenario(
+        data_dir, strategy, active_workspace_codes
+    )
 
     print(f"블록 {len(blocks)}개, 작업장 {len(workspaces)}개")
     if active_workspace_codes:
         print(
-            f"Active workspaces: {len(workspaces)}/{total_workspace_count} "
+            f"Active workspaces: {len(workspaces)} "
             f"({', '.join(ws.code for ws in workspaces)})"
         )
     else:
         print(f"Active workspaces: all {len(workspaces)}")
 
     # ── 2. Synthetic 블록 생성기 ─────────────────────────────────
-    generator = SyntheticBlockGenerator.from_csv(blk_csv, seed=args.seed)
-    print("[Synthetic] CSV 분포 기반 블록 생성기 초기화 완료")
+    generator = SyntheticBlockGenerator.from_blocks(
+        blocks,
+        seed=args.seed,
+        monthly_jitter=args.monthly_jitter,
+        empirical_profile_probability=(
+            args.empirical_profile_probability
+        ),
+    )
+    print(
+        "[Synthetic] fixed total="
+        f"{len(blocks)}, monthly jitter=+/-{args.monthly_jitter}, "
+        "empirical profile probability="
+        f"{args.empirical_profile_probability:.2f}"
+    )
 
     # ── 3. 환경 생성 (학습: synthetic, 평가: CSV 원본) ────────────
     env = create_training_env(
@@ -921,8 +1016,8 @@ def main():
                         help="총 학습 타임스텝")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="학습률 (learning rate)")
-    parser.add_argument("--n-steps", type=int, default=554,
-                        help="PPO n_steps (에피소드 길이×2 권장)")
+    parser.add_argument("--n-steps", type=int, default=960,
+                        help="PPO n_steps (913-block episode 근사, batch 64 배수)")
     parser.add_argument("--grid-size", type=int, default=64,
                         help="점유 그리드 해상도 (64 or 128, 메모리에 영향)")
     parser.add_argument("--batch-size", type=int, default=64,
@@ -957,6 +1052,18 @@ def main():
                         help="PyTorch device for policy training")
     parser.add_argument("--seed", type=int, default=0,
                         help="global and environment random seed")
+    parser.add_argument(
+        "--monthly-jitter",
+        type=int,
+        default=DEFAULT_MONTHLY_JITTER,
+        help="balanced profile monthly count jitter (fixed total)",
+    )
+    parser.add_argument(
+        "--empirical-profile-probability",
+        type=float,
+        default=DEFAULT_EMPIRICAL_PROFILE_PROBABILITY,
+        help="probability of using the empirical monthly count profile",
+    )
     parser.add_argument("--n-envs", type=int, default=1,
                         help="number of parallel training environments")
     parser.add_argument("--vec-env", type=str, default="auto",

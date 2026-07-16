@@ -250,12 +250,32 @@ class BlockPlacementEnv(gym.Env):
             self._max_breadth = max(float(dist.breadth.high), 1.0)
             self._max_height  = max(float(dist.height.high), 1.0)
             self._max_weight  = max(float(dist.weight.high), 1.0)
-            # duration_days는 달력일 분포. 생성기는 근무일 공기를
-            # working_dur ≈ dur*0.7 (최소 2)로 만든다(block_generator.generate).
-            self._max_duration = max(int(dist.duration_days.high * 0.7), 1)
-            # 입고 긴급도 기준: synthetic base_date와 생성기 분산 범위
-            self._base_date = self._synthetic_base_date
-            self._date_spread = max(self._synthetic_spread_range[1], 1)
+            source_blocks = getattr(gen, "source_blocks", ())
+            if source_blocks:
+                self._max_duration = max(
+                    max(block.original_duration for block in source_blocks),
+                    1,
+                )
+                self._base_date = min(
+                    block.in_date for block in source_blocks
+                )
+                self._date_spread = max(
+                    (
+                        max(block.in_date for block in source_blocks)
+                        - self._base_date
+                    ).days,
+                    1,
+                )
+            else:
+                # Parametric generation converts calendar duration to an
+                # approximate working-day duration with a 0.7 factor.
+                self._max_duration = max(
+                    int(dist.duration_days.high * 0.7), 1
+                )
+                self._base_date = self._synthetic_base_date
+                self._date_spread = max(
+                    self._synthetic_spread_range[1], 1
+                )
         else:
             blocks = self._original_blocks
             self._max_length  = max((b.length  for b in blocks), default=1.0) or 1.0
