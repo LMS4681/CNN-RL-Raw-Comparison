@@ -16,6 +16,21 @@ ABLATIONS = {
     "D": ("candidate-cnn", 0),
     "E": ("candidate-cnn", 4),
 }
+BLOCK_SOURCE_FILENAME = "\ube14\ub85d\ub370\uc774\ud130.csv"
+
+
+def _block_source_path(data_dir: Path) -> Path:
+    source_path = data_dir / BLOCK_SOURCE_FILENAME
+    if not source_path.is_file():
+        raise FileNotFoundError(
+            f"Evaluation source file does not exist: {source_path}"
+        )
+    lines = source_path.read_bytes().splitlines()
+    if not lines or b"STAGE" not in lines[0]:
+        raise ValueError(
+            f"Evaluation source file is invalid: {source_path}"
+        )
+    return source_path
 
 
 def build_ablation_commands(
@@ -64,16 +79,12 @@ def prepare_evaluation_file(data_dir: Path, output_path: Path) -> None:
         parse_workspace_codes,
     )
 
+    source_path = _block_source_path(data_dir)
     strategy = BaseGridStrategy(step=5.0)
     csv_blocks, active = load_allocation_scenario(
         data_dir,
         strategy,
         parse_workspace_codes(DEFAULT_ACTIVE_WORKSPACE_CODES),
-    )
-    source_path = next(
-        path
-        for path in data_dir.glob("*.csv")
-        if b"STAGE" in path.read_bytes().splitlines()[0]
     )
     split = split_blocks_by_ship(csv_blocks, source_path)
     target_month_counts = Counter(
@@ -100,6 +111,9 @@ def prepare_evaluation_file(data_dir: Path, output_path: Path) -> None:
     metadata = {
         **split.manifest,
         "source": "holdout_fixed",
+        "source_ship_count": len({block.ship_no for block in csv_blocks}),
+        "training_ship_count": len(split.manifest["training_ship_nos"]),
+        "holdout_ship_count": len(split.manifest["holdout_ship_nos"]),
         "target_month_counts": {
             f"{year:04d}-{month:02d}": count
             for (year, month), count in sorted(target_month_counts.items())

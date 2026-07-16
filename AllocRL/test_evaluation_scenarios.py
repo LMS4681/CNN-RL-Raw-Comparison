@@ -1,5 +1,6 @@
 import csv
 import json
+import shutil
 import tempfile
 import unittest
 from collections import Counter
@@ -27,6 +28,7 @@ from evaluation_scenarios import (
 )
 from run_ablation import (
     ABLATIONS,
+    _block_source_path,
     build_ablation_commands,
     prepare_evaluation_file,
 )
@@ -39,14 +41,8 @@ from train import (
 
 
 DATA_DIR = Path(__file__).parent / "data"
-
-
-def block_csv_path(data_dir: Path) -> Path:
-    return next(
-        path
-        for path in data_dir.glob("*.csv")
-        if b"STAGE" in path.read_bytes().splitlines()[0]
-    )
+BLOCK_SOURCE_FILENAME = "\ube14\ub85d\ub370\uc774\ud130.csv"
+BLOCK_CSV = DATA_DIR / BLOCK_SOURCE_FILENAME
 
 
 def make_workspace(code: str = "PE001") -> Workspace:
@@ -177,9 +173,37 @@ class EvaluationScenarioTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "scenarios.json"
             write_scenarios(path, scenarios, metadata)
+            duplicate_path = Path(tmpdir) / "duplicate_scenarios.json"
+            write_scenarios(duplicate_path, scenarios, metadata)
             self.assertEqual(scenarios, read_scenarios(path))
             self.assertEqual(metadata, read_scenario_metadata(path))
             self.assertEqual("holdout_fixed", scenarios[0]["source"])
+            self.assertEqual(path.read_bytes(), duplicate_path.read_bytes())
+
+    def test_block_source_path_uses_exact_filename_despite_extra_csv(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            copied_data_dir = Path(tmpdir) / "data"
+            shutil.copytree(DATA_DIR, copied_data_dir)
+            (copied_data_dir / "00-distractor.csv").write_bytes(
+                b"STAGE,distractor\n"
+            )
+
+            self.assertEqual(
+                copied_data_dir / BLOCK_SOURCE_FILENAME,
+                _block_source_path(copied_data_dir),
+            )
+
+    def test_block_source_path_rejects_missing_or_invalid_exact_source(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = Path(tmpdir) / "data"
+            data_dir.mkdir()
+
+            with self.assertRaisesRegex(FileNotFoundError, "source file"):
+                _block_source_path(data_dir)
+
+            (data_dir / BLOCK_SOURCE_FILENAME).write_bytes(b"invalid\n")
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                _block_source_path(data_dir)
 
     def test_prepare_evaluation_file_uses_holdout_templates_and_full_profile(
         self,
@@ -189,8 +213,7 @@ class EvaluationScenarioTests(unittest.TestCase):
             BaseGridStrategy(step=5.0),
             parse_workspace_codes(DEFAULT_ACTIVE_WORKSPACE_CODES),
         )
-        source_path = block_csv_path(DATA_DIR)
-        split = split_blocks_by_ship(blocks, source_path)
+        split = split_blocks_by_ship(blocks, BLOCK_CSV)
         target_month_counts = Counter(
             (block.in_date.year, block.in_date.month) for block in blocks
         )
@@ -211,10 +234,13 @@ class EvaluationScenarioTests(unittest.TestCase):
         self.assertEqual("holdout_fixed", metadata["source"])
         self.assertEqual(DEFAULT_SPLIT_SEED, metadata["split_seed"])
         self.assertEqual(
-            sha256_file(source_path), metadata["source_sha256"]
+            sha256_file(BLOCK_CSV), metadata["source_sha256"]
         )
         self.assertEqual(913, metadata["source_row_count"])
         self.assertEqual(240, metadata["holdout_row_count"])
+        self.assertEqual(40, metadata["source_ship_count"])
+        self.assertEqual(29, metadata["training_ship_count"])
+        self.assertEqual(11, metadata["holdout_ship_count"])
         self.assertEqual(
             split.manifest["source_month_counts"],
             metadata["target_month_counts"],
@@ -301,6 +327,33 @@ class EvaluationScenarioTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "schema"):
+                read_scenarios(path)
+
+    def test_scenario_reader_rejects_non_object_payload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scenarios.json"
+            path.write_text(json.dumps([]), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "object"):
+                read_scenarios(path)
+
+    def test_scenario_reader_rejects_scenario_missing_required_keys(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scenarios.json"
+            path.write_text(
+                json.dumps({
+                    "schema_version": 3,
+                    "metadata": {},
+                    "scenarios": [{
+                        "seed": 1000,
+                        "source": "holdout_fixed",
+                        "blocks": [],
+                    }],
+                }),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "seed, source"):
                 read_scenarios(path)
 
     def test_ablation_matrix_contains_five_models_per_seed(self):

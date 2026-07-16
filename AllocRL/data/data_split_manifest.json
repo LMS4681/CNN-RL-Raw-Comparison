@@ -77,6 +77,9 @@
     "2026-06": 73
   },
   "source": "holdout_fixed",
+  "source_ship_count": 40,
+  "training_ship_count": 29,
+  "holdout_ship_count": 11,
   "target_month_counts": {
     "2025-12": 64,
     "2026-01": 122,

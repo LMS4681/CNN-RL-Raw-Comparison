@@ -16,6 +16,9 @@ from alloc_env.workspace import LotRegion, Workspace
 
 
 SCENARIO_SCHEMA_VERSION = 3
+SCENARIO_REQUIRED_KEYS = frozenset({
+    "seed", "source", "blocks", "workspaces"
+})
 
 
 def _block_record(block: Block) -> dict:
@@ -130,10 +133,7 @@ def write_scenarios(
     if not isinstance(metadata, dict):
         raise ValueError("Evaluation scenario metadata must be a dictionary")
     for scenario in scenarios:
-        if not isinstance(scenario, dict) or not {
-            "seed", "source", "blocks", "workspaces"
-        }.issubset(scenario):
-            raise ValueError("Evaluation scenarios must include seed, source, blocks, and workspaces")
+        _validate_scenario(scenario)
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -150,13 +150,27 @@ def write_scenarios(
 
 def _read_payload(path: str | Path) -> dict:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Evaluation scenario payload must be an object")
     if payload.get("schema_version") != SCENARIO_SCHEMA_VERSION:
         raise ValueError("Unsupported evaluation scenario schema")
     if not isinstance(payload.get("metadata"), dict):
         raise ValueError("Evaluation scenario payload must contain metadata")
     if not isinstance(payload.get("scenarios"), list):
         raise ValueError("Evaluation scenario payload must contain a list")
+    for scenario in payload["scenarios"]:
+        _validate_scenario(scenario)
     return payload
+
+
+def _validate_scenario(scenario: object) -> None:
+    if not isinstance(scenario, dict) or not SCENARIO_REQUIRED_KEYS.issubset(
+        scenario
+    ):
+        raise ValueError(
+            "Evaluation scenarios must include seed, source, blocks, and "
+            "workspaces"
+        )
 
 
 def read_scenarios(path: str | Path) -> list[dict]:
