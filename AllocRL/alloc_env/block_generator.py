@@ -12,7 +12,7 @@ import csv
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -136,6 +136,7 @@ class SyntheticBlockGenerator:
         source_blocks: Optional[Sequence[Block]] = None,
         monthly_jitter: int = 20,
         empirical_profile_probability: float = 0.2,
+        target_month_counts: Optional[Mapping[Tuple[int, int], int]] = None,
     ):
         self._dist = dist or BlockDistribution.from_defaults()
         self._rng = np.random.default_rng(seed)
@@ -157,6 +158,19 @@ class SyntheticBlockGenerator:
             (block.in_date.year, block.in_date.month)
             for block in self._source_blocks
         )
+        self._target_month_counts = Counter(
+            dict(sorted({
+                (int(year), int(month)): int(count)
+                for (year, month), count in (
+                    target_month_counts or self._source_month_counts
+                ).items()
+            }.items()))
+        )
+        for key, count in self._target_month_counts.items():
+            if count < 0:
+                raise ValueError("target month counts must be non-negative")
+            if count and key not in self._source_month_counts:
+                raise ValueError(f"Target month {key} has no source templates")
 
     @property
     def dist(self) -> BlockDistribution:
@@ -166,6 +180,10 @@ class SyntheticBlockGenerator:
     @property
     def source_blocks(self) -> Tuple[Block, ...]:
         return self._source_blocks
+
+    @property
+    def target_month_counts(self) -> dict[tuple[int, int], int]:
+        return dict(self._target_month_counts)
 
     @property
     def monthly_jitter(self) -> int:
@@ -188,6 +206,7 @@ class SyntheticBlockGenerator:
         seed: Optional[int] = None,
         monthly_jitter: int = 20,
         empirical_profile_probability: float = 0.2,
+        target_month_counts: Optional[Mapping[Tuple[int, int], int]] = None,
     ) -> SyntheticBlockGenerator:
         """Create a row-bootstrap generator from allocation targets."""
         source = list(blocks)
@@ -197,6 +216,7 @@ class SyntheticBlockGenerator:
             source_blocks=source,
             monthly_jitter=monthly_jitter,
             empirical_profile_probability=empirical_profile_probability,
+            target_month_counts=target_month_counts,
         )
 
     @classmethod
@@ -279,7 +299,7 @@ class SyntheticBlockGenerator:
         if n_blocks < 1:
             return []
 
-        month_keys = sorted(self._source_month_counts)
+        month_keys = sorted(self._target_month_counts)
         if self._rng.random() < self._empirical_profile_probability:
             month_counts = self._empirical_month_counts(n_blocks, month_keys)
         else:
@@ -363,11 +383,11 @@ class SyntheticBlockGenerator:
     def _empirical_month_counts(
         self, n_blocks: int, month_keys: Sequence[Tuple[int, int]]
     ) -> np.ndarray:
-        source_counts = np.array(
-            [self._source_month_counts[key] for key in month_keys],
+        target_counts = np.array(
+            [self._target_month_counts[key] for key in month_keys],
             dtype=np.float64,
         )
-        raw = source_counts * (float(n_blocks) / float(source_counts.sum()))
+        raw = target_counts * (float(n_blocks) / float(target_counts.sum()))
         counts = np.floor(raw).astype(np.int64)
         remainder = n_blocks - int(counts.sum())
         if remainder:

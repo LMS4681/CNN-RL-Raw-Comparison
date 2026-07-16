@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 
 # Windows cp949 콘솔에서 Unicode 출력 에러 방지
@@ -34,7 +35,7 @@ DEFAULT_SUPPLEMENTAL_WORKSPACES = {
 DEFAULT_EXCLUDED_START_MONTHS = (7, 11)
 DEFAULT_MONTHLY_JITTER = 20
 DEFAULT_EMPIRICAL_PROFILE_PROBABILITY = 0.2
-TRAINING_DATA_SCHEMA_VERSION = 1
+TRAINING_DATA_SCHEMA_VERSION = 2
 OBSERVATION_SCHEMA_VERSION = 2
 REWARD_SCHEMA_VERSION = 2
 MODEL_FILENAME = "block_placement_ppo.sb3"
@@ -179,6 +180,7 @@ def make_env(
     generator_empirical_profile_probability=(
         DEFAULT_EMPIRICAL_PROFILE_PROBABILITY
     ),
+    generator_target_month_counts=None,
     synthetic_n_blocks=None,
     vary_layout=True,
     grid_size=64,
@@ -199,6 +201,7 @@ def make_env(
                 empirical_profile_probability=(
                     generator_empirical_profile_probability
                 ),
+                target_month_counts=generator_target_month_counts,
             )
             if generator_dist is not None
             else None
@@ -228,6 +231,7 @@ def create_training_env(
     vec_env: str = "auto",
     n_future_blocks: int = 4,
     seed: int = 0,
+    episode_n_blocks: int = 913,
 ):
     """Create the training env, optionally vectorized for parallel rollout."""
     from sb3_contrib.common.wrappers import ActionMasker
@@ -252,7 +256,10 @@ def create_training_env(
             if generator is not None
             else DEFAULT_EMPIRICAL_PROFILE_PROBABILITY
         ),
-        "synthetic_n_blocks": len(blocks),
+        "generator_target_month_counts": (
+            generator.target_month_counts if generator is not None else None
+        ),
+        "synthetic_n_blocks": episode_n_blocks,
         "vary_layout": False,
         "grid_size": grid_size,
         "n_future_blocks": n_future_blocks,
@@ -600,11 +607,22 @@ def train(args):
     # ── 1. 데이터 로드 ────────────────────────────────────────────
     strategy = BaseGridStrategy(step=5.0)
     active_workspace_codes = parse_workspace_codes(args.active_workspace_codes)
-    blocks, workspaces = load_allocation_scenario(
+    full_blocks, workspaces = load_allocation_scenario(
         data_dir, strategy, active_workspace_codes
     )
+    from alloc_env.data_split import split_blocks_by_ship
 
-    print(f"블록 {len(blocks)}개, 작업장 {len(workspaces)}개")
+    source_split = split_blocks_by_ship(
+        full_blocks,
+        data_dir / "블록데이터.csv",
+        split_seed=20260716,
+        holdout_fraction=0.20,
+    )
+    target_month_counts = Counter(
+        (block.in_date.year, block.in_date.month) for block in full_blocks
+    )
+
+    print(f"블록 {len(full_blocks)}개, 작업장 {len(workspaces)}개")
     if active_workspace_codes:
         print(
             f"Active workspaces: {len(workspaces)} "
@@ -615,26 +633,28 @@ def train(args):
 
     # ── 2. Synthetic 블록 생성기 ─────────────────────────────────
     generator = SyntheticBlockGenerator.from_blocks(
-        blocks,
+        source_split.training_blocks,
         seed=args.seed,
         monthly_jitter=args.monthly_jitter,
         empirical_profile_probability=(
             args.empirical_profile_probability
         ),
+        target_month_counts=target_month_counts,
     )
     print(
         "[Synthetic] fixed total="
-        f"{len(blocks)}, monthly jitter=+/-{args.monthly_jitter}, "
+        f"{len(full_blocks)}, monthly jitter=+/-{args.monthly_jitter}, "
         "empirical profile probability="
         f"{args.empirical_profile_probability:.2f}"
     )
 
     # ── 3. 환경 생성 (학습: synthetic, 평가: CSV 원본) ────────────
     env = create_training_env(
-        blocks,
+        source_split.training_blocks,
         workspaces,
         strategy,
         generator,
+        episode_n_blocks=len(full_blocks),
         grid_size=args.grid_size,
         n_envs=args.n_envs,
         vec_env=args.vec_env,
@@ -755,7 +775,7 @@ def train(args):
     print("  학습 완료 - 최종 평가")
     print("=" * 60)
     eval_env = create_evaluation_env(
-        blocks,
+        full_blocks,
         workspaces,
         strategy,
         grid_size=args.grid_size,

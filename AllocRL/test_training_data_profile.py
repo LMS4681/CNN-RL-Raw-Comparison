@@ -5,9 +5,12 @@ from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
+import pytest
+
 from alloc_env import data_loader
 from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.block_generator import SyntheticBlockGenerator
+from alloc_env.data_split import split_blocks_by_ship
 from alloc_env.strategy import BaseGridStrategy
 import train as train_module
 
@@ -186,6 +189,43 @@ def test_empirical_profile_preserves_source_month_counts():
     assert count_start_months(generated) == EXPECTED_MONTH_COUNTS
 
 
+def test_split_sources_generate_full_empirical_target_profile():
+    blocks, _ = train_module.load_allocation_scenario(
+        DATA_DIR,
+        BaseGridStrategy(step=5.0),
+        train_module.parse_workspace_codes(
+            train_module.DEFAULT_ACTIVE_WORKSPACE_CODES
+        ),
+    )
+    split = split_blocks_by_ship(blocks, BLOCK_CSV)
+    target_counts = count_start_months(blocks)
+
+    for source in (split.training_blocks, split.holdout_blocks):
+        generator = SyntheticBlockGenerator.from_blocks(
+            source,
+            seed=3,
+            empirical_profile_probability=1.0,
+            target_month_counts=target_counts,
+        )
+        generated = generator.generate(913, min(block.in_date for block in blocks))
+
+        assert len(generated) == 913
+        assert count_start_months(generated) == target_counts
+
+
+def test_target_profile_rejects_month_without_source_templates():
+    source = list(target_blocks())
+    missing_month_source = [
+        block for block in source if block.in_date.month != 12
+    ]
+
+    with pytest.raises(ValueError, match="no source templates"):
+        SyntheticBlockGenerator.from_blocks(
+            missing_month_source,
+            target_month_counts=EXPECTED_MONTH_COUNTS,
+        )
+
+
 def test_monthly_bootstrap_is_seeded_and_preserves_row_correlations():
     source = list(target_blocks())
     kwargs = {
@@ -226,7 +266,9 @@ def test_training_defaults_use_approved_ten_workspace_scenario():
 
 
 def test_training_env_keeps_real_geometry_empty_and_generates_913_targets():
-    source = list(target_blocks())
+    split = split_blocks_by_ship(target_blocks(), BLOCK_CSV)
+    source = split.training_blocks
+    assert len(source) == 673
     strategy = BaseGridStrategy(step=5.0)
     all_workspaces = data_loader.load_workspaces(
         str(WORKSPACE_CSV),
@@ -243,13 +285,18 @@ def test_training_env_keeps_real_geometry_empty_and_generates_913_targets():
         (workspace.code, workspace.length, workspace.breadth)
         for workspace in workspaces
     ]
-    generator = SyntheticBlockGenerator.from_blocks(source, seed=41)
+    generator = SyntheticBlockGenerator.from_blocks(
+        source,
+        seed=41,
+        target_month_counts=EXPECTED_MONTH_COUNTS,
+    )
 
     env = train_module.create_training_env(
         source,
         workspaces,
         strategy,
         generator,
+        episode_n_blocks=913,
         grid_size=16,
         n_envs=1,
         seed=41,

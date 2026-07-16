@@ -15,7 +15,7 @@ class TrainResumeCliTest(unittest.TestCase):
     @staticmethod
     def _run_config(observation_schema_version=2):
         return {
-            "training_data_schema_version": 1,
+            "training_data_schema_version": 2,
             "observation_schema_version": observation_schema_version,
             "reward_schema_version": 2,
             "extractor": "candidate-cnn",
@@ -202,7 +202,7 @@ class TrainResumeCliTest(unittest.TestCase):
             validator({"training_data_schema_version": 0}, source="test")
 
         validator(
-            {"training_data_schema_version": 1}, source="test"
+            {"training_data_schema_version": 2}, source="test"
         )
 
 
