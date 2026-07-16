@@ -226,6 +226,33 @@ def test_target_profile_rejects_month_without_source_templates():
         )
 
 
+def test_target_profile_ignores_zero_month_without_source_templates():
+    source = [
+        block for block in target_blocks() if block.in_date.month != 12
+    ]
+    target_counts = count_start_months(source)
+    target_counts[(2025, 12)] = 0
+    generator = SyntheticBlockGenerator.from_blocks(
+        source,
+        seed=29,
+        empirical_profile_probability=1.0,
+        target_month_counts=target_counts,
+    )
+
+    generated = generator.generate(len(source), min(block.in_date for block in source))
+
+    assert generator.target_month_counts == count_start_months(source)
+    assert count_start_months(generated) == count_start_months(source)
+
+
+def test_target_profile_rejects_all_zero_counts():
+    with pytest.raises(ValueError, match="at least one positive"):
+        SyntheticBlockGenerator.from_blocks(
+            target_blocks(),
+            target_month_counts={(2025, 12): 0},
+        )
+
+
 def test_monthly_bootstrap_is_seeded_and_preserves_row_correlations():
     source = list(target_blocks())
     kwargs = {

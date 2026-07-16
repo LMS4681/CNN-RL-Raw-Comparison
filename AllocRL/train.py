@@ -257,7 +257,9 @@ def create_training_env(
             else DEFAULT_EMPIRICAL_PROFILE_PROBABILITY
         ),
         "generator_target_month_counts": (
-            generator.target_month_counts if generator is not None else None
+            generator.target_month_counts
+            if generator is not None and generator.source_blocks
+            else None
         ),
         "synthetic_n_blocks": episode_n_blocks,
         "vary_layout": False,

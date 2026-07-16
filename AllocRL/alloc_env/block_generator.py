@@ -158,18 +158,30 @@ class SyntheticBlockGenerator:
             (block.in_date.year, block.in_date.month)
             for block in self._source_blocks
         )
-        self._target_month_counts = Counter(
-            dict(sorted({
-                (int(year), int(month)): int(count)
-                for (year, month), count in (
-                    target_month_counts or self._source_month_counts
-                ).items()
-            }.items()))
-        )
-        for key, count in self._target_month_counts.items():
+        target_counts = {
+            (int(year), int(month)): int(count)
+            for (year, month), count in (
+                target_month_counts
+                if target_month_counts is not None
+                else self._source_month_counts
+            ).items()
+        }
+        for count in target_counts.values():
             if count < 0:
                 raise ValueError("target month counts must be non-negative")
-            if count and key not in self._source_month_counts:
+        self._target_month_counts = Counter(
+            dict(sorted(
+                (key, count)
+                for key, count in target_counts.items()
+                if count > 0
+            ))
+        )
+        if target_month_counts is not None and not self._target_month_counts:
+            raise ValueError(
+                "target month counts must include at least one positive count"
+            )
+        for key in self._target_month_counts:
+            if key not in self._source_month_counts:
                 raise ValueError(f"Target month {key} has no source templates")
 
     @property
