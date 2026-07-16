@@ -1,4 +1,5 @@
 import io
+import inspect
 import unittest
 import warnings
 
@@ -181,6 +182,11 @@ class FeatureExtractorTests(unittest.TestCase):
                 output = io.BytesIO()
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", torch.jit.TracerWarning)
+                    export_kwargs = {}
+                    if "dynamo" in inspect.signature(
+                        torch.onnx.export
+                    ).parameters:
+                        export_kwargs["dynamo"] = False
                     torch.onnx.export(
                         GridEncoder(space),
                         observation(
@@ -194,6 +200,7 @@ class FeatureExtractorTests(unittest.TestCase):
                             "workspace_features": {0: "batch"},
                         },
                         opset_version=17,
+                        **export_kwargs,
                     )
 
                 self.assertGreater(len(output.getvalue()), 0)

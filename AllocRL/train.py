@@ -652,8 +652,8 @@ def train(args):
     # ── 8. ONNX export ───────────────────────────────────────────
     if args.export_onnx:
         onnx_path = str(output_dir / "block_placement_ppo.onnx")
-        export_to_onnx(model, env, onnx_path)
-        print(f"ONNX 모델 저장: {onnx_path}")
+        if try_export_to_onnx(model, env, onnx_path):
+            print(f"ONNX 모델 저장: {onnx_path}")
 
     # ── 9. 학습 결과 평가 ─────────────────────────────────────────
     print("\n" + "=" * 60)
@@ -824,6 +824,8 @@ def export_to_onnx(model, env, onnx_path: str):
     관측 키 집합을 하드코딩하지 않고 observation_space에서 읽어오므로,
     n_future_blocks > 0으로 future_blocks/future_mask가 추가되어도 그대로 export된다.
     """
+    import inspect
+
     import torch
     import onnx
 
@@ -865,20 +867,48 @@ def export_to_onnx(model, env, onnx_path: str):
     dynamic_axes = {key: {0: "batch"} for key in obs_keys}
     dynamic_axes["action_logits"] = {0: "batch"}
 
+    export_kwargs = {
+        "input_names": obs_keys,
+        "output_names": ["action_logits"],
+        "dynamic_axes": dynamic_axes,
+        "opset_version": 17,
+    }
+    try:
+        export_parameters = inspect.signature(torch.onnx.export).parameters
+    except (TypeError, ValueError):
+        export_parameters = {}
+    if "dynamo" in export_parameters:
+        export_kwargs["dynamo"] = False
+
     torch.onnx.export(
         wrapper,
         dummy_inputs,
         onnx_path,
-        input_names=obs_keys,
-        output_names=["action_logits"],
-        dynamic_axes=dynamic_axes,
-        opset_version=17,
+        **export_kwargs,
     )
 
     # 검증
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
     print(f"  ONNX inputs: {[inp.name for inp in onnx_model.graph.input]}")
+
+
+def try_export_to_onnx(model, env, onnx_path: str | Path) -> bool:
+    """Export an optional ONNX artifact without invalidating saved SB3 output."""
+    try:
+        export_to_onnx(model, env, str(onnx_path))
+    except Exception as exc:
+        path = Path(onnx_path)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            print(f"[경고] 불완전한 ONNX 파일 제거 실패: {cleanup_error}")
+        print(
+            f"\n[경고] ONNX 모델 변환 실패: {type(exc).__name__}: {exc}\n"
+            "SB3 모델은 이미 저장되어 있으며 최종 평가는 계속합니다."
+        )
+        return False
+    return True
 
 
 def main():
