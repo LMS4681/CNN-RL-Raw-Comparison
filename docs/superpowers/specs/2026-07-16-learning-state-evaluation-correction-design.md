@@ -233,6 +233,13 @@ All arrays are `float32` and remain in `[0, 1]`.
 Height and weight remain in `Block` and generated records but are removed from the
 policy observation because no current workspace limit or placement rule uses them.
 
+Every reference to a source maximum or source date span in this observation
+contract means the complete eligible 913-row source before the ship-group split.
+One normalization record is computed from those 913 rows and the fixed ten
+workspaces, serialized in `run_config.json`, and reused for training, holdout,
+original-CSV evaluation, ONNX export, and visualization. Training and holdout
+subsets must not derive independent normalization values.
+
 ### 6.2 Ordered future blocks
 
 The next 16 unassigned decision blocks remain ordered and attention-free. Each row
@@ -452,9 +459,12 @@ from them.
 
 - observation, reward, and training-data schema versions;
 - extractor and feature dimensions;
+- the complete pre-split observation normalization record;
 - workspace order;
 - future and pending constants;
 - data split seed and source SHA256;
+- episode block count, target month profile, excluded months, monthly jitter, and
+  empirical-profile probability;
 - learning rate, rollout size, batch size, epoch count, gamma, and GAE lambda.
 
 Auto-resume rejects incompatible settings. It selects the readable final model or
