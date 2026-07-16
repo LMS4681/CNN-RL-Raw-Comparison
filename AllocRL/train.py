@@ -761,14 +761,14 @@ def train(args):
         seed=args.seed,
     )
     try:
-        csv_metrics = evaluate_original_csv(
+        csv_row = evaluate_original_csv_row(
             model, eval_env, n_eval=args.n_eval
         )
     finally:
         eval_env.close()
     write_evaluation_metrics(
         output_dir / "evaluation_csv.csv",
-        [{"source": "original_csv", "policy": "model", **csv_metrics}],
+        [csv_row],
     )
 
     if fixed_scenarios is not None:
@@ -815,6 +815,15 @@ def evaluate_original_csv(model, env, n_eval: int = 5) -> dict[str, float]:
         stacklevel=2,
     )
     return evaluate_policy(ModelActionPolicy(model), env, episodes=1)
+
+
+def evaluate_original_csv_row(model, env, n_eval: int = 5) -> dict:
+    """Evaluate once and build the single original-CSV metric row."""
+    return {
+        "source": "original_csv",
+        "policy": "model",
+        **evaluate_original_csv(model, env, n_eval=n_eval),
+    }
 
 
 def export_to_onnx(model, env, onnx_path: str):
