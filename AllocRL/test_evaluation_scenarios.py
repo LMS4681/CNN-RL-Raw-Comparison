@@ -516,16 +516,31 @@ class EvaluationScenarioTests(unittest.TestCase):
 
         self.assertEqual(0, env.reset_count)
 
-    def test_original_csv_evaluation_ignores_deprecated_n_eval(self):
+    def test_cli_accepts_deprecated_n_eval_and_evaluates_csv_once(self):
         env = CountingEvaluationEnv()
+        parsed_n_eval = []
+        metric_results = []
 
-        with self.assertWarnsRegex(FutureWarning, "--n-eval.*ignored"):
-            metrics = train_module.evaluate_original_csv(
-                FirstValidModel(), env, n_eval=5
-            )
+        def run_from_parsed_args(args):
+            parsed_n_eval.append(args.n_eval)
+            with self.assertWarnsRegex(FutureWarning, "--n-eval.*ignored"):
+                metric_results.append(train_module.evaluate_original_csv(
+                    FirstValidModel(), env, n_eval=args.n_eval
+                ))
 
+        with (
+            patch("sys.argv", ["train.py", "--n-eval", "5"]),
+            patch.object(
+                train_module, "train", side_effect=run_from_parsed_args
+            ) as train_entry,
+        ):
+            train_module.main()
+
+        self.assertEqual([5], parsed_n_eval)
+        self.assertEqual(1, train_entry.call_count)
         self.assertEqual(1, env.reset_count)
-        self.assertEqual(2.5, metrics["mean_reward"])
+        self.assertEqual(1, len(metric_results))
+        self.assertEqual(2.5, metric_results[0]["mean_reward"])
 
     def test_future_choice_count_previews_immediate_post_action_state(self):
         env = self.make_choice_env()
