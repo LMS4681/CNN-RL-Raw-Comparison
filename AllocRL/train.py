@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import warnings
 from collections import Counter
 from pathlib import Path
 
@@ -540,16 +541,9 @@ def write_evaluation_metrics(
     path: str | Path,
     rows: list[dict],
 ) -> None:
-    import csv
+    from evaluation_runner import write_evaluation_metrics as write_metrics
 
-    if not rows:
-        raise ValueError("At least one evaluation metric row is required")
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+    write_metrics(path, rows)
 
 
 def evaluate_fixed_scenarios(
@@ -559,33 +553,15 @@ def evaluate_fixed_scenarios(
     n_future_blocks: int,
     workspace_codes: list[str] | None = None,
 ) -> list[dict]:
-    from alloc_env.data_loader import select_workspaces_in_order
-    from alloc_env.strategy import BaseGridStrategy
-    from evaluation_scenarios import materialize_scenario
+    from evaluation_runner import ModelActionPolicy, evaluate_scenarios
 
-    rows = []
-    for scenario in scenario_records:
-        strategy = BaseGridStrategy(step=5.0)
-        blocks, workspaces = materialize_scenario(scenario, strategy)
-        workspaces = select_workspaces_in_order(
-            workspaces, workspace_codes
-        )
-        env = create_evaluation_env(
-            blocks=blocks,
-            workspaces=workspaces,
-            strategy=strategy,
-            grid_size=grid_size,
-            n_future_blocks=n_future_blocks,
-            seed=int(scenario["seed"]),
-        )
-        try:
-            metrics = evaluate(
-                model, env, n_eval=1, return_metrics=True
-            )
-        finally:
-            env.close()
-        rows.append({"seed": int(scenario["seed"]), **metrics})
-    return rows
+    return evaluate_scenarios(
+        lambda seed: ModelActionPolicy(model),
+        scenario_records,
+        grid_size=grid_size,
+        n_future_blocks=n_future_blocks,
+        workspace_codes=workspace_codes,
+    )
 
 
 def train(args):
@@ -785,14 +761,14 @@ def train(args):
         seed=args.seed,
     )
     try:
-        csv_metrics = evaluate(
-            model, eval_env, n_eval=args.n_eval, return_metrics=True
+        csv_metrics = evaluate_original_csv(
+            model, eval_env, n_eval=args.n_eval
         )
     finally:
         eval_env.close()
     write_evaluation_metrics(
         output_dir / "evaluation_csv.csv",
-        [{"source": "original_csv", **csv_metrics}],
+        [{"source": "original_csv", "policy": "model", **csv_metrics}],
     )
 
     if fixed_scenarios is not None:
@@ -812,119 +788,12 @@ def train(args):
 
 
 def evaluate(model, env, n_eval: int = 5, return_metrics: bool = False):
-    """Evaluate deterministic episodes and optionally return quality metrics."""
-    from alloc_env.alloc_env import DELAY_THRESHOLD
-    from alloc_env.simulator import SimulationResult
-    from evaluation_scenarios import compute_retained_choice_ratio
+    """Compatibility wrapper for deterministic model evaluation."""
+    from evaluation_runner import ModelActionPolicy, evaluate_policy
 
-    if n_eval < 1:
-        raise ValueError("n_eval must be at least 1")
-
-    rewards = []
-    terminal_scores = []
-    dropout_rates = []
-    mean_delay_days = []
-    delayed_counts = []
-    retained_choice_ratios = []
-    for ep in range(n_eval):
-        obs, info = env.reset()
-        total_reward = 0.0
-        done = False
-        episode_choice_ratios = []
-        diagnostic_env = getattr(env, "unwrapped", env)
-        while not done:
-            action_masks = env.action_masks() if hasattr(env, 'action_masks') else None
-            action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
-            if hasattr(diagnostic_env, "future_workspace_choice_indices"):
-                future_indices = (
-                    diagnostic_env.future_workspace_choice_indices()
-                )
-                choices_before = (
-                    diagnostic_env.future_workspace_choice_count(
-                        future_indices
-                    )
-                )
-            else:
-                future_indices = []
-                choices_before = 0
-            if hasattr(
-                diagnostic_env,
-                "future_workspace_choice_count_after_action",
-            ):
-                choices_after = (
-                    diagnostic_env.future_workspace_choice_count_after_action(
-                        int(action), future_indices
-                    )
-                )
-            else:
-                choices_after = None
-            obs, reward, terminated, truncated, info = env.step(action)
-            if (
-                choices_after is None
-                and hasattr(
-                    diagnostic_env, "future_workspace_choice_count"
-                )
-            ):
-                choices_after = (
-                    diagnostic_env.future_workspace_choice_count(
-                        future_indices
-                    )
-                )
-            elif choices_after is None:
-                choices_after = 0
-            episode_choice_ratios.append(
-                compute_retained_choice_ratio(
-                    choices_before, choices_after
-                )
-            )
-            total_reward += float(reward)
-            done = terminated or truncated
-
-        rewards.append(total_reward)
-        terminal_score = info.get(
-            "terminal_score", info.get("terminal_reward", total_reward)
-        )
-        terminal_scores.append(terminal_score)
-        result = info.get("raw_result")
-        delay_days = list(result.delay_days) if result is not None else []
-        dropout_count = sum(
-            delay == SimulationResult.DROPOUT for delay in delay_days
-        )
-        placed_delays = [
-            delay
-            for delay in delay_days
-            if delay != SimulationResult.DROPOUT
-        ]
-        dropout_rates.append(
-            dropout_count / len(delay_days) if delay_days else 0.0
-        )
-        mean_delay_days.append(
-            float(np.mean(placed_delays)) if placed_delays else 0.0
-        )
-        delayed_counts.append(
-            sum(delay > DELAY_THRESHOLD for delay in placed_delays)
-        )
-        retained_choice_ratios.append(
-            float(np.mean(episode_choice_ratios))
-            if episode_choice_ratios
-            else 1.0
-        )
-        print(
-            f"  Episode {ep+1}: "
-            f"total reward = {total_reward:.2f}, "
-            f"terminal score = {terminal_score:.2f}"
-        )
-
-    metrics = {
-        "mean_reward": float(np.mean(rewards)),
-        "mean_terminal_score": float(np.mean(terminal_scores)),
-        "mean_dropout_rate": float(np.mean(dropout_rates)),
-        "mean_delay_days": float(np.mean(mean_delay_days)),
-        "mean_delayed_count": float(np.mean(delayed_counts)),
-        "mean_retained_choice_ratio": float(
-            np.mean(retained_choice_ratios)
-        ),
-    }
+    metrics = evaluate_policy(
+        ModelActionPolicy(model), env, episodes=n_eval
+    )
     print(
         f"\n  Mean evaluation: reward={metrics['mean_reward']:.2f}, "
         f"terminal score={metrics['mean_terminal_score']:.2f}, "
@@ -933,6 +802,19 @@ def evaluate(model, env, n_eval: int = 5, return_metrics: bool = False):
         f"(n={n_eval})"
     )
     return metrics if return_metrics else metrics["mean_reward"]
+
+
+def evaluate_original_csv(model, env, n_eval: int = 5) -> dict[str, float]:
+    """Evaluate the original CSV exactly once while accepting legacy n_eval."""
+    from evaluation_runner import ModelActionPolicy, evaluate_policy
+
+    warnings.warn(
+        "--n-eval is deprecated and ignored; original CSV evaluation always "
+        "runs exactly one episode.",
+        FutureWarning,
+        stacklevel=2,
+    )
+    return evaluate_policy(ModelActionPolicy(model), env, episodes=1)
 
 
 def export_to_onnx(model, env, onnx_path: str):
@@ -1051,7 +933,10 @@ def main():
     parser.add_argument("--gae-lambda", type=float, default=0.98,
                         help="GAE bias-variance parameter")
     parser.add_argument("--n-eval", type=int, default=5,
-                        help="평가 에피소드 수")
+                        help=(
+                            "deprecated and ignored; original CSV evaluation "
+                            "always runs exactly one episode"
+                        ))
     parser.add_argument(
         "--eval-scenarios",
         type=str,

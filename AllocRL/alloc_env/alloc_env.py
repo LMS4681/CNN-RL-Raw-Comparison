@@ -529,6 +529,19 @@ class BlockPlacementEnv(gym.Env):
 
     # ── Evaluation-only future optionality diagnostics ────────────
 
+    def immediate_placeability(self) -> np.ndarray:
+        """Return current geometric placeability without changing state."""
+        return np.array(
+            [candidate.placeable for candidate in self._candidate_placements],
+            dtype=bool,
+        )
+
+    def workspace_free_areas(self) -> np.ndarray:
+        """Return non-negative workspace free areas without changing state."""
+        return np.maximum(
+            self._ws_areas - self._ws_used_area, 0.0
+        ).astype(np.float32)
+
     def future_workspace_choice_indices(self) -> List[int]:
         """Return the exact future block set used by the current observation."""
         if self._placement_simulator is None:

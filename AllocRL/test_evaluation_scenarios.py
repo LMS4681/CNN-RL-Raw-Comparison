@@ -6,9 +6,14 @@ import unittest
 from collections import Counter
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
 
 import train as train_module
 from alloc_env.alloc_env import BlockPlacementEnv
+from alloc_env.alloc_env import DELAY_THRESHOLD
 from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.block_generator import BlockDistribution
 from alloc_env.data_split import (
@@ -17,7 +22,13 @@ from alloc_env.data_split import (
     split_blocks_by_ship,
 )
 from alloc_env.strategy import BaseGridStrategy
+from alloc_env.simulator import SimulationResult
 from alloc_env.workspace import LotRegion, Workspace
+from evaluation_runner import (
+    ModelActionPolicy,
+    evaluate_policy,
+    evaluate_scenarios,
+)
 from evaluation_scenarios import (
     compute_retained_choice_ratio,
     generate_scenarios,
@@ -104,6 +115,49 @@ class FirstValidModel:
     def predict(obs, action_masks=None, deterministic=True):
         action = int(next(i for i, valid in enumerate(action_masks) if valid))
         return action, None
+
+
+class FirstValidPolicy:
+    name = "first_valid"
+
+    @staticmethod
+    def select_action(env, observation):
+        return int(np.flatnonzero(env.action_masks())[0])
+
+
+class CountingEvaluationEnv:
+    def __init__(self, delay_days=None):
+        self.reset_count = 0
+        self.close_count = 0
+        self.delay_days = list(delay_days or [])
+
+    @property
+    def unwrapped(self):
+        return self
+
+    def reset(self):
+        self.reset_count += 1
+        return {"step": 0}, {}
+
+    def action_masks(self):
+        return np.array([True, False], dtype=bool)
+
+    def step(self, action):
+        if int(action) != 0:
+            raise AssertionError("Policy selected a masked action")
+        return (
+            {"step": 1},
+            2.5,
+            True,
+            False,
+            {
+                "terminal_score": 1.5,
+                "raw_result": SimpleNamespace(delay_days=self.delay_days),
+            },
+        )
+
+    def close(self):
+        self.close_count += 1
 
 
 class EvaluationScenarioTests(unittest.TestCase):
@@ -401,6 +455,78 @@ class EvaluationScenarioTests(unittest.TestCase):
         self.assertEqual(3.0, compute_retained_choice_ratio(0, 3))
         self.assertEqual(0.5, compute_retained_choice_ratio(4, 2))
 
+    def test_model_policy_passes_action_mask_and_requests_determinism(self):
+        calls = []
+
+        class RecordingModel:
+            @staticmethod
+            def predict(observation, **kwargs):
+                calls.append((observation, kwargs))
+                return np.array(0), None
+
+        env = CountingEvaluationEnv()
+        observation = {"step": 0}
+
+        action = ModelActionPolicy(RecordingModel()).select_action(
+            env, observation
+        )
+
+        self.assertEqual(0, action)
+        self.assertEqual(observation, calls[0][0])
+        np.testing.assert_array_equal(
+            np.array([True, False], dtype=bool),
+            calls[0][1]["action_masks"],
+        )
+        self.assertIs(True, calls[0][1]["deterministic"])
+
+    def test_shared_evaluation_preserves_metric_semantics(self):
+        env = CountingEvaluationEnv([
+            SimulationResult.DROPOUT,
+            0,
+            DELAY_THRESHOLD + 1,
+        ])
+
+        metrics = evaluate_policy(FirstValidPolicy(), env, episodes=1)
+
+        self.assertEqual(1, env.reset_count)
+        self.assertEqual(2.5, metrics["mean_reward"])
+        self.assertEqual(1.5, metrics["mean_terminal_score"])
+        self.assertAlmostEqual(1.0 / 3.0, metrics["mean_dropout_rate"])
+        self.assertEqual(1.5, metrics["mean_delay_days"])
+        self.assertEqual(1.0, metrics["mean_delayed_count"])
+        self.assertEqual(1.0, metrics["mean_retained_choice_ratio"])
+
+    def test_shared_evaluation_uses_immediate_choice_preview(self):
+        env = CountingEvaluationEnv()
+        env.future_workspace_choice_indices = lambda: [1]
+        env.future_workspace_choice_count = lambda indices: 4
+        env.future_workspace_choice_count_after_action = (
+            lambda action, indices: 1
+        )
+
+        metrics = evaluate_policy(FirstValidPolicy(), env)
+
+        self.assertEqual(0.25, metrics["mean_retained_choice_ratio"])
+
+    def test_shared_evaluation_rejects_non_positive_episode_count(self):
+        env = CountingEvaluationEnv()
+
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            evaluate_policy(FirstValidPolicy(), env, episodes=0)
+
+        self.assertEqual(0, env.reset_count)
+
+    def test_original_csv_evaluation_ignores_deprecated_n_eval(self):
+        env = CountingEvaluationEnv()
+
+        with self.assertWarnsRegex(FutureWarning, "--n-eval.*ignored"):
+            metrics = train_module.evaluate_original_csv(
+                FirstValidModel(), env, n_eval=5
+            )
+
+        self.assertEqual(1, env.reset_count)
+        self.assertEqual(2.5, metrics["mean_reward"])
+
     def test_future_choice_count_previews_immediate_post_action_state(self):
         env = self.make_choice_env()
         self.assertEqual(0, env.future_workspace_choice_count())
@@ -433,6 +559,7 @@ class EvaluationScenarioTests(unittest.TestCase):
 
     def test_evaluate_uses_immediate_post_action_choice_preview(self):
         env = self.make_choice_env()
+        env.future_workspace_choice_indices = lambda: [1]
         env.future_workspace_choice_count = lambda block_indices=None: 4
         env.future_workspace_choice_count_after_action = (
             lambda action, block_indices=None: 1
@@ -494,6 +621,74 @@ class EvaluationScenarioTests(unittest.TestCase):
         self.assertEqual(150, rows[0]["seed"])
         self.assertIn("mean_terminal_score", rows[0])
         self.assertIn("mean_retained_choice_ratio", rows[0])
+
+    def test_shared_scenarios_create_and_close_env_and_policy_per_seed(self):
+        scenarios = [
+            {"seed": 11, "source": "holdout_fixed", "blocks": [], "workspaces": []},
+            {"seed": 12, "source": "holdout_fixed", "blocks": [], "workspaces": []},
+        ]
+        envs = [CountingEvaluationEnv(), CountingEvaluationEnv()]
+        policies = []
+
+        def policy_factory(seed):
+            policy = FirstValidPolicy()
+            policy.name = f"first_valid_{seed}"
+            policies.append(policy)
+            return policy
+
+        with (
+            patch("evaluation_runner.materialize_scenario", return_value=([], [])),
+            patch("evaluation_runner.select_workspaces_in_order", return_value=[]),
+            patch("train.create_evaluation_env", side_effect=envs) as create_env,
+        ):
+            rows = evaluate_scenarios(
+                policy_factory,
+                scenarios,
+                grid_size=32,
+                n_future_blocks=2,
+                workspace_codes=["PE001"],
+            )
+
+        self.assertEqual([11, 12], [row["seed"] for row in rows])
+        self.assertEqual(
+            ["first_valid_11", "first_valid_12"],
+            [row["policy"] for row in rows],
+        )
+        self.assertEqual(
+            ["holdout_fixed20", "holdout_fixed20"],
+            [row["source"] for row in rows],
+        )
+        self.assertEqual(2, create_env.call_count)
+        self.assertIsNot(policies[0], policies[1])
+        self.assertEqual([1, 1], [env.reset_count for env in envs])
+        self.assertEqual([1, 1], [env.close_count for env in envs])
+
+    def test_shared_scenario_closes_env_when_policy_creation_fails(self):
+        scenario = {
+            "seed": 11,
+            "source": "holdout_fixed",
+            "blocks": [],
+            "workspaces": [],
+        }
+        env = CountingEvaluationEnv()
+
+        with (
+            patch("evaluation_runner.materialize_scenario", return_value=([], [])),
+            patch("evaluation_runner.select_workspaces_in_order", return_value=[]),
+            patch("train.create_evaluation_env", return_value=env),
+            self.assertRaisesRegex(RuntimeError, "factory failed"),
+        ):
+            evaluate_scenarios(
+                lambda seed: (_ for _ in ()).throw(
+                    RuntimeError("factory failed")
+                ),
+                [scenario],
+                grid_size=32,
+                n_future_blocks=2,
+                workspace_codes=None,
+            )
+
+        self.assertEqual(1, env.close_count)
 
     def test_evaluation_metric_rows_are_written_as_csv(self):
         rows = [
