@@ -2,6 +2,7 @@ import csv
 import json
 import tempfile
 import unittest
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
@@ -9,17 +10,43 @@ import train as train_module
 from alloc_env.alloc_env import BlockPlacementEnv
 from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.block_generator import BlockDistribution
+from alloc_env.data_split import (
+    DEFAULT_SPLIT_SEED,
+    sha256_file,
+    split_blocks_by_ship,
+)
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import LotRegion, Workspace
 from evaluation_scenarios import (
     compute_retained_choice_ratio,
     generate_scenarios,
     materialize_scenario,
+    read_scenario_metadata,
     read_scenarios,
     write_scenarios,
 )
-from run_ablation import ABLATIONS, build_ablation_commands
-from train import evaluate
+from run_ablation import (
+    ABLATIONS,
+    build_ablation_commands,
+    prepare_evaluation_file,
+)
+from train import (
+    DEFAULT_ACTIVE_WORKSPACE_CODES,
+    evaluate,
+    load_allocation_scenario,
+    parse_workspace_codes,
+)
+
+
+DATA_DIR = Path(__file__).parent / "data"
+
+
+def block_csv_path(data_dir: Path) -> Path:
+    return next(
+        path
+        for path in data_dir.glob("*.csv")
+        if b"STAGE" in path.read_bytes().splitlines()[0]
+    )
 
 
 def make_workspace(code: str = "PE001") -> Workspace:
@@ -109,7 +136,7 @@ class EvaluationScenarioTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "scenarios.json"
-            write_scenarios(path, scenarios)
+            write_scenarios(path, scenarios, {"source": "test"})
             loaded = read_scenarios(path)
 
         self.assertEqual(scenarios, loaded)
@@ -121,6 +148,107 @@ class EvaluationScenarioTests(unittest.TestCase):
         self.assertEqual(["SYN-*"], workspaces[0].allowable_block_patterns)
         self.assertEqual("L1", workspaces[0].lots[0].lot_id)
         self.assertTrue(all(isinstance(block.in_date, date) for block in blocks))
+
+    def test_scenario_bundle_round_trips_provenance(self):
+        blocks = make_blocks()
+        workspaces = [make_workspace()]
+        metadata = {
+            "source": "holdout_fixed",
+            "split_seed": 20260716,
+            "source_sha256": "abc123",
+        }
+        scenarios = generate_scenarios(
+            distribution=BlockDistribution.from_blocks(blocks),
+            workspaces=workspaces,
+            seeds=[1000],
+            n_blocks=3,
+            base_date=date(2026, 1, 5),
+            spread_days=30,
+            source_blocks=blocks,
+            target_month_counts=Counter(
+                (block.in_date.year, block.in_date.month)
+                for block in blocks
+            ),
+            vary_layout=False,
+            empirical_profile_probability=1.0,
+            source_name="holdout_fixed",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scenarios.json"
+            write_scenarios(path, scenarios, metadata)
+            self.assertEqual(scenarios, read_scenarios(path))
+            self.assertEqual(metadata, read_scenario_metadata(path))
+            self.assertEqual("holdout_fixed", scenarios[0]["source"])
+
+    def test_prepare_evaluation_file_uses_holdout_templates_and_full_profile(
+        self,
+    ):
+        blocks, _ = load_allocation_scenario(
+            DATA_DIR,
+            BaseGridStrategy(step=5.0),
+            parse_workspace_codes(DEFAULT_ACTIVE_WORKSPACE_CODES),
+        )
+        source_path = block_csv_path(DATA_DIR)
+        split = split_blocks_by_ship(blocks, source_path)
+        target_month_counts = Counter(
+            (block.in_date.year, block.in_date.month) for block in blocks
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scenario_path = Path(tmpdir) / "fixed_eval_scenarios.json"
+            prepare_evaluation_file(DATA_DIR, scenario_path)
+            scenarios = read_scenarios(scenario_path)
+            metadata = read_scenario_metadata(scenario_path)
+            manifest_path = Path(tmpdir) / "data_split_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(list(range(1000, 1020)), [
+            scenario["seed"] for scenario in scenarios
+        ])
+        self.assertEqual(20, len(scenarios))
+        self.assertEqual(manifest, metadata)
+        self.assertEqual("holdout_fixed", metadata["source"])
+        self.assertEqual(DEFAULT_SPLIT_SEED, metadata["split_seed"])
+        self.assertEqual(
+            sha256_file(source_path), metadata["source_sha256"]
+        )
+        self.assertEqual(913, metadata["source_row_count"])
+        self.assertEqual(240, metadata["holdout_row_count"])
+        self.assertEqual(
+            split.manifest["source_month_counts"],
+            metadata["target_month_counts"],
+        )
+        self.assertEqual(
+            "holdout_ship_split",
+            metadata["provenance"]["template_source"],
+        )
+        self.assertFalse(metadata["provenance"]["vary_layout"])
+        self.assertEqual(
+            1.0,
+            metadata["provenance"]["empirical_profile_probability"],
+        )
+        holdout_ships = set(split.manifest["holdout_ship_nos"])
+        for scenario in scenarios:
+            self.assertEqual("holdout_fixed", scenario["source"])
+            self.assertEqual(913, len(scenario["blocks"]))
+            self.assertEqual(10, len(scenario["workspaces"]))
+            self.assertTrue(
+                all(not workspace["pre_placements"]
+                    for workspace in scenario["workspaces"])
+            )
+            self.assertEqual(
+                target_month_counts,
+                Counter(
+                    (date.fromisoformat(block["in_date"]).year,
+                     date.fromisoformat(block["in_date"]).month)
+                    for block in scenario["blocks"]
+                ),
+            )
+            self.assertTrue(
+                {block["ship_no"] for block in scenario["blocks"]}
+                .issubset(holdout_ships)
+            )
 
     def test_source_scenarios_keep_workspace_geometry_and_remove_obstacles(self):
         workspace = make_workspace()

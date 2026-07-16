@@ -6,6 +6,7 @@ import json
 import math
 from datetime import date
 from pathlib import Path
+from typing import Mapping
 
 from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.block_generator import BlockDistribution, SyntheticBlockGenerator
@@ -14,7 +15,7 @@ from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import LotRegion, Workspace
 
 
-SCENARIO_SCHEMA_VERSION = 2
+SCENARIO_SCHEMA_VERSION = 3
 
 
 def _block_record(block: Block) -> dict:
@@ -85,6 +86,8 @@ def generate_scenarios(
     source_blocks: list[Block] | None = None,
     vary_layout: bool = True,
     empirical_profile_probability: float = 0.2,
+    target_month_counts: Mapping[tuple[int, int], int] | None = None,
+    source_name: str = "holdout_fixed",
 ) -> list[dict]:
     scenarios = []
     for seed in seeds:
@@ -93,6 +96,7 @@ def generate_scenarios(
             seed=seed,
             source_blocks=source_blocks,
             empirical_profile_probability=empirical_profile_probability,
+            target_month_counts=target_month_counts,
         )
         blocks = generator.generate(
             n_blocks=n_blocks,
@@ -107,6 +111,7 @@ def generate_scenarios(
         scenarios.append(
             {
                 "seed": int(seed),
+                "source": source_name,
                 "blocks": [_block_record(block) for block in blocks],
                 "workspaces": [
                     _workspace_record(workspace)
@@ -117,11 +122,24 @@ def generate_scenarios(
     return scenarios
 
 
-def write_scenarios(path: str | Path, scenarios: list[dict]) -> None:
+def write_scenarios(
+    path: str | Path,
+    scenarios: list[dict],
+    metadata: dict,
+) -> None:
+    if not isinstance(metadata, dict):
+        raise ValueError("Evaluation scenario metadata must be a dictionary")
+    for scenario in scenarios:
+        if not isinstance(scenario, dict) or not {
+            "seed", "source", "blocks", "workspaces"
+        }.issubset(scenario):
+            raise ValueError("Evaluation scenarios must include seed, source, blocks, and workspaces")
+
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": SCENARIO_SCHEMA_VERSION,
+        "metadata": dict(metadata),
         "scenarios": scenarios,
     }
     destination.write_text(
@@ -130,15 +148,23 @@ def write_scenarios(path: str | Path, scenarios: list[dict]) -> None:
     )
 
 
-def read_scenarios(path: str | Path) -> list[dict]:
-    source = Path(path)
-    payload = json.loads(source.read_text(encoding="utf-8"))
+def _read_payload(path: str | Path) -> dict:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if payload.get("schema_version") != SCENARIO_SCHEMA_VERSION:
         raise ValueError("Unsupported evaluation scenario schema")
-    scenarios = payload.get("scenarios")
-    if not isinstance(scenarios, list):
+    if not isinstance(payload.get("metadata"), dict):
+        raise ValueError("Evaluation scenario payload must contain metadata")
+    if not isinstance(payload.get("scenarios"), list):
         raise ValueError("Evaluation scenario payload must contain a list")
-    return scenarios
+    return payload
+
+
+def read_scenarios(path: str | Path) -> list[dict]:
+    return _read_payload(path)["scenarios"]
+
+
+def read_scenario_metadata(path: str | Path) -> dict:
+    return dict(_read_payload(path)["metadata"])
 
 
 def materialize_scenario(
