@@ -113,6 +113,23 @@ class UpcomingBlockIndicesTests(unittest.TestCase):
         upcoming = sim.upcoming_block_indices(5)
         self.assertNotIn(assigned_idx, upcoming)
 
+    def test_unassigned_ties_use_block_index(self):
+        sim = self._make_sim([date(2026, 4, 6)] * 4)
+        sim.current_block_index = 0
+        sim.pending = {3, 2, 1, 0}
+
+        self.assertEqual(sim.unassigned_block_indices(), [1, 2, 3])
+        self.assertEqual(sim.upcoming_block_indices(2), [1, 2])
+
+    def test_next_decision_uses_unassigned_queue_order(self):
+        sim = self._make_sim([date(2026, 4, 6)] * 3)
+        sim.blocks[1].delay_placement(1)
+        sim.blocks[2].delay_placement(1)
+
+        self.assertEqual(sim.unassigned_block_indices(), [1, 2])
+        sim.assign_current(0)
+        self.assertEqual(sim.current_block_index, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

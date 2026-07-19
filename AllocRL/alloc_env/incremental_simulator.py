@@ -135,6 +135,24 @@ class IncrementalPlacementSimulator:
     def resolved_delay_days(self) -> List[int]:
         return [d for d in self.delay_days if d is not None]
 
+    def current_delay_workdays(self, block_index: int) -> int:
+        return max(
+            cal.get_working_days_between(
+                self._original_blocks[block_index].in_date,
+                self.blocks[block_index].in_date,
+            ) - 1,
+            0,
+        )
+
+    def unassigned_block_indices(self) -> List[int]:
+        indices = [
+            idx for idx in self.pending
+            if idx != self.current_block_index
+            and idx not in self._infeasible
+            and self.assignments[idx] is None
+        ]
+        return sorted(indices, key=self._sort_key)
+
     def upcoming_block_indices(self, k: int) -> List[int]:
         """다음에 '에이전트에게 물어볼' pending 블록 인덱스를 결정 순서로 최대 k개 반환.
 
@@ -148,16 +166,21 @@ class IncrementalPlacementSimulator:
         순서를 주므로, 실제 시뮬레이터가 블록을 제시하는 순서와 일치하는 근사
         lookahead를 제공한다. 지연으로 인한 순서 변동은 근사로 감수한다.
         """
-        if k <= 0:
-            return []
-        candidates = [
+        return self.unassigned_block_indices()[:max(k, 0)]
+
+    def pending_assignment_indices(
+        self, workspace_index: Optional[int] = None
+    ) -> List[int]:
+        indices = [
             idx for idx in self.pending
-            if idx != self.current_block_index
-            and idx not in self._infeasible
-            and self.assignments[idx] is None
+            if self.assignments[idx] is not None
+            and self.delay_days[idx] is None
+            and (
+                workspace_index is None
+                or self.assignments[idx] == workspace_index
+            )
         ]
-        candidates.sort(key=self._sort_key)
-        return candidates[:k]
+        return sorted(indices, key=self._sort_key)
 
     def _advance_to_next_decision(self) -> None:
         self.current_block_index = None
@@ -202,12 +225,9 @@ class IncrementalPlacementSimulator:
 
             self.env_date = cal.next_working_day(self.env_date)
 
-    def _sort_key(self, idx: int) -> Tuple[int, date]:
-        delay = cal.get_working_days_between(
-            self._original_blocks[idx].in_date,
-            self.blocks[idx].in_date,
-        ) - 1
-        return (-delay, self._original_blocks[idx].in_date)
+    def _sort_key(self, idx: int) -> Tuple[int, date, int]:
+        delay = self.current_delay_workdays(idx)
+        return (-delay, self._original_blocks[idx].in_date, idx)
 
     def _process_assigned_block(self, idx: int) -> PlacementStepResult:
         assignment = self.assignments[idx]
@@ -215,10 +235,7 @@ class IncrementalPlacementSimulator:
             raise RuntimeError("Cannot process a block without assignment.")
 
         block = self.blocks[idx]
-        cur_delay = cal.get_working_days_between(
-            self._original_blocks[idx].in_date,
-            block.in_date,
-        ) - 1
+        cur_delay = self.current_delay_workdays(idx)
 
         if cur_delay > self._dropout_threshold:
             self.delay_days[idx] = SimulationResult.DROPOUT
