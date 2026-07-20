@@ -300,3 +300,33 @@ def test_manifest_missing_ref_matrix(tmp_path, arm, kind):
     from comparison.report_builder import build_comparison_summary
     write_complete_fixture(tmp_path); path = tmp_path / "manifest.json"; payload = json.loads(path.read_text("utf-8")); del payload["checkpoints"][arm][kind]; _json(path, payload)
     with pytest.raises(ValueError): build_comparison_summary(tmp_path)
+
+
+@pytest.mark.parametrize("arm,digest", [("raw_direct", "1" * 64), ("candidate_cnn", "2" * 64)])
+def test_common_arm_provenance_must_match_manifest(tmp_path, arm, digest):
+    from comparison.report_builder import build_comparison_summary
+    write_complete_fixture(tmp_path); path = tmp_path / "comparison" / "common_step_evaluation.csv"
+    with path.open(encoding="utf-8", newline="") as stream: rows = list(csv.DictReader(stream))
+    for row in rows:
+        if row["arm"] == arm: row["checkpoint_sha256"] = digest
+    _write_csv(path, rows)
+    with pytest.raises(ValueError, match="common checkpoint"):
+        build_comparison_summary(tmp_path)
+
+
+def test_report_renders_all_actual_runtime_and_selection_fields(tmp_path):
+    from comparison.report_builder import write_complete_report
+    write_complete_fixture(tmp_path)
+    for arm, tag, fallback in (("raw_direct", "11", False), ("candidate_cnn", "22", True)):
+        path = tmp_path / arm / "runtime_metrics.json"; p = json.loads(path.read_text("utf-8")); digest = ("a" if arm == "raw_direct" else "b") * 64
+        p.update({"target_training_seconds": float(tag), "recorded_training_seconds": float(tag)+.1, "end_to_end_training_seconds":float(tag)+.2, "overrun_seconds":float(tag)+.3, "restart_count":int(tag), "max_unrecorded_seconds":float(tag)+.4, "start_timestep":int(tag)*100, "end_timestep":int(tag)*100+1, "steps_per_second":float(tag)+.5, "evaluation_seconds":float(tag)+.6, "parameter_counts":{"total":int(tag)*10,"feature_extractor":int(tag),"policy":int(tag)*2,"value":int(tag)*7}, "peak_cuda_memory_bytes":int(tag)*1000, "selection_count":0 if fallback else 5, "selection_tuple":None if fallback else [1.1,2.2,3.3], "selected_checkpoint_timestep":50000, "checkpoint_identity":{"filename":"fallback.sb3" if fallback else "best_model.sb3","sha256":digest}}); _json(path,p)
+        manifest=json.loads((tmp_path/"manifest.json").read_text("utf-8")); manifest["checkpoints"][arm]["selected"].update({"label":"fallback_final" if fallback else "best_model","path":f"{arm}/{'fallback.sb3' if fallback else 'best_model.sb3'}"}); _json(tmp_path/"manifest.json",manifest)
+        for name in ("evaluation_scenarios.csv","evaluation_primary_test.csv"):
+            file=tmp_path/arm/name
+            with file.open(encoding="utf-8",newline="") as s: rows=list(csv.DictReader(s))
+            for row in rows: row["checkpoint"]="fallback_final" if fallback else "best_model"
+            _write_csv(file,rows)
+    text=write_complete_report(tmp_path).read_text("utf-8")
+    for value in ("11.0","11.1","11.2","11.3","11.4","11.5","11.6","22.0","22.1","22.2","22.3","22.4","22.5","22.6","1100","1101","2200","2201","11000","22000","selection count 5","selection count 0","[1.1, 2.2, 3.3]","best_model","fallback_final","fallback 사유: 자료 없음"):
+        assert value in text
+    assert "10,800" not in text
