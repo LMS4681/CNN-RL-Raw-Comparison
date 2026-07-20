@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -149,7 +150,7 @@ def test_malformed_completed_journal_is_rejected_before_it_is_trusted(tmp_path: 
 
 @pytest.mark.parametrize("timestep", [None, 1])
 def test_smoke_zero_exit_without_a_valid_requested_archive_fails(tmp_path: Path, timestep: int | None):
-    from comparison.experiment_runner import ExperimentConfig, ExperimentStageError, _Runner
+    from comparison.experiment_runner import ExperimentConfig, ExperimentIntegrityError, ExperimentStageError, _Runner
 
     config = ExperimentConfig.for_test(smoke_timesteps=2)
     def process(argv, **_kwargs):
@@ -197,3 +198,72 @@ def test_run_entrypoint_orders_both_smokes_before_raw_training(tmp_path: Path, m
     runner_module.run_overnight_experiment(config, tmp_path, lease_interval_seconds=999)
     assert observed == list(runner_module.JOURNAL_STAGES)
     assert observed.index("smoke_candidate_cnn") < observed.index("train_raw_direct")
+
+
+def _write_runner_state(root: Path, config, *, status="complete", target=10, seconds=10,
+                        config_sha=None, checkpoint_bytes=b"state", timestep=7) -> Path:
+    checkpoint = root / "checkpoints" / "model_7_g1.sb3"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True); checkpoint.write_bytes(checkpoint_bytes)
+    payload = {
+        "schema_version": 1, "target_training_seconds": target,
+        "completed_training_seconds": seconds, "last_checkpoint_timestep": 7,
+        "last_regular_checkpoint_timestep": 0, "last_checkpoint_file": checkpoint.name,
+        "last_checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
+        "config_sha256": config_sha or config.config_sha256, "generation": 1,
+        "restart_count": 0, "max_unrecorded_seconds": 0.0, "status": status,
+        "started_at_utc": "2026-01-01T00:00:00Z", "updated_at_utc": "2026-01-01T00:00:10Z",
+        "completed_at_utc": "2026-01-01T00:00:10Z" if status == "complete" else None,
+    }
+    (root / "run_state.json").write_text(json.dumps(payload), encoding="utf-8")
+    return checkpoint
+
+
+@pytest.mark.parametrize("kind", ["missing", "running", "wrong_target", "short", "wrong_config", "wrong_sha", "wrong_timestep"])
+def test_train_rejects_every_unverified_or_incomplete_completion_state(tmp_path: Path, kind: str, monkeypatch):
+    from comparison.experiment_runner import ExperimentConfig, ExperimentIntegrityError, ExperimentStageError, _Runner
+
+    config = ExperimentConfig.for_test(target_training_seconds_per_arm=10)
+    root = tmp_path / "raw_direct"; calls = []
+    runner = _Runner(config, tmp_path, subprocess_runner=lambda argv, **kwargs: calls.append(argv), clock=lambda: 0,
+                     python_executable="python", archive_timestep_reader=lambda _: 7)
+    monkeypatch.setattr(runner, "provenance", lambda: {"lock_sha256": "a" * 64})
+    if kind != "missing":
+        checkpoint = _write_runner_state(root, config,
+            status="running" if kind == "running" else "complete",
+            target=9 if kind == "wrong_target" else 10,
+            seconds=9 if kind == "short" else 10,
+            config_sha="b" * 64 if kind == "wrong_config" else None)
+        if kind == "wrong_sha": checkpoint.write_bytes(b"tampered")
+        if kind == "wrong_timestep": runner.archive_reader = lambda _: 8
+    with pytest.raises((ExperimentStageError, ExperimentIntegrityError, ValueError, FileNotFoundError)):
+        runner.train("raw_direct")
+
+
+def test_train_valid_complete_state_skips_subprocess(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import ExperimentConfig, _Runner
+    config = ExperimentConfig.for_test(target_training_seconds_per_arm=10)
+    _write_runner_state(tmp_path / "raw_direct", config)
+    calls = []
+    runner = _Runner(config, tmp_path, subprocess_runner=lambda argv, **kwargs: calls.append(argv), clock=lambda: 0,
+                     python_executable="python", archive_timestep_reader=lambda _: 7)
+    monkeypatch.setattr(runner, "provenance", lambda: {"lock_sha256": "a" * 64})
+    runner.train("raw_direct")
+    assert calls == []
+
+
+def test_train_resume_uses_only_state_named_checkpoint_not_higher_orphan(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import ExperimentConfig, _Runner
+    config = ExperimentConfig.for_test(target_training_seconds_per_arm=10)
+    named = _write_runner_state(tmp_path / "raw_direct", config, status="running", seconds=1)
+    orphan = tmp_path / "raw_direct" / "checkpoints" / "model_999_g9.sb3"; orphan.write_bytes(b"orphan")
+    commands = []
+    def process(argv, **_kwargs):
+        commands.append(argv)
+        _write_runner_state(tmp_path / "raw_direct", config)
+    runner = _Runner(config, tmp_path, subprocess_runner=process, clock=lambda: 0,
+                     python_executable="python", archive_timestep_reader=lambda path: 7 if path == named else 999)
+    monkeypatch.setattr(runner, "provenance", lambda: {"lock_sha256": "a" * 64})
+    runner.train("raw_direct")
+    assert commands[0][commands[0].index("--resume-from") + 1] == str(named)
+    assert str(orphan) not in commands[0]
+    assert "--auto-resume" not in commands[0] and "--final-holdout-report" not in commands[0]

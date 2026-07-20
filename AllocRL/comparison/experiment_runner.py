@@ -328,7 +328,7 @@ class _Runner:
         root=self.root/arm; root.mkdir(parents=True,exist_ok=True); resume=None
         # A restarted process may legitimately skip the preflight journal entry;
         # recompute provenance here rather than retaining an invented/empty lock.
-        self.provenance()
+        self.lock_sha = self.provenance()["lock_sha256"]
         state_path=root/"run_state.json"
         if state_path.exists():
             state=read_wall_clock_state(state_path)
