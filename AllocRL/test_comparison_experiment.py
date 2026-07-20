@@ -322,3 +322,18 @@ def test_malformed_in_progress_is_rejected_not_normalized(tmp_path: Path, field:
     runner = _Runner(ExperimentConfig.for_test(), tmp_path, subprocess_runner=lambda *a, **k: None, clock=lambda: 0, python_executable=None, archive_timestep_reader=None)
     runner.save_journal({name: entry if name == "evaluate_raw_direct" else _journal_entry() for name in JOURNAL_STAGES})
     with pytest.raises(ExperimentIntegrityError, match="invalid stage journal"): runner.journal()
+
+
+def test_public_stage_harness_completes_once_then_skips_every_action(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, JOURNAL_STAGES, run_overnight_experiment
+    calls = []
+    actions = {stage: (lambda stage=stage: calls.append(stage)) for stage in JOURNAL_STAGES}
+    hashers = {stage: (lambda stage=stage: f"{JOURNAL_STAGES.index(stage):064x}") for stage in JOURNAL_STAGES}
+    config = ExperimentConfig.for_test()
+    run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    assert calls == list(JOURNAL_STAGES)
+    journal = json.loads((tmp_path / "stage_journal.json").read_text())
+    assert all(journal[stage]["status"] == "complete" and journal[stage]["output_sha256"] == hashers[stage]() for stage in JOURNAL_STAGES)
+    assert (tmp_path / "COMPLETE.json").is_file()
+    before = list(calls); run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    assert calls == before and json.loads((tmp_path / "lease.json").read_text())["status"] == "released"

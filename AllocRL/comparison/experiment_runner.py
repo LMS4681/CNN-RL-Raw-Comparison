@@ -286,7 +286,7 @@ class _Runner:
         journal[name]=_journal_entry("in_progress", input_sha256=incoming, started_at_utc=_utc()); self.save_journal(journal)
         try:
             action(); output_hash=self.output_hash(name)
-            if not output.exists(): raise ExperimentStageError(f"stage produced no output: {name}")
+            if self._injected_output_hasher is None and not output.exists(): raise ExperimentStageError(f"stage produced no output: {name}")
         except KeyboardInterrupt:
             journal[name]=_journal_entry("interrupted", input_sha256=incoming, started_at_utc=journal[name]["started_at_utc"], completed_at_utc=_utc(), error="interrupted"); self.save_journal(journal); raise
         except BaseException as error:
@@ -383,23 +383,17 @@ class _Runner:
         atomic_write_json(self.root/"integrity_verification.json", {"manifest_sha256": sha256_file(self.root / "manifest.json"), "verified_at_utc": _utc()})
 
 
-def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_root: str | Path, *, subprocess_runner: Callable[..., Any] = subprocess.run, clock: Callable[[], float] = time.monotonic, python_executable: str | None = None, archive_timestep_reader: Callable[[Path], int | None] | None = None, stale_takeover: bool = False, lease_interval_seconds: float = 60, lease_stale_seconds: float = 900) -> None:
+def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_root: str | Path, *, subprocess_runner: Callable[..., Any] = subprocess.run, clock: Callable[[], float] = time.monotonic, python_executable: str | None = None, archive_timestep_reader: Callable[[Path], int | None] | None = None, stale_takeover: bool = False, lease_interval_seconds: float = 60, lease_stale_seconds: float = 900, stage_actions: Mapping[str, Callable[[], None]] | None = None, stage_output_hashers: Mapping[str, Callable[[], str]] | None = None) -> None:
+    if (stage_actions is None) != (stage_output_hashers is None): raise ValueError("stage actions and output hashers must be supplied together")
+    if stage_actions is not None and (set(stage_actions) != set(JOURNAL_STAGES) or set(stage_output_hashers or ()) != set(JOURNAL_STAGES) or not all(callable(value) for value in stage_actions.values()) or not all(callable(value) for value in (stage_output_hashers or {}).values())): raise ValueError("test stage mappings must have exact callable journal-stage keys")
     config=config_path if isinstance(config_path,ExperimentConfig) else load_experiment_config(config_path)
-    root=Path(output_root).resolve(); root.mkdir(parents=True,exist_ok=True); runner=_Runner(config,root,subprocess_runner=subprocess_runner,clock=clock,python_executable=python_executable,archive_timestep_reader=archive_timestep_reader)
+    root=Path(output_root).resolve(); root.mkdir(parents=True,exist_ok=True); runner=_Runner(config,root,subprocess_runner=subprocess_runner,clock=clock,python_executable=python_executable,archive_timestep_reader=archive_timestep_reader,output_hasher=(lambda name: stage_output_hashers[name]()) if stage_output_hashers else None)
     lease = _Lease(root,stale_takeover=stale_takeover,clock=clock,interval=lease_interval_seconds,stale_after=lease_stale_seconds)
     runner.lease = lease
     try:
         with lease:
-            runner.run_stage("preflight",runner.preflight)
-            runner.run_stage("smoke_raw_direct",lambda: runner.smoke("raw_direct"))
-            runner.run_stage("smoke_candidate_cnn",lambda: runner.smoke("candidate_cnn"))
-            runner.run_stage("train_raw_direct",lambda: runner.train("raw_direct"))
-            runner.run_stage("evaluate_raw_direct",lambda: runner.evaluate_arm("raw_direct"))
-            runner.run_stage("train_candidate_cnn",lambda: runner.train("candidate_cnn"))
-            runner.run_stage("evaluate_candidate_cnn",lambda: runner.evaluate_arm("candidate_cnn"))
-            runner.run_stage("evaluate_common_step",runner.common_evaluation)
-            runner.run_stage("build_report",lambda: write_complete_report(root))
-            runner.run_stage("integrity_verification",runner.integrity)
+            actions = stage_actions or {"preflight":runner.preflight,"smoke_raw_direct":lambda: runner.smoke("raw_direct"),"smoke_candidate_cnn":lambda: runner.smoke("candidate_cnn"),"train_raw_direct":lambda: runner.train("raw_direct"),"evaluate_raw_direct":lambda: runner.evaluate_arm("raw_direct"),"train_candidate_cnn":lambda: runner.train("candidate_cnn"),"evaluate_candidate_cnn":lambda: runner.evaluate_arm("candidate_cnn"),"evaluate_common_step":runner.common_evaluation,"build_report":lambda: write_complete_report(root),"integrity_verification":runner.integrity}
+            for stage in JOURNAL_STAGES: runner.run_stage(stage, actions[stage])
             atomic_write_json(root/"COMPLETE.json",{"status":"complete","stages":REQUIRED_COMPLETE_STAGES})
     except BaseException as error:
         if lease.acquired:
