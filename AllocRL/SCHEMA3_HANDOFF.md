@@ -153,35 +153,25 @@ Stage C, Training Operations and Ablation:
 - [x] C1 Add deterministic fixed-holdout model selection.
 - [x] C2 Complete run configuration and automatic resume selection.
 - [x] C3 Reduce CNN diagnostics to one observation copy per rollout.
-- [ ] C4 Generate exact smoke, screening, and final commands.
+- [x] C4 Generate exact smoke, screening, and final commands (repaired in
+  `f55496e`).
 - [ ] C5 Produce screening-selection and final-acceptance reports.
 - [ ] C6 Update the Colab schema-3 training workflow.
 - [ ] C7 Run end-to-end operational verification.
 
-The next task is to repair C4 against the task definition in
-`docs/superpowers/plans/2026-07-16-training-operations-ablation-implementation.md`.
-Its independent review found these unresolved items:
+C4 was initially implemented in rejected commit `2b5b66a`. Its independent
+review identified five defects: forwarded controlled-option abbreviations, the
+obsolete three-argument builder adapter, non-frozen builder seed sequences,
+repeated selected-option handling, and inaccurate dry-run documentation. All
+five were repaired in `f55496e`, including the review follow-up that moves
+duplicate-option validation before utility-mode dispatch.
 
-1. Reject argparse abbreviations in forwarded common arguments. For example,
-   `--final-holdout` currently bypasses the controlled-option check and is
-   accepted by `train.py` as `--final-holdout-report` in non-final stages.
-2. Remove the obsolete three-argument `build_ablation_commands` adapter. It can
-   still generate the old 20,000/100,000-step contract without the required
-   hyperparameter, checkpoint, and holdout flags. Update its stale test in
-   `test_evaluation_scenarios.py`.
-3. Require each exported builder call to use the exact frozen seed tuple for its
-   stage. Reject duplicate, missing, extra, or reordered seeds so output paths
-   remain collision-free and counts remain exactly 5/60/25.
-4. Reject repeated `--selected-gae-lambda` and `--selected-n-steps` CLI options
-   instead of silently using the last occurrence.
-5. Correct the `--dry-run` documentation or make dry-run suppress scenario
-   preparation and baseline evaluation consistently. The current documentation
-   incorrectly says it applies to any invocation.
-
-After these fixes, rerun the C4 focused and full suites, obtain a fresh C4
-review, and only then continue with C5. Local `.superpowers/sdd` task reports are
-ignored and are not transferred through Git; this tracked handoff and the
-tracked plan above are the authoritative continuation record.
+C4 verification is current: the focused command contract suite passed with
+`99 passed, 6 subtests`, and the full suite passed with `519 passed, 2
+warnings, 54 subtests`. The next task is C5: produce the screening-selection
+and final-acceptance reports. Local `.superpowers/sdd` task reports are ignored
+and are not transferred through Git; this tracked handoff and the tracked plan
+above are the authoritative continuation record.
 
 ## Continue On Another PC
 
