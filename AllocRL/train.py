@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import sys
 import warnings
@@ -721,6 +722,65 @@ def create_holdout_eval_callback(
     )
 
 
+def _detach_callback_references(callbacks) -> None:
+    """Remove model references retained by SB3 callback state."""
+    seen: set[int] = set()
+
+    def detach(callback) -> None:
+        if callback is None or id(callback) in seen:
+            return
+        seen.add(id(callback))
+        for child in getattr(callback, "callbacks", ()):
+            detach(child)
+        detach(getattr(callback, "callback", None))
+        if hasattr(callback, "locals"):
+            callback.locals.clear()
+        if hasattr(callback, "globals"):
+            callback.globals.clear()
+        if hasattr(callback, "parent"):
+            callback.parent = None
+        if hasattr(callback, "model"):
+            callback.model = None
+
+    for callback in callbacks:
+        detach(callback)
+    callbacks.clear()
+
+
+def _detach_model_environment(model) -> None:
+    if model is None:
+        return
+    if hasattr(model, "env"):
+        model.env = None
+    if hasattr(model, "_vec_normalize_env"):
+        model._vec_normalize_env = None
+
+
+def _release_training_resources(model, callbacks, training_env) -> None:
+    _detach_callback_references(callbacks)
+    _detach_model_environment(model)
+    if training_env is not None:
+        training_env.close()
+
+
+class _TrainingResourceLifecycle:
+    def __init__(self) -> None:
+        self.training_env = None
+        self.model = None
+        self.callbacks = []
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        _release_training_resources(
+            self.model, self.callbacks, self.training_env
+        )
+        self.model = None
+        self.training_env = None
+
+
 def evaluate_selected_holdout_report(
     model_class,
     *,
@@ -737,21 +797,41 @@ def evaluate_selected_holdout_report(
         validate_fixed_holdout_scenarios,
     )
 
-    validate_fixed_holdout_scenarios(scenario_records)
-    best_path = resolve_model_archive_path(
-        Path(output_dir) / BEST_MODEL_FILENAME
-    )
-    selected_model = model_class.load(
-        str(best_path), env=training_env, device=device
-    )
-    rows = evaluate_fn(
-        lambda _seed: ModelActionPolicy(selected_model, name="model"),
-        scenario_records,
-    )
-    return [{**row, "checkpoint": "best_model"} for row in rows]
+    selected_model = None
+    attached_env = None
+    try:
+        validate_fixed_holdout_scenarios(scenario_records)
+        best_path = resolve_model_archive_path(
+            Path(output_dir) / BEST_MODEL_FILENAME
+        )
+        selected_model = model_class.load(
+            str(best_path), env=training_env, device=device
+        )
+        if hasattr(selected_model, "get_env"):
+            attached_env = selected_model.get_env()
+        rows = evaluate_fn(
+            lambda _seed: ModelActionPolicy(selected_model, name="model"),
+            scenario_records,
+        )
+        return [{**row, "checkpoint": "best_model"} for row in rows]
+    finally:
+        _detach_model_environment(selected_model)
+        if attached_env is not None:
+            attached_env.close()
+        elif training_env is not None:
+            training_env.close()
 
 
 def train(args):
+    """Run training with deterministic cleanup on every exit path."""
+    resources = _TrainingResourceLifecycle()
+    try:
+        return _train(args, resources)
+    finally:
+        resources.close()
+
+
+def _train(args, resources: _TrainingResourceLifecycle):
     """MaskablePPO 학습 실행."""
     from sb3_contrib import MaskablePPO
 
@@ -854,6 +934,7 @@ def train(args):
         state_context_mode=args.state_context,
         seed=args.seed,
     )
+    resources.training_env = env
     resolved_vec_env = resolve_vec_env_type(args.vec_env, args.n_envs)
 
     # 메모리 사용량 예측
@@ -918,6 +999,7 @@ def train(args):
             device=args.device,
             tensorboard_log=str(output_dir / "tb_logs"),
         )
+    resources.model = model
 
     # ── 5. 콜백 설정 ──────────────────────────────────────────────
     callback = [
@@ -928,6 +1010,7 @@ def train(args):
             log_dir=args.output_dir, verbose=1, append=is_resume
         ),
     ]
+    resources.callbacks = callback
     holdout_callback = create_holdout_eval_callback(
         fixed_scenarios,
         run_fixed_holdout,
@@ -998,12 +1081,28 @@ def train(args):
         [csv_row],
     )
 
+    resources.close()
+    model = None
+    holdout_callback = None
+    callback = None
+    env = None
+    gc.collect()
+
     if args.final_holdout_report:
         print("\n  Selected model fixed holdout report")
+        selected_model_env = create_evaluation_env(
+            full_blocks,
+            workspaces,
+            strategy,
+            observation_scales=observation_scales,
+            grid_size=args.grid_size,
+            state_context_mode=args.state_context,
+            seed=args.seed,
+        )
         scenario_rows = evaluate_selected_holdout_report(
             MaskablePPO,
             output_dir=output_dir,
-            training_env=env,
+            training_env=selected_model_env,
             scenario_records=fixed_scenarios,
             device=args.device,
             evaluate_fn=run_fixed_holdout,

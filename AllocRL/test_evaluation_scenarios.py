@@ -801,8 +801,23 @@ class EvaluationScenarioTests(unittest.TestCase):
         self,
     ):
         scenarios = [{"seed": seed} for seed in range(1000, 1020)]
-        training_env = object()
         evaluated = {}
+
+        class CloseCountingEnv:
+            def __init__(self):
+                self.close_count = 0
+
+            def close(self):
+                self.close_count += 1
+
+        training_env = CloseCountingEnv()
+
+        class SelectedModel:
+            def __init__(self, env):
+                self.env = env
+
+            def get_env(self):
+                return self.env
 
         class FakeMaskablePPO:
             loaded = None
@@ -810,7 +825,7 @@ class EvaluationScenarioTests(unittest.TestCase):
             @classmethod
             def load(cls, path, **kwargs):
                 cls.loaded = (path, kwargs)
-                return "selected-model"
+                return SelectedModel(kwargs["env"])
 
         def evaluate_fn(policy_factory, scenario_records):
             evaluated["policy"] = policy_factory(1000)
@@ -840,22 +855,26 @@ class EvaluationScenarioTests(unittest.TestCase):
         self.assertEqual("cpu", load_kwargs["device"])
         self.assertEqual(list(range(1000, 1020)), [row["seed"] for row in rows])
         self.assertTrue(all(row["checkpoint"] == "best_model" for row in rows))
-        self.assertEqual("selected-model", evaluated["policy"].model)
+        self.assertIsInstance(evaluated["policy"].model, SelectedModel)
+        self.assertEqual(1, training_env.close_count)
         self.assertIs(scenarios, evaluated["scenarios"])
 
     def test_selected_holdout_report_requires_best_model(self):
+        model_env = CountingEvaluationEnv()
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.assertRaisesRegex(FileNotFoundError, "best_model.sb3"):
                 train_module.evaluate_selected_holdout_report(
                     object(),
                     output_dir=tmpdir,
-                    training_env=object(),
+                    training_env=model_env,
                     scenario_records=[
                         {"seed": seed} for seed in range(1000, 1020)
                     ],
                     device="cpu",
                     evaluate_fn=lambda policy_factory, scenarios: [],
                 )
+
+        self.assertEqual(1, model_env.close_count)
 
     def test_all_real_fixed_scenarios_obey_and_reset_with_full_source_scales(
         self,
