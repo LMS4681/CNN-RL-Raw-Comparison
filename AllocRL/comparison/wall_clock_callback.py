@@ -141,6 +141,12 @@ def _validated_state(payload: Mapping[str, Any]) -> WallClockState:
     for key in ("started_at_utc", "updated_at_utc"):
         if not isinstance(payload[key], str) or not payload[key]:
             raise ValueError(f"wall-clock state {key} must be a non-empty string")
+        try:
+            parsed = datetime.fromisoformat(payload[key].replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(f"wall-clock state {key} must be UTC") from error
+        if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+            raise ValueError(f"wall-clock state {key} must be UTC")
     completed_at = payload["completed_at_utc"]
     if completed_at is not None and (
         not isinstance(completed_at, str) or not completed_at
@@ -150,6 +156,13 @@ def _validated_state(payload: Mapping[str, Any]) -> WallClockState:
         )
     if payload["status"] == "complete" and completed_at is None:
         raise ValueError("complete wall-clock state requires completed_at_utc")
+    if completed_at is not None:
+        try:
+            completed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("wall-clock state completed_at_utc must be UTC") from error
+        if completed.tzinfo is None or completed.utcoffset() != timezone.utc.utcoffset(completed):
+            raise ValueError("wall-clock state completed_at_utc must be UTC")
     return WallClockState(**dict(payload))
 
 

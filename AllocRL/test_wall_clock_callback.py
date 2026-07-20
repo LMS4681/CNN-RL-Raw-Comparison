@@ -113,6 +113,18 @@ def test_read_wall_clock_state_rejects_duplicate_json_fields(tmp_path, fake_cloc
         read_wall_clock_state(path)
 
 
+def test_read_wall_clock_state_requires_real_utc_timestamps(tmp_path, fake_clock):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start(); model.num_timesteps = 1
+    callback.persist_checkpoint(status="running")
+    path = tmp_path / "run_state.json"
+    payload = __import__("json").loads(path.read_text(encoding="utf-8"))
+    payload["started_at_utc"] = "2026-07-21T09:00:00+09:00"
+    path.write_text(__import__("json").dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="started_at_utc"):
+        read_wall_clock_state(path)
+
+
 def test_resume_uses_only_remaining_budget(tmp_path, fake_clock):
     first, model = prepared_callback(tmp_path, fake_clock, target_seconds=10_800)
     first._on_training_start()

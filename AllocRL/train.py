@@ -17,6 +17,7 @@ import os
 import pickle
 import re
 import sys
+import tempfile
 import time
 import warnings
 import zipfile
@@ -41,6 +42,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from comparison.wall_clock_callback import (
     WallClockBudgetCallback,
     read_wall_clock_state,
+    reconcile_progress_timing,
     resolve_state_checkpoint,
 )
 from comparison.artifact_manifest import (
@@ -52,6 +54,10 @@ from comparison.artifact_manifest import (
     sha256_file,
     write_runtime_metrics,
     write_run_origin,
+)
+from comparison.training_completion import (
+    validate_training_completion,
+    write_training_completion,
 )
 
 from alloc_env.observation_state import (
@@ -268,6 +274,140 @@ def runtime_selected_checkpoint(
             "sha256": wall_clock_state.last_checkpoint_sha256,
         },
     }
+
+
+def _atomic_save_conventional_model(model, path: Path) -> None:
+    """Save and publish the conventional SB3 archive without partial exposure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="final-model-", dir=path.parent
+    ) as temporary_dir:
+        temporary = Path(temporary_dir) / path.name
+        model.save(str(temporary))
+        if not temporary.is_file():
+            zip_path = Path(f"{temporary}.zip")
+            if zip_path.is_file():
+                temporary = zip_path
+            else:
+                raise FileNotFoundError("model.save produced no conventional archive")
+        with temporary.open("rb+") as stream:
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+
+
+def _atomic_write_evaluation_metrics(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        if not rows:
+            raise ValueError("evaluation metrics require at least one row")
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+        stream.flush()
+        os.fsync(stream.fileno())
+        temporary = Path(stream.name)
+    try:
+        os.replace(temporary, path)
+        with path.open(encoding="utf-8", newline="") as source:
+            if list(csv.DictReader(source)) != [
+                {key: str(value) for key, value in row.items()} for row in rows
+            ]:
+                raise ValueError("evaluation CSV reread differs from publication")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def finalize_complete_wall_clock_run(
+    model,
+    *,
+    args,
+    output_dir: str | Path,
+    full_blocks,
+    workspaces,
+    strategy,
+    observation_scales,
+    wall_clock_state,
+    run_origin: Mapping[str, Any],
+    finalization_mode: str,
+) -> dict[str, Any]:
+    """Idempotently finalize a complete state without performing learning."""
+    output = Path(output_dir).resolve()
+    receipt_path = output / "training_completion.json"
+    if receipt_path.exists():
+        return validate_training_completion(
+            output,
+            expected_config_sha256=args.comparison_config_sha256,
+            expected_target_seconds=float(args.max_training_seconds),
+            archive_timestep_reader=model_num_timesteps,
+        )
+    if wall_clock_state.status != "complete":
+        raise ValueError("finalization requires a complete wall-clock state")
+    checkpoint = resolve_state_checkpoint(output, wall_clock_state)
+    if (
+        int(model.num_timesteps) != wall_clock_state.last_checkpoint_timestep
+        or model_num_timesteps(checkpoint) != wall_clock_state.last_checkpoint_timestep
+    ):
+        raise ValueError("finalization model is not the exact complete state model")
+    reconcile_progress_timing(
+        output / "progress_timing.csv", wall_clock_state
+    )
+    conventional = output / MODEL_FILENAME
+    _atomic_save_conventional_model(model, conventional)
+    if model_num_timesteps(conventional) != wall_clock_state.last_checkpoint_timestep:
+        raise ValueError("conventional model timestep differs after atomic save")
+
+    evaluation_started = time.monotonic()
+    eval_env = create_evaluation_env(
+        full_blocks,
+        workspaces,
+        strategy,
+        observation_scales=observation_scales,
+        grid_size=args.grid_size,
+        state_context_mode=args.state_context,
+        seed=args.seed,
+    )
+    try:
+        csv_row = evaluate_original_csv_row(model, eval_env, n_eval=args.n_eval)
+    finally:
+        eval_env.close()
+    evaluation_seconds = time.monotonic() - evaluation_started
+    _atomic_write_evaluation_metrics(
+        output / "evaluation_csv.csv", [csv_row]
+    )
+    metrics_recorded_at_utc = datetime.now(timezone.utc).isoformat()
+    write_runtime_metrics(
+        output / "runtime_metrics.json",
+        comparison_runtime_metrics(
+            model,
+            wall_clock_state,
+            origin=run_origin,
+            metrics_recorded_at_utc=metrics_recorded_at_utc,
+            evaluation_seconds=evaluation_seconds,
+            finalization_mode=finalization_mode,
+            selected_checkpoint=runtime_selected_checkpoint(
+                output,
+                wall_clock_state,
+                selection_count=args.holdout_selection_count,
+            ),
+        ),
+    )
+    return write_training_completion(
+        output,
+        expected_config_sha256=args.comparison_config_sha256,
+        expected_target_seconds=float(args.max_training_seconds),
+        finalization_mode=finalization_mode,
+        archive_timestep_reader=model_num_timesteps,
+        finalized_at_utc=datetime.now(timezone.utc).isoformat(),
+    )
 
 
 class Sb3CheckpointCallback(CheckpointCallback):
@@ -1011,6 +1151,14 @@ def _resolve_wall_clock_resume_path(
         )
     if state.config_sha256 != config_sha256:
         raise ValueError("wall-clock config SHA256 changed on resume")
+    finalize_only = bool(getattr(args, "finalize_complete_state", False))
+    if finalize_only and state.status != "complete":
+        raise ValueError("--finalize-complete-state requires complete run_state.json")
+    if not finalize_only and state.status == "complete":
+        raise ValueError(
+            "complete wall-clock state permits finalization only; pass "
+            "--finalize-complete-state with the exact state checkpoint"
+        )
     expected = resolve_state_checkpoint(output_dir, state)
     requested = getattr(args, "resume_from", None)
     if not requested:
@@ -1422,6 +1570,28 @@ def _train(args, resources: _TrainingResourceLifecycle):
                 initial_timestep=initial_timestep,
             )
 
+    if bool(getattr(args, "finalize_complete_state", False)):
+        if not wall_clock_enabled or not is_resume:
+            raise ValueError(
+                "--finalize-complete-state requires wall-clock mode and exact resume"
+            )
+        wall_clock_state = read_wall_clock_state(
+            _wall_clock_state_path(args, output_dir)
+        )
+        assert run_origin is not None
+        return finalize_complete_wall_clock_run(
+            model,
+            args=args,
+            output_dir=output_dir,
+            full_blocks=full_blocks,
+            workspaces=workspaces,
+            strategy=strategy,
+            observation_scales=observation_scales,
+            wall_clock_state=wall_clock_state,
+            run_origin=run_origin,
+            finalization_mode="recovered_complete_state",
+        )
+
     # ── 5. 콜백 설정 ──────────────────────────────────────────────
     callback = [
         AllocationCallback(
@@ -1499,6 +1669,19 @@ def _train(args, resources: _TrainingResourceLifecycle):
                 "training timestep ceiling returned before the wall-clock "
                 "budget completed; the arm remains incomplete"
             )
+        assert run_origin is not None
+        return finalize_complete_wall_clock_run(
+            model,
+            args=args,
+            output_dir=output_dir,
+            full_blocks=full_blocks,
+            workspaces=workspaces,
+            strategy=strategy,
+            observation_scales=observation_scales,
+            wall_clock_state=wall_clock_state,
+            run_origin=run_origin,
+            finalization_mode="in_process",
+        )
 
     # ── 7. 모델 저장 ─────────────────────────────────────────────
     sb3_path = str(output_dir / MODEL_FILENAME)
@@ -1849,6 +2032,11 @@ def main():
     parser.add_argument("--comparison-scenario-sha256", default=None)
     parser.add_argument("--comparison-split-sha256", default=None)
     parser.add_argument("--comparison-lock-sha256", default=None)
+    parser.add_argument(
+        "--finalize-complete-state",
+        action="store_true",
+        help="finalize an exact complete wall-clock state without learning",
+    )
     parser.add_argument("--export-onnx", action="store_true", default=True,
                         help="ONNX export 수행")
     parser.add_argument("--no-export-onnx", action="store_false", dest="export_onnx")

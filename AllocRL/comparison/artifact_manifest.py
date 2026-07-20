@@ -250,6 +250,31 @@ def _validate_runtime_metrics_payload(
     steps = payload["steps_per_second"]
     if steps is not None:
         _finite_nonnegative(steps, "runtime metrics steps_per_second")
+    start = payload["start_timestep"]
+    end = payload["end_timestep"]
+    recorded = float(payload["recorded_training_seconds"])
+    if end < start:
+        raise ValueError("runtime metrics end_timestep precedes start_timestep")
+    if recorded == 0:
+        if steps is not None:
+            raise ValueError("zero recorded runtime requires null throughput")
+    else:
+        expected_steps = (end - start) / recorded
+        if steps is None or not math.isclose(
+            float(steps), expected_steps, rel_tol=1e-12, abs_tol=0.0
+        ):
+            raise ValueError("runtime metrics throughput arithmetic differs")
+    expected_overrun = max(
+        0.0,
+        recorded - float(payload["target_training_seconds"]),
+    )
+    if not math.isclose(
+        float(payload["overrun_seconds"]),
+        expected_overrun,
+        rel_tol=1e-12,
+        abs_tol=0.0,
+    ):
+        raise ValueError("runtime metrics overrun arithmetic differs")
     peak = payload["peak_cuda_memory_bytes"]
     if peak is not None:
         _nonnegative_integer(peak, "runtime metrics peak_cuda_memory_bytes")
@@ -264,6 +289,12 @@ def _validate_runtime_metrics_payload(
         raise ValueError("recovered runtime peak CUDA memory must be null")
     if scope == "not_cuda" and peak is not None:
         raise ValueError("CPU runtime peak CUDA memory must be null")
+    mode = payload["finalization_mode"]
+    if mode == "recovered_complete_state":
+        if scope not in {"unavailable_after_training_process", "not_cuda"} or peak is not None:
+            raise ValueError("recovered runtime cannot claim training-process CUDA peak")
+    elif scope not in {"training_process", "not_cuda"}:
+        raise ValueError("in-process runtime peak CUDA scope is invalid")
     counts = payload["parameter_counts"]
     if not isinstance(counts, dict) or set(counts) != {
         "total", "feature_extractor", "policy", "value"

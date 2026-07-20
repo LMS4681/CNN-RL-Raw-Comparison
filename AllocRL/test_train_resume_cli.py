@@ -794,6 +794,25 @@ class TrainResumeCliTest(unittest.TestCase):
         self.assertEqual(300, captured["wall_clock_heartbeat_seconds"])
         self.assertEqual("a" * 64, captured["comparison_config_sha256"])
 
+    def test_finalize_complete_state_argument_is_accepted(self):
+        captured = {}
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["train.py", "--finalize-complete-state"],
+            ),
+            patch.object(
+                train_module,
+                "train",
+                lambda args: captured.update(vars(args)),
+            ),
+        ):
+            train_module.main()
+
+        self.assertTrue(captured["finalize_complete_state"])
+
     def test_obsolete_future_cli_argument_is_rejected(self):
         with (
             patch.object(

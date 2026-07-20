@@ -215,6 +215,49 @@ def test_run_origin_is_atomic_exact_and_never_inferred(tmp_path):
         read_run_origin(path)
 
 
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"start_timestep": 121, "end_timestep": 120},
+        {"recorded_training_seconds": 0.0, "steps_per_second": 1.0},
+        {"recorded_training_seconds": 10.0, "steps_per_second": 99.0},
+        {
+            "finalization_mode": "recovered_complete_state",
+            "peak_cuda_memory_scope": "training_process",
+            "peak_cuda_memory_bytes": 1,
+        },
+        {
+            "finalization_mode": "in_process",
+            "peak_cuda_memory_scope": "unavailable_after_training_process",
+            "peak_cuda_memory_bytes": None,
+        },
+    ],
+)
+def test_runtime_v2_rejects_impossible_arithmetic_and_peak_scope(
+    tmp_path, updates
+):
+    path = tmp_path / "runtime.json"
+    payload = {
+        "schema_version": 2, "target_training_seconds": 10.0,
+        "recorded_training_seconds": 10.0, "run_wall_span_seconds": 12.0,
+        "overrun_seconds": 0.0, "restart_count": 0,
+        "max_unrecorded_seconds": 1.0, "start_timestep": 0,
+        "start_timestep_source": "run_origin.initial_timestep",
+        "end_timestep": 120, "steps_per_second": 12.0,
+        "parameter_counts": {"total": 10, "feature_extractor": 1, "policy": 5, "value": 4},
+        "peak_cuda_memory_bytes": None, "peak_cuda_memory_scope": "not_cuda",
+        "evaluation_seconds": 2.0,
+        "metrics_recorded_at_utc": "2026-07-21T00:00:12+00:00",
+        "finalization_mode": "in_process", "selected_checkpoint_timestep": 120,
+        "selection_count": 0, "selection_tuple": None,
+        "checkpoint_identity": {"filename": "model.sb3", "sha256": "a" * 64},
+    }
+    payload.update(updates)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError):
+        read_runtime_metrics(path)
+
+
 def test_jsonl_writer_uses_compact_canonical_json_and_rejects_nan(tmp_path):
     segment = tmp_path / "segment.jsonl"
     append_environment_segment(segment, {"b": 1, "a": 2})

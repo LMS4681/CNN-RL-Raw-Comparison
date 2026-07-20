@@ -166,6 +166,7 @@ def test_korean_report_is_utf8_and_has_no_replacement_character(tmp_path):
     assert "\ufffd" not in text
     assert "wall span" in text
     assert "end-to-end" not in text
+    assert "scope=training_process" in text
 
 
 def test_missing_runtime_value_is_json_null_not_a_guessed_zero(tmp_path):
