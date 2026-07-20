@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import math
 import hashlib
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -369,3 +371,22 @@ def test_public_runner_rejects_invalid_lease_timing(tmp_path: Path, kwargs: dict
     from comparison.experiment_runner import ExperimentConfig, run_overnight_experiment
     with pytest.raises(ValueError, match="positive finite"):
         run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, **kwargs)
+
+
+def test_public_harness_refreshes_lease_while_smoke_action_blocks(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, run_overnight_experiment
+    calls, actions, hashers = _public_harness(); entered = threading.Event(); release = threading.Event(); errors = []
+    def block():
+        calls.append("smoke_raw_direct"); entered.set(); assert release.wait(2)
+    actions["smoke_raw_direct"] = block
+    worker = threading.Thread(target=lambda: (run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=.01),), daemon=True)
+    worker.start(); assert entered.wait(1)
+    seen = set(); deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline and len(seen) < 2:
+        try:
+            payload = json.loads((tmp_path / "lease.json").read_text());
+            if payload.get("status") == "active": seen.add(payload["heartbeat_utc"])
+        except (OSError, json.JSONDecodeError): pass
+        time.sleep(.01)
+    release.set(); worker.join(2)
+    assert len(seen) >= 2 and not worker.is_alive() and json.loads((tmp_path / "lease.json").read_text())["status"] == "released"
