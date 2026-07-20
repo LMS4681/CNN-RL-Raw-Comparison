@@ -1,6 +1,7 @@
 import hashlib
 import json
 import platform
+import subprocess
 
 import pytest
 import torch.nn as nn
@@ -344,6 +345,127 @@ def test_run_origin_replay_still_validates_requested_identity(tmp_path):
             config_sha256="a" * 64,
             initial_timestep=False,
         )
+
+
+def test_run_origin_replay_rejects_matching_file_symlink(tmp_path):
+    target = tmp_path / "real_run_origin.json"
+    write_run_origin(
+        target,
+        config_sha256="a" * 64,
+        initial_timestep=0,
+        created_at_utc="2026-07-21T00:00:00+00:00",
+    )
+    origin_path = tmp_path / "run_origin.json"
+    try:
+        origin_path.symlink_to(target)
+    except OSError:
+        pytest.skip("file symlink creation is unavailable on this host")
+
+    with pytest.raises(ValueError, match="direct regular file"):
+        write_run_origin(
+            origin_path,
+            config_sha256="a" * 64,
+            initial_timestep=0,
+            created_at_utc="2026-07-21T00:01:00+00:00",
+        )
+
+    assert origin_path.is_symlink()
+
+
+def test_run_origin_replay_rejects_broken_file_symlink_without_replacing_it(
+    tmp_path,
+):
+    missing = tmp_path / "missing_run_origin.json"
+    origin_path = tmp_path / "run_origin.json"
+    try:
+        origin_path.symlink_to(missing)
+    except OSError:
+        pytest.skip("file symlink creation is unavailable on this host")
+
+    with pytest.raises(ValueError, match="direct regular file"):
+        write_run_origin(
+            origin_path,
+            config_sha256="a" * 64,
+            initial_timestep=0,
+            created_at_utc="2026-07-21T00:00:00+00:00",
+        )
+
+    assert origin_path.is_symlink()
+    assert not missing.exists()
+
+
+def test_run_origin_replay_rejects_output_directory_junction(tmp_path):
+    if platform.system() != "Windows" or not hasattr(type(tmp_path), "is_junction"):
+        pytest.skip("directory junctions are unavailable on this host")
+    target_dir = tmp_path / "real_output"
+    target_dir.mkdir()
+    write_run_origin(
+        target_dir / "run_origin.json",
+        config_sha256="a" * 64,
+        initial_timestep=0,
+        created_at_utc="2026-07-21T00:00:00+00:00",
+    )
+    output_dir = tmp_path / "output"
+    created = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(output_dir), str(target_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        pytest.skip("directory junction creation is unavailable on this host")
+    try:
+        assert output_dir.is_junction()
+        with pytest.raises(ValueError, match="direct regular file"):
+            write_run_origin(
+                output_dir / "run_origin.json",
+                config_sha256="a" * 64,
+                initial_timestep=0,
+                created_at_utc="2026-07-21T00:01:00+00:00",
+            )
+    finally:
+        output_dir.rmdir()
+
+
+def test_run_origin_replay_rejects_corrupt_existing_bytes_without_rewriting(
+    tmp_path,
+):
+    origin_path = tmp_path / "run_origin.json"
+    corrupt = b'{"schema_version":1'
+    origin_path.write_bytes(corrupt)
+
+    with pytest.raises(ValueError):
+        write_run_origin(
+            origin_path,
+            config_sha256="a" * 64,
+            initial_timestep=0,
+        )
+
+    assert origin_path.read_bytes() == corrupt
+
+
+def test_run_origin_replay_rejects_invalid_existing_source_without_rewriting(
+    tmp_path,
+):
+    origin_path = tmp_path / "run_origin.json"
+    payload = {
+        "schema_version": 1,
+        "config_sha256": "a" * 64,
+        "initial_timestep": 0,
+        "source": "inferred_from_checkpoint",
+        "created_at_utc": "2026-07-21T00:00:00+00:00",
+    }
+    origin_path.write_text(json.dumps(payload), encoding="utf-8")
+    original_bytes = origin_path.read_bytes()
+
+    with pytest.raises(ValueError, match="source is invalid"):
+        write_run_origin(
+            origin_path,
+            config_sha256="a" * 64,
+            initial_timestep=0,
+        )
+
+    assert origin_path.read_bytes() == original_bytes
 
 
 @pytest.mark.parametrize(

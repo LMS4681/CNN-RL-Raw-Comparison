@@ -198,8 +198,16 @@ def write_run_origin(
     _sha256(config_sha256, "run origin config_sha256")
     _nonnegative_integer(initial_timestep, "run origin initial_timestep")
     destination = Path(path)
-    if destination.exists():
-        existing = read_run_origin(destination)
+    try:
+        existing_path = resolve_direct_regular_file(
+            destination.parent,
+            destination,
+            label="run origin",
+        )
+    except FileNotFoundError:
+        existing_path = None
+    if existing_path is not None:
+        existing = read_run_origin(existing_path)
         if (
             existing["config_sha256"] != config_sha256
             or existing["initial_timestep"] != initial_timestep
