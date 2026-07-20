@@ -131,6 +131,14 @@ def test_final_reference_uses_only_the_complete_state_checkpoint(tmp_path, monke
     assert (reference.path, reference.label, reference.timestep) == (final, "final", 60_000)
 
 
+def test_malformed_state_is_a_partial_result(tmp_path):
+    from comparison import checkpoint_evaluator as evaluator
+
+    (tmp_path / "run_state.json").write_text('{"status":"complete"}', encoding="utf-8")
+    with pytest.raises(evaluator.PartialResultError, match="final checkpoint"):
+        evaluator.resolve_final_checkpoint(tmp_path)
+
+
 def test_evaluate_checkpoint_labels_rows_and_writes_partitions(tmp_path, monkeypatch):
     from comparison import checkpoint_evaluator as evaluator
 
@@ -181,3 +189,22 @@ def test_manifest_checkpoint_entries_merge_without_fabricating_metadata(tmp_path
     assert result["checkpoints"]["raw_direct"]["selected"] == {
         "path": "raw/best_model.sb3", "label": "best_model", "sha256": "a" * 64, "timestep": 50_000,
     }
+
+
+def test_common_writer_rejects_incomplete_or_mismatched_pair(tmp_path):
+    from comparison import checkpoint_evaluator as evaluator
+
+    rows = []
+    for arm in evaluator.ARMS:
+        for seed in range(1000, 1020):
+            rows.append(dict(zip(evaluator.EVALUATION_COLUMNS, (
+                "holdout_fixed20", arm, seed, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+                arm, "common_step", 20_000, arm[0] * 64,
+                "selection" if seed < 1005 else "primary_test",
+            ))))
+    evaluator.write_common_step_evaluation(tmp_path, list(reversed(rows)))
+    written = list(csv.DictReader((tmp_path / "comparison" / "common_step_evaluation.csv").open(encoding="utf-8")))
+    assert [(row["arm"], int(row["seed"])) for row in written] == [(arm, seed) for arm in evaluator.ARMS for seed in range(1000, 1020)]
+    rows.pop()
+    with pytest.raises(ValueError, match="holdout"):
+        evaluator.write_common_step_evaluation(tmp_path, rows)
