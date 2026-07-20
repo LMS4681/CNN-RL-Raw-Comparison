@@ -16,6 +16,7 @@ import os
 import pickle
 import re
 import sys
+import time
 import warnings
 import zipfile
 from collections import Counter
@@ -39,6 +40,12 @@ from comparison.wall_clock_callback import (
     WallClockBudgetCallback,
     read_wall_clock_state,
     resolve_state_checkpoint,
+)
+from comparison.artifact_manifest import (
+    append_environment_segment,
+    collect_environment,
+    count_trainable_parameters,
+    write_runtime_metrics,
 )
 
 from alloc_env.observation_state import (
@@ -65,6 +72,70 @@ OBSERVATION_SCHEMA_VERSION = 3
 REWARD_SCHEMA_VERSION = 2
 MODEL_FILENAME = "block_placement_ppo.sb3"
 LEGACY_MODEL_FILENAME = "block_placement_ppo.zip"
+
+
+def comparison_runtime_metrics(
+    model,
+    wall_clock_state,
+    *,
+    start_timestep: int,
+    end_to_end_seconds: float,
+    evaluation_seconds: float,
+) -> dict[str, Any]:
+    """Build the per-arm metrics payload from the durable wall-clock state."""
+    recorded_seconds = float(wall_clock_state.completed_training_seconds)
+    end_timestep = int(model.num_timesteps)
+    trained_steps = end_timestep - int(start_timestep)
+    return {
+        "target_training_seconds": float(wall_clock_state.target_training_seconds),
+        "recorded_training_seconds": recorded_seconds,
+        "end_to_end_training_seconds": float(end_to_end_seconds),
+        "overrun_seconds": max(
+            0.0,
+            recorded_seconds - float(wall_clock_state.target_training_seconds),
+        ),
+        "restart_count": int(wall_clock_state.restart_count),
+        "max_unrecorded_seconds": float(wall_clock_state.max_unrecorded_seconds),
+        "start_timestep": int(start_timestep),
+        "end_timestep": end_timestep,
+        "steps_per_second": (
+            trained_steps / recorded_seconds if recorded_seconds > 0 else None
+        ),
+        "parameter_counts": count_trainable_parameters(model.policy),
+        "peak_cuda_memory_bytes": (
+            int(torch.cuda.max_memory_allocated())
+            if torch.cuda.is_available()
+            else None
+        ),
+        "evaluation_seconds": float(evaluation_seconds),
+        "selected_checkpoint_timestep": int(
+            wall_clock_state.last_checkpoint_timestep
+        ),
+        "selection_count": None,
+        "selection_tuple": None,
+        "checkpoint_identity": {
+            "filename": wall_clock_state.last_checkpoint_file,
+            "sha256": wall_clock_state.last_checkpoint_sha256,
+        },
+    }
+
+
+def comparison_runtime_provenance(args) -> dict[str, str]:
+    """Return the immutable comparison inputs required for arm metadata."""
+    fields = {
+        "baseline_sha256": getattr(args, "comparison_baseline_sha256", None),
+        "config_sha256": getattr(args, "comparison_config_sha256", None),
+        "scenario_sha256": getattr(args, "comparison_scenario_sha256", None),
+        "split_sha256": getattr(args, "comparison_split_sha256", None),
+        "lock_sha256": getattr(args, "comparison_lock_sha256", None),
+    }
+    missing = sorted(key for key, value in fields.items() if not value)
+    if missing:
+        raise ValueError(
+            "comparison runtime metadata requires immutable provenance: "
+            + ", ".join(missing)
+        )
+    return fields
 
 
 class Sb3CheckpointCallback(CheckpointCallback):
@@ -1161,6 +1232,13 @@ def _train(args, resources: _TrainingResourceLifecycle):
         extractor=args.extractor,
         features_dim=args.features_dim,
     )
+    if wall_clock_enabled:
+        append_environment_segment(
+            output_dir / "environment_segments.jsonl",
+            collect_environment(
+                sys.argv, provenance=comparison_runtime_provenance(args)
+            ),
+        )
 
     print(f"Feature extractor: {args.extractor}")
     if is_resume:
@@ -1245,6 +1323,11 @@ def _train(args, resources: _TrainingResourceLifecycle):
     print(f"\n학습 시작: {args.timesteps} timesteps "
           f"({'이어학습(추가)' if is_resume else '신규'})")
     print(f"TensorBoard: tensorboard --logdir {Path(args.output_dir) / 'tb_logs'}")
+    training_start_timestep = None
+    training_started = None
+    if wall_clock_enabled:
+        training_start_timestep = int(model.num_timesteps)
+        training_started = time.monotonic()
     model.learn(
         total_timesteps=args.timesteps,
         progress_bar=True,
@@ -1282,6 +1365,7 @@ def _train(args, resources: _TrainingResourceLifecycle):
     print("\n" + "=" * 60)
     print("  학습 완료 - 최종 평가")
     print("=" * 60)
+    evaluation_started = time.monotonic()
     eval_env = create_evaluation_env(
         full_blocks,
         workspaces,
@@ -1297,10 +1381,22 @@ def _train(args, resources: _TrainingResourceLifecycle):
         )
     finally:
         eval_env.close()
+    evaluation_seconds = time.monotonic() - evaluation_started
     write_evaluation_metrics(
         output_dir / "evaluation_csv.csv",
         [csv_row],
     )
+    if wall_clock_enabled:
+        write_runtime_metrics(
+            output_dir / "runtime_metrics.json",
+            comparison_runtime_metrics(
+                model,
+                wall_clock_state,
+                start_timestep=training_start_timestep,
+                end_to_end_seconds=time.monotonic() - training_started,
+                evaluation_seconds=evaluation_seconds,
+            ),
+        )
 
     resources.close()
     model = None
@@ -1591,6 +1687,10 @@ def main():
         "--wall-clock-heartbeat-seconds", type=float, default=300.0
     )
     parser.add_argument("--comparison-config-sha256", default=None)
+    parser.add_argument("--comparison-baseline-sha256", default=None)
+    parser.add_argument("--comparison-scenario-sha256", default=None)
+    parser.add_argument("--comparison-split-sha256", default=None)
+    parser.add_argument("--comparison-lock-sha256", default=None)
     parser.add_argument("--export-onnx", action="store_true", default=True,
                         help="ONNX export 수행")
     parser.add_argument("--no-export-onnx", action="store_false", dest="export_onnx")
