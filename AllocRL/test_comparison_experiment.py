@@ -289,3 +289,27 @@ def test_run_stage_failed_entry_retries_without_changing_prior_verified_hashes(t
     assert all(failed[name]["output_sha256"] == hashes[name] for name in prior)
     runner.run_stage(stage, action)
     assert runner.journal()[stage]["status"] == "complete" and len(calls) == 2
+
+
+@pytest.mark.parametrize("stage", ["train_raw_direct", "build_report"])
+def test_run_stage_keyboard_interrupt_is_interrupted_then_retries(tmp_path: Path, stage: str, monkeypatch):
+    from comparison.experiment_runner import ExperimentConfig, JOURNAL_STAGES, _Runner
+    runner = _Runner(ExperimentConfig.for_test(), tmp_path, subprocess_runner=lambda *a, **k: None, clock=lambda: 0,
+                     python_executable=None, archive_timestep_reader=None, output_hasher=lambda _: "a" * 64)
+    monkeypatch.setattr(runner, "input_hash", lambda *args: "b" * 64); monkeypatch.setattr(runner, "stage_path", lambda _: tmp_path)
+    with pytest.raises(KeyboardInterrupt): runner.run_stage(stage, lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+    entry = runner.journal()[stage]; assert entry["status"] == "interrupted" and entry["completed_at_utc"] and entry["error"] == "interrupted"
+    runner.run_stage(stage, lambda: None); assert runner.journal()[stage]["status"] == "complete"
+
+
+def test_stale_valid_in_progress_becomes_interrupted_and_retries(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import ExperimentConfig, JOURNAL_STAGES, _Runner, _journal_entry
+    runner = _Runner(ExperimentConfig.for_test(), tmp_path, subprocess_runner=lambda *a, **k: None, clock=lambda: 0,
+                     python_executable=None, archive_timestep_reader=None, output_hasher=lambda _: "a" * 64)
+    stale = _journal_entry("in_progress", input_sha256="a" * 64, started_at_utc="2026-01-01T00:00:00Z")
+    runner.save_journal({name: stale if name == "evaluate_raw_direct" else _journal_entry() for name in JOURNAL_STAGES})
+    normalized = runner.journal()["evaluate_raw_direct"]
+    assert normalized["status"] == "interrupted" and normalized["input_sha256"] == "a" * 64 and normalized["started_at_utc"] == "2026-01-01T00:00:00Z" and normalized["completed_at_utc"]
+    monkeypatch.setattr(runner, "input_hash", lambda *args: "a" * 64); monkeypatch.setattr(runner, "stage_path", lambda _: tmp_path)
+    runner.run_stage("evaluate_raw_direct", lambda: None)
+    assert runner.journal()["evaluate_raw_direct"]["status"] == "complete"
