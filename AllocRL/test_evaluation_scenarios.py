@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from alloc_env.data_split import (
     sha256_file,
     split_blocks_by_ship,
 )
+from alloc_env.data_loader import select_workspaces_in_order
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.simulator import SimulationResult
 from alloc_env.observation_state import (
@@ -354,6 +356,29 @@ class EvaluationScenarioTests(unittest.TestCase):
                 .issubset(holdout_ships)
             )
 
+    def test_prepared_artifact_bytes_match_committed_bundle_and_manifest(self):
+        committed_scenarios = (
+            DATA_DIR / "fixed_eval_scenarios.json"
+        ).read_bytes()
+        committed_manifest = (
+            DATA_DIR / "data_split_manifest.json"
+        ).read_bytes()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prepared_path = Path(tmpdir) / "fixed_eval_scenarios.json"
+            prepare_evaluation_file(DATA_DIR, prepared_path)
+            prepared_scenarios = prepared_path.read_bytes()
+            prepared_manifest = prepared_path.with_name(
+                "data_split_manifest.json"
+            ).read_bytes()
+
+        self.assertEqual(committed_scenarios, prepared_scenarios)
+        self.assertEqual(
+            hashlib.sha256(committed_scenarios).hexdigest(),
+            hashlib.sha256(prepared_scenarios).hexdigest(),
+        )
+        self.assertEqual(committed_manifest, prepared_manifest)
+
     def test_source_scenarios_keep_workspace_geometry_and_remove_obstacles(self):
         workspace = make_workspace()
         workspace.add_pre_placement(PrePlacedBlock(
@@ -439,7 +464,16 @@ class EvaluationScenarioTests(unittest.TestCase):
             "screening", [0, 1, 2], ["--data-dir", "./data"]
         )
 
-        self.assertEqual({"A", "B", "C", "D", "E"}, set(ABLATIONS))
+        self.assertEqual(
+            {
+                "A": ("structured", "current"),
+                "B": ("structured", "full"),
+                "C": ("fixed-grid", "full"),
+                "D": ("candidate-cnn", "current"),
+                "E": ("candidate-cnn", "full"),
+            },
+            ABLATIONS,
+        )
         self.assertEqual(15, len(commands))
         joined = [" ".join(command) for command in commands]
         self.assertTrue(
@@ -762,7 +796,9 @@ class EvaluationScenarioTests(unittest.TestCase):
         self.assertIn("mean_terminal_score", rows[0])
         self.assertIn("mean_retained_choice_ratio", rows[0])
 
-    def test_real_fixed_scenario_resets_with_exact_full_source_scales(self):
+    def test_all_real_fixed_scenarios_obey_and_reset_with_full_source_scales(
+        self,
+    ):
         strategy = BaseGridStrategy(step=5.0)
         workspace_codes = parse_workspace_codes(
             DEFAULT_ACTIVE_WORKSPACE_CODES
@@ -773,31 +809,72 @@ class EvaluationScenarioTests(unittest.TestCase):
         scales = build_observation_scales(
             full_blocks, source_workspaces, DROPOUT_THRESHOLD
         )
-        scenario = read_scenarios(
-            DATA_DIR / "fixed_eval_scenarios.json"
-        )[0]
-        scenario_strategy = BaseGridStrategy(step=5.0)
-        blocks, workspaces = materialize_scenario(
-            scenario, scenario_strategy
+        scenario_path = DATA_DIR / "fixed_eval_scenarios.json"
+        scenarios = read_scenarios(scenario_path)
+        source_split = split_blocks_by_ship(full_blocks, BLOCK_CSV)
+        expected_month_counts = Counter(
+            (block.in_date.year, block.in_date.month)
+            for block in full_blocks
         )
-        from alloc_env.data_loader import select_workspaces_in_order
+        holdout_ships = set(source_split.manifest["holdout_ship_nos"])
 
-        ordered = select_workspaces_in_order(workspaces, workspace_codes)
-        env = train_module.create_evaluation_env(
-            blocks,
-            ordered,
-            scenario_strategy,
-            observation_scales=scales,
-            state_context_mode="full",
-            seed=int(scenario["seed"]),
-        )
-        try:
-            observation, _ = env.reset()
-        finally:
-            env.close()
+        self.assertEqual(date(2025, 12, 4), scales.base_date)
+        self.assertEqual(list(range(1000, 1020)), [
+            scenario["seed"] for scenario in scenarios
+        ])
+        for scenario in scenarios:
+            self.assertEqual("holdout_fixed", scenario["source"])
+            self.assertEqual(913, len(scenario["blocks"]))
+            self.assertEqual(10, len(scenario["workspaces"]))
+            self.assertEqual(
+                workspace_codes,
+                [workspace["code"] for workspace in scenario["workspaces"]],
+            )
+            self.assertGreaterEqual(
+                min(
+                    date.fromisoformat(block["in_date"])
+                    for block in scenario["blocks"]
+                ),
+                scales.base_date,
+            )
+            self.assertEqual(
+                expected_month_counts,
+                Counter(
+                    (
+                        date.fromisoformat(block["in_date"]).year,
+                        date.fromisoformat(block["in_date"]).month,
+                    )
+                    for block in scenario["blocks"]
+                ),
+            )
+            self.assertTrue(
+                {block["ship_no"] for block in scenario["blocks"]}
+                .issubset(holdout_ships)
+            )
+            self.assertTrue(all(
+                not workspace["pre_placements"]
+                for workspace in scenario["workspaces"]
+            ))
 
-        self.assertIs(scales, env.unwrapped._observation_scales)
-        self.assertTrue(env.observation_space.contains(observation))
+            scenario_strategy = BaseGridStrategy(step=5.0)
+            blocks, workspaces = materialize_scenario(
+                scenario, scenario_strategy
+            )
+            ordered = select_workspaces_in_order(workspaces, workspace_codes)
+            env = train_module.create_evaluation_env(
+                blocks,
+                ordered,
+                scenario_strategy,
+                observation_scales=scales,
+                state_context_mode="full",
+                seed=int(scenario["seed"]),
+            )
+            try:
+                observation, _ = env.reset()
+                self.assertIs(scales, env.unwrapped._observation_scales)
+                self.assertTrue(env.observation_space.contains(observation))
+            finally:
+                env.close()
 
     def test_shared_scenarios_create_and_close_env_and_policy_per_seed(self):
         scenarios = [

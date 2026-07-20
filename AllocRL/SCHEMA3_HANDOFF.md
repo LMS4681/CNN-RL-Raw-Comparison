@@ -1,6 +1,6 @@
 # Schema-3 State Correction Handoff
 
-Updated: 2026-07-16
+Updated: 2026-07-20
 
 ## Git Checkpoint
 
@@ -67,17 +67,20 @@ Artifact output: `20 673 240`.
 Pinned artifact hashes:
 
 - `data/fixed_eval_scenarios.json`:
-  `CC32B8F76B05234AA9A93A6A5229605CF3093EFDB0D5EF7D3610CB470E9D49F6`
+  `6125F53939A1B8EEF8662B2628C0DA2F1D0F26B5B541A99252858326B38CD814`
 - `data/data_split_manifest.json`:
   `D3DF1D0076248B4BCBDDB4C910A3CB81481DA65C7415C6B3CACF9E055CC3F9DF`
+
+The scenario bundle was regenerated after enforcing the full-source
+`2025-12-04` scale lower bound. The split manifest remained byte-identical.
 
 Full baseline evaluation produced 40 ignored CSV rows, 20 seeds per policy.
 The measured means were:
 
 | Policy | Terminal score | Dropout rate | Delay days |
 | --- | ---: | ---: | ---: |
-| `greedy_immediate_area` | 0.8496276013 | 0.0387732749 | 0.1252279954 |
-| `random_valid` | 0.0652683461 | 0.2037239869 | 1.4268817588 |
+| `greedy_immediate_area` | 0.8072179628 | 0.0483570646 | 0.1757393756 |
+| `random_valid` | 0.0038006572 | 0.2305585980 | 1.4020701322 |
 
 ## Remaining Work
 

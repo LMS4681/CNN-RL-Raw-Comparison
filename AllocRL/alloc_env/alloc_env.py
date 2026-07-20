@@ -232,8 +232,12 @@ class BlockPlacementEnv(gym.Env):
                 raise ValueError(
                     "source blocks exceed observation scales max_duration"
                 )
-            # Fixed monthly scenarios may begin before the first source row;
-            # temporal encoders intentionally clip those positions to zero.
+            earliest_start = min(block.in_date for block in source_blocks)
+            if scales.base_date > earliest_start:
+                raise ValueError(
+                    "observation scales base_date is later than the earliest "
+                    "source block in_date"
+                )
             latest_start = max(block.in_date for block in source_blocks)
             if (
                 working_day_position(scales.base_date, latest_start)

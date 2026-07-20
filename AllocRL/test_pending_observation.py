@@ -375,6 +375,7 @@ def test_fixture_scale_fallback_propagates_zero_working_day_span():
         (make_scales(max_length=9.0), "max_length"),
         (make_scales(max_breadth=4.0), "max_breadth"),
         (make_scales(max_duration=9), "max_duration"),
+        (make_scales(base_date=date(2026, 1, 6)), "base_date"),
         (make_scales(date_span_workdays=1), "date_span_workdays"),
         (make_scales(max_workspace_length=99.0), "max_workspace_length"),
         (make_scales(max_workspace_breadth=49.0), "max_workspace_breadth"),
@@ -402,6 +403,12 @@ def test_constructor_rejects_incompatible_source_scales(scales, message):
                 blocks[-1], "in_date", add_workdays(date(2026, 1, 5), 101)
             ),
             "date_span_workdays",
+        ),
+        (
+            lambda blocks: setattr(
+                blocks[0], "in_date", date(2026, 1, 2)
+            ),
+            "base_date",
         ),
     ],
 )
