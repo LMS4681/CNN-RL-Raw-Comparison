@@ -3,6 +3,14 @@
 !/.gitignore
 !/AllocRL/
 !/AllocRL/**
+!/README.md
+!/UPSTREAM_BASELINE.md
+!/notebooks/
+!/notebooks/**
+!/reports/
+!/reports/**
+!/docs/
+!/docs/**
 
 # ── Build output ──────────────────────────────────────
 bin/
