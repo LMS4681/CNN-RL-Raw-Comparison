@@ -313,3 +313,12 @@ def test_stale_valid_in_progress_becomes_interrupted_and_retries(tmp_path: Path,
     monkeypatch.setattr(runner, "input_hash", lambda *args: "a" * 64); monkeypatch.setattr(runner, "stage_path", lambda _: tmp_path)
     runner.run_stage("evaluate_raw_direct", lambda: None)
     assert runner.journal()["evaluate_raw_direct"]["status"] == "complete"
+
+
+@pytest.mark.parametrize("field,value", [("input_sha256", None), ("input_sha256", "bad"), ("started_at_utc", None), ("started_at_utc", "bad"), ("output_sha256", "a" * 64), ("completed_at_utc", "2026-01-01T00:00:01Z"), ("error", "premature")])
+def test_malformed_in_progress_is_rejected_not_normalized(tmp_path: Path, field: str, value: object):
+    from comparison.experiment_runner import ExperimentConfig, ExperimentIntegrityError, JOURNAL_STAGES, _Runner, _journal_entry
+    entry = _journal_entry("in_progress", input_sha256="a" * 64, started_at_utc="2026-01-01T00:00:00Z"); entry[field] = value
+    runner = _Runner(ExperimentConfig.for_test(), tmp_path, subprocess_runner=lambda *a, **k: None, clock=lambda: 0, python_executable=None, archive_timestep_reader=None)
+    runner.save_journal({name: entry if name == "evaluate_raw_direct" else _journal_entry() for name in JOURNAL_STAGES})
+    with pytest.raises(ExperimentIntegrityError, match="invalid stage journal"): runner.journal()

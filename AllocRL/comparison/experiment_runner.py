@@ -233,6 +233,7 @@ class _Runner:
                     if not valid_time: raise ExperimentIntegrityError("invalid stage journal")
             if entry["error"] is not None and (not isinstance(entry["error"], str) or "\ufffd" in entry["error"]): raise ExperimentIntegrityError("invalid stage journal")
             if entry["status"] == "complete" and (entry["input_sha256"] is None or entry["output_sha256"] is None or entry["started_at_utc"] is None or entry["completed_at_utc"] is None or entry["error"] is not None): raise ExperimentIntegrityError("invalid stage journal")
+            if entry["status"] == "in_progress" and (entry["input_sha256"] is None or entry["started_at_utc"] is None or entry["output_sha256"] is not None or entry["completed_at_utc"] is not None or entry["error"] is not None): raise ExperimentIntegrityError("invalid stage journal")
             if entry["status"] in {"failed", "interrupted"} and entry["completed_at_utc"] is None: raise ExperimentIntegrityError("invalid stage journal")
             if entry["status"]=="in_progress": entry.update(_journal_entry("interrupted", input_sha256=entry["input_sha256"], output_sha256=entry["output_sha256"], started_at_utc=entry["started_at_utc"], completed_at_utc=_utc(), error="previous runner interrupted"))
         self.save_journal(result); return result
