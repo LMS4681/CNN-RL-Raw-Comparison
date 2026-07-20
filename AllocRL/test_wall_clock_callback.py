@@ -238,6 +238,36 @@ def test_progress_failure_is_repaired_from_authoritative_state_on_resume(
     )] == [1, 2]
 
 
+def test_same_callback_retry_adopts_committed_state_before_next_generation(
+    tmp_path, fake_clock, monkeypatch
+):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start()
+    model.num_timesteps = 100
+    callback.persist_checkpoint(status="running")
+    original = wall_clock_module.atomic_write_progress_timing
+    monkeypatch.setattr(
+        wall_clock_module,
+        "atomic_write_progress_timing",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("progress")),
+    )
+    model.num_timesteps = 200
+    fake_clock.advance(5)
+    with pytest.raises(OSError, match="progress"):
+        callback.persist_checkpoint(status="running")
+
+    monkeypatch.setattr(
+        wall_clock_module, "atomic_write_progress_timing", original
+    )
+    callback.persist_checkpoint(status="running")
+
+    state = read_wall_clock_state(tmp_path / "run_state.json")
+    assert state.generation == 3
+    assert [row.generation for row in read_progress_timing(
+        tmp_path / "progress_timing.csv"
+    )] == [1, 2, 3]
+
+
 def test_reconcile_removes_only_valid_future_tail(tmp_path, fake_clock):
     callback, model = prepared_callback(tmp_path, fake_clock)
     callback._on_training_start()

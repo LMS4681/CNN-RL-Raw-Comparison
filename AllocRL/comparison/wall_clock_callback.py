@@ -241,10 +241,19 @@ def read_progress_timing(path: str | Path) -> list[ProgressTimingRow]:
         return []
     try:
         with source.open(encoding="utf-8", newline="") as stream:
-            reader = csv.DictReader(stream)
-            if tuple(reader.fieldnames or ()) != _PROGRESS_FIELDS:
+            physical_rows = list(csv.reader(stream, strict=True))
+            if not physical_rows or tuple(physical_rows[0]) != _PROGRESS_FIELDS:
                 raise ValueError("progress timing header differs")
-            rows = [_progress_row(row) for row in reader]
+            if any(
+                len(row) != len(_PROGRESS_FIELDS)
+                or not any(field != "" for field in row)
+                for row in physical_rows[1:]
+            ):
+                raise ValueError("progress timing physical row is malformed")
+            rows = [
+                _progress_row(dict(zip(_PROGRESS_FIELDS, row)))
+                for row in physical_rows[1:]
+            ]
     except (OSError, UnicodeDecodeError, csv.Error, ValueError, TypeError) as error:
         if isinstance(error, ValueError) and str(error).startswith("progress timing"):
             raise
@@ -502,6 +511,43 @@ class WallClockBudgetCallback(BaseCallback):
                 return generation, partial, final
             generation += 1
 
+    def _adopt_newer_durable_state(self) -> WallClockState | None:
+        """Recover a state-first commit whose progress publication raised."""
+        if not self._state_path.exists():
+            return None
+        durable = read_wall_clock_state(self._state_path)
+        if durable.generation <= self._generation:
+            return None
+        if (
+            durable.target_training_seconds != self._target_seconds
+            or durable.config_sha256 != self._config_sha256
+        ):
+            raise ValueError("newer durable wall-clock state is incompatible")
+        checkpoint = resolve_state_checkpoint(self._output_dir, durable)
+        stored_timestep = self._archive_timestep_reader(checkpoint)
+        if (
+            stored_timestep != durable.last_checkpoint_timestep
+            or int(self.model.num_timesteps) != durable.last_checkpoint_timestep
+        ):
+            raise ValueError(
+                "newer durable wall-clock state does not match current model"
+            )
+        reconcile_progress_timing(
+            self._output_dir / "progress_timing.csv", durable
+        )
+        now = self._monotonic()
+        self._completed_before_segment = durable.completed_training_seconds
+        self._segment_started = now
+        self._last_persisted_monotonic = now
+        self._generation = durable.generation
+        self._last_checkpoint_timestep = durable.last_checkpoint_timestep
+        self._last_regular_checkpoint_timestep = (
+            durable.last_regular_checkpoint_timestep
+        )
+        self._restart_count = durable.restart_count
+        self._max_unrecorded_seconds = durable.max_unrecorded_seconds
+        return durable
+
     @staticmethod
     def _flush_file(path: Path) -> None:
         with path.open("rb+") as stream:
@@ -515,6 +561,9 @@ class WallClockBudgetCallback(BaseCallback):
         if status not in {"running", "complete"}:
             raise ValueError("checkpoint status must be running or complete")
         self._initialize_segment()
+        adopted = self._adopt_newer_durable_state()
+        if adopted is not None and adopted.status == "complete":
+            return adopted
         timestep = int(self.model.num_timesteps)
         generation, partial, final = self._next_generation(timestep)
 
