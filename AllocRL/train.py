@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import gc
 import os
 import pickle
@@ -45,6 +46,7 @@ from comparison.artifact_manifest import (
     append_environment_segment,
     collect_environment,
     count_trainable_parameters,
+    sha256_file,
     write_runtime_metrics,
 )
 
@@ -81,6 +83,7 @@ def comparison_runtime_metrics(
     start_timestep: int,
     end_to_end_seconds: float,
     evaluation_seconds: float,
+    selected_checkpoint: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the per-arm metrics payload from the durable wall-clock state."""
     recorded_seconds = float(wall_clock_state.completed_training_seconds)
@@ -108,15 +111,21 @@ def comparison_runtime_metrics(
             else None
         ),
         "evaluation_seconds": float(evaluation_seconds),
-        "selected_checkpoint_timestep": int(
-            wall_clock_state.last_checkpoint_timestep
+        **(
+            selected_checkpoint
+            if selected_checkpoint is not None
+            else {
+                "selected_checkpoint_timestep": int(
+                    wall_clock_state.last_checkpoint_timestep
+                ),
+                "selection_count": 0,
+                "selection_tuple": None,
+                "checkpoint_identity": {
+                    "filename": wall_clock_state.last_checkpoint_file,
+                    "sha256": wall_clock_state.last_checkpoint_sha256,
+                },
+            }
         ),
-        "selection_count": None,
-        "selection_tuple": None,
-        "checkpoint_identity": {
-            "filename": wall_clock_state.last_checkpoint_file,
-            "sha256": wall_clock_state.last_checkpoint_sha256,
-        },
     }
 
 
@@ -135,7 +144,62 @@ def comparison_runtime_provenance(args) -> dict[str, str]:
             "comparison runtime metadata requires immutable provenance: "
             + ", ".join(missing)
         )
+    baseline = fields["baseline_sha256"]
+    if not isinstance(baseline, str) or re.fullmatch(r"[0-9a-f]{40}", baseline) is None:
+        raise ValueError("comparison provenance baseline must be a git commit SHA")
+    for key in ("config_sha256", "scenario_sha256", "split_sha256", "lock_sha256"):
+        value = fields[key]
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"comparison provenance {key} must be SHA-256")
+    requested_device = str(getattr(args, "device", "auto"))
+    fields["resolved_device"] = (
+        "cuda" if requested_device == "auto" and torch.cuda.is_available() else
+        "cpu" if requested_device == "auto" else requested_device
+    )
     return fields
+
+
+def runtime_selected_checkpoint(
+    output_dir: str | Path, wall_clock_state, *, selection_count: int = 1
+) -> dict[str, Any]:
+    """Use a readable selected holdout model, else the verified state archive."""
+    output = Path(output_dir)
+    selection_path = output / "holdout_selection.csv"
+    best_path = output / "best_model.sb3"
+    if selection_path.is_file() and best_path.is_file():
+        with selection_path.open(encoding="utf-8", newline="") as source:
+            best_rows = [
+                row for row in csv.DictReader(source) if row.get("is_best") == "1"
+            ]
+        if best_rows:
+            row = best_rows[-1]
+            timestep = int(row["timestep"])
+            if model_num_timesteps(best_path) == timestep:
+                return {
+                    "selected_checkpoint_timestep": timestep,
+                    "selection_count": int(selection_count),
+                    "selection_tuple": [
+                        float(row["mean_terminal_score"]),
+                        -float(row["mean_dropout_rate"]),
+                        -float(row["mean_delay_days"]),
+                    ],
+                    "checkpoint_identity": {
+                        "filename": best_path.name,
+                        "sha256": sha256_file(best_path),
+                    },
+                }
+    checkpoint = output / "checkpoints" / wall_clock_state.last_checkpoint_file
+    if not checkpoint.is_file() or sha256_file(checkpoint) != wall_clock_state.last_checkpoint_sha256:
+        raise ValueError("complete wall-clock state checkpoint is not verifiable")
+    return {
+        "selected_checkpoint_timestep": int(wall_clock_state.last_checkpoint_timestep),
+        "selection_count": 0,
+        "selection_tuple": None,
+        "checkpoint_identity": {
+            "filename": checkpoint.name,
+            "sha256": wall_clock_state.last_checkpoint_sha256,
+        },
+    }
 
 
 class Sb3CheckpointCallback(CheckpointCallback):
@@ -1395,6 +1459,11 @@ def _train(args, resources: _TrainingResourceLifecycle):
                 start_timestep=training_start_timestep,
                 end_to_end_seconds=time.monotonic() - training_started,
                 evaluation_seconds=evaluation_seconds,
+                selected_checkpoint=runtime_selected_checkpoint(
+                    output_dir,
+                    wall_clock_state,
+                    selection_count=args.holdout_selection_count,
+                ),
             ),
         )
 

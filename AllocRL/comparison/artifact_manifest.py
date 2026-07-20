@@ -7,6 +7,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -46,11 +47,22 @@ REQUIRED_ENVIRONMENT_KEYS = frozenset(
 )
 
 
+_URL_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s]+")
+
+
+def _canonical_json(payload: Mapping[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
 def canonical_json_sha256(payload: Mapping[str, Any]) -> str:
     """Hash a mapping using the same canonical representation written to disk."""
-    encoded = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    encoded = _canonical_json(payload).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -64,15 +76,13 @@ def sha256_file(path: str | Path) -> str:
 
 def sanitize_requirement_line(line: str) -> str:
     """Remove URL credentials and transient query/fragment credentials."""
-    if " @ " not in line:
-        return line.strip()
-    name, url = line.split(" @ ", 1)
-    parsed = urlsplit(url.strip())
-    if not parsed.scheme or not parsed.netloc:
-        return line.strip()
-    hostname = parsed.hostname or ""
-    host = hostname if parsed.port is None else f"{hostname}:{parsed.port}"
-    return f"{name.strip()} @ {urlunsplit((parsed.scheme, host, parsed.path, '', ''))}"
+    def redact(match: re.Match[str]) -> str:
+        parsed = urlsplit(match.group(0))
+        hostname = parsed.hostname or ""
+        host = hostname if parsed.port is None else f"{hostname}:{parsed.port}"
+        return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+
+    return _URL_PATTERN.sub(redact, line.strip())
 
 
 def _run_text(command: Sequence[str]) -> str | None:
@@ -122,11 +132,26 @@ def _git_metadata() -> tuple[str | None, bool | None]:
     return (sha.strip() if sha else None, bool(dirty) if dirty is not None else None)
 
 
-def _gpu_uuid() -> str | None:
+def _gpu_uuid(index: int) -> str | None:
     output = _run_text(
-        ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"]
+        [
+            "nvidia-smi",
+            f"--id={index}",
+            "--query-gpu=uuid",
+            "--format=csv,noheader",
+        ]
     )
     return output.splitlines()[0].strip() if output and output.splitlines() else None
+
+
+def _resolved_cuda_index(device: str, cuda_available: bool) -> int | None:
+    if not cuda_available or device == "cpu":
+        return None
+    if device == "cuda":
+        return torch.cuda.current_device()
+    if device.startswith("cuda:"):
+        return int(device.split(":", 1)[1])
+    return None
 
 
 def collect_environment(
@@ -136,12 +161,16 @@ def collect_environment(
     supplied = dict(provenance or {})
     git_sha, git_dirty = _git_metadata()
     cuda_available = torch.cuda.is_available()
-    if cuda_available:
-        properties = torch.cuda.get_device_properties(0)
-        gpu_name: str | None = torch.cuda.get_device_name(0)
+    requested_device = supplied.get(
+        "resolved_device", "cuda:0" if cuda_available else "cpu"
+    )
+    cuda_index = _resolved_cuda_index(requested_device, cuda_available)
+    if cuda_index is not None:
+        properties = torch.cuda.get_device_properties(cuda_index)
+        gpu_name: str | None = torch.cuda.get_device_name(cuda_index)
         gpu_memory: int | None = int(properties.total_memory)
-        resolved_device = "cuda:0"
-        gpu_uuid = _gpu_uuid()
+        resolved_device = f"cuda:{cuda_index}"
+        gpu_uuid = _gpu_uuid(cuda_index)
     else:
         gpu_name = None
         gpu_memory = None
@@ -163,7 +192,7 @@ def collect_environment(
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "cudnn_version": torch.backends.cudnn.version(),
-        "resolved_device": supplied.get("resolved_device", resolved_device),
+        "resolved_device": resolved_device,
         "gpu_name": gpu_name,
         "gpu_uuid": gpu_uuid,
         "gpu_total_memory_bytes": gpu_memory,
@@ -212,17 +241,14 @@ def count_trainable_parameters(model: Any) -> dict[str, int]:
 def _write_json(path: str | Path, payload: Mapping[str, Any]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    destination.write_text(_canonical_json(payload) + "\n", encoding="utf-8")
 
 
 def append_environment_segment(path: str | Path, payload: Mapping[str, Any]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.write(_canonical_json(payload) + "\n")
 
 
 def write_runtime_metrics(path: str | Path, metrics: Mapping[str, Any]) -> None:
