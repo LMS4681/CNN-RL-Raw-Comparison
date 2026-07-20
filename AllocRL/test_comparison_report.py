@@ -216,3 +216,27 @@ def test_plots_close_figures_when_save_fails(tmp_path, monkeypatch):
     with pytest.raises(OSError): report_builder._learning_plot(tmp_path, tmp_path / "x.png")
     with pytest.raises(OSError): report_builder._holdout_plot(summary, pairs, tmp_path / "x.png")
     assert set(plt.get_fignums()) == before
+
+
+@pytest.mark.parametrize("present, phrase", [(("raw_direct",), "후보 CNN 결과가 없어 우열을 결론내리지 않음"), (("candidate_cnn",), "raw-direct 결과가 없어 비교를 결론내리지 않음"), (("raw_direct", "candidate_cnn"), "무결성 또는 보고 단계가 불완전"), ((), "두 arm 모두 없어서")])
+def test_partial_report_uses_valid_artifact_groups_and_stage_journal(tmp_path, present, phrase):
+    from comparison.report_builder import write_partial_report
+    write_complete_fixture(tmp_path)
+    for arm in {"raw_direct", "candidate_cnn"} - set(present):
+        for path in (tmp_path / arm).glob("*"): path.unlink()
+    _json(tmp_path / "stage_journal.json", {"preflight": {"status": "complete", "input_sha256": "a" * 64, "output_sha256": "b" * 64, "started_at_utc": "x", "completed_at_utc": "y", "error": None}, "cnn_train": {"status": "failed", "input_sha256": "a" * 64, "output_sha256": None, "started_at_utc": "x", "completed_at_utc": None, "error": "bad"}})
+    complete = tmp_path / "COMPLETE.json"; complete.write_text("sentinel", encoding="utf-8")
+    text = write_partial_report(tmp_path, "<b>bad</b>\n[link]").read_text(encoding="utf-8")
+    assert phrase in text and "completed: preflight" in text and "failed: cnn_train" in text
+    assert "&lt;b&gt;bad&lt;/b&gt;" in text and complete.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_partial_report_handles_invalid_journal_and_integrity_matrix(tmp_path):
+    from comparison.report_builder import build_comparison_summary, write_partial_report
+    write_complete_fixture(tmp_path)
+    _json(tmp_path / "stage_journal.json", {"bad": {"status": "unknown"}})
+    assert "invalid metadata" in write_partial_report(tmp_path, "failed").read_text(encoding="utf-8")
+    path = tmp_path / "raw_direct" / "runtime_metrics.json"; payload = json.loads(path.read_text(encoding="utf-8"))
+    for value in ("NaN", True, 1.5):
+        payload["parameter_counts"]["total"] = value; _json(path, payload)
+        with pytest.raises(ValueError): build_comparison_summary(tmp_path)

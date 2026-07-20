@@ -420,8 +420,31 @@ def write_complete_report(root: str | Path) -> Path:
 def write_partial_report(root: str | Path, failure: str) -> Path:
     """Document a failed stage without fabricating report data or COMPLETE.json."""
     if "\ufffd" in failure: raise ValueError("failure text contains replacement character")
-    base = Path(root); raw_ok = (base / "raw_direct" / "runtime_metrics.json").is_file(); cnn_ok = (base / "candidate_cnn" / "runtime_metrics.json").is_file()
+    base = Path(root)
+    def valid_arm(arm: str) -> bool:
+        try:
+            _runtime(base / arm / "runtime_metrics.json")
+            _read_evaluation(base / arm / "evaluation_scenarios.csv", arm, tuple(range(1000, 1020)))
+            _read_evaluation(base / arm / "evaluation_primary_test.csv", arm, PRIMARY_TEST_SEEDS)
+            return True
+        except ValueError:
+            return False
+    raw_ok, cnn_ok = valid_arm("raw_direct"), valid_arm("candidate_cnn")
+    journal_text = "stage metadata: absent"
+    journal = base / "stage_journal.json"
+    if journal.is_file():
+        try:
+            data = _read_json(journal)
+            statuses = {"pending", "in_progress", "interrupted", "failed", "complete"}
+            groups: dict[str, list[str]] = {status: [] for status in statuses}
+            for name, entry in data.items():
+                if not isinstance(name, str) or not isinstance(entry, Mapping) or set(entry) != {"status", "input_sha256", "output_sha256", "started_at_utc", "completed_at_utc", "error"} or entry["status"] not in statuses:
+                    raise ValueError("invalid stage journal")
+                groups[entry["status"]].append(name)
+            journal_text = "; ".join(f"{label}: {', '.join(sorted(groups[status])) or MISSING}" for status, label in (("complete", "completed"), ("failed", "failed"), ("interrupted", "interrupted"), ("in_progress", "in-progress"), ("pending", "missing")))
+        except ValueError:
+            journal_text = "stage metadata: invalid metadata"
     state = "후보 CNN 결과가 없어 우열을 결론내리지 않음" if raw_ok and not cnn_ok else ("raw-direct 결과가 없어 비교를 결론내리지 않음" if cnn_ok and not raw_ok else ("두 arm 모두 없어서 비교를 결론내리지 않음" if not raw_ok and not cnn_ok else "두 arm 자료는 있으나 무결성 또는 보고 단계가 불완전하여 결론내리지 않음"))
-    text = f"# 부분 비교 보고서\n\n실패 원인: {html.escape(failure)}\n\n사용 가능 단계: raw-direct runtime={'있음' if raw_ok else '없음'}, candidate-CNN runtime={'있음' if cnn_ok else '없음'}.\n\n{state}. 누락 수치는 {MISSING}이며 0 또는 추정값으로 대체하지 않는다. 같은 output_root로 같은 experiment runner/notebook을 다시 실행하여 검증 완료 stage를 건너뛰고 재개한다.\n"
+    text = f"# 부분 비교 보고서\n\n실패 원인: {html.escape(failure)}\n\n사용 가능 단계: raw-direct runtime={'있음' if raw_ok else '없음'}, candidate-CNN runtime={'있음' if cnn_ok else '없음'}.\n{journal_text}\n\n{state}. 누락 수치는 {MISSING}이며 0 또는 추정값으로 대체하지 않는다. 같은 output_root로 같은 experiment runner/notebook을 다시 실행하여 검증 완료 stage를 건너뛰고 재개한다.\n"
     path = base / "comparison" / "PARTIAL_REPORT.md"; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(text, encoding="utf-8", newline="\n")
     return path

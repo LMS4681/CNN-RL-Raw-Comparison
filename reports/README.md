@@ -9,3 +9,5 @@ The headline is the one seed-0 training run evaluated on the 15 unselected prima
 `COMPLETE.json` is an integrity marker owned by the experiment orchestrator, not the report builder. If a required stage is missing, the report builder writes `PARTIAL_REPORT.md` describing the failure and available stages; it must not invent plots or data.
 
 When present, `training_log.csv`, `loss_log.csv`, and `progress_timing.csv` are strict canonical inputs, not best-effort hints. Their headers and finite, monotonic rows are validated; the learning plot shows terminal score, checkpoint wall-time progress, and the recorded PPO loss trace. An absent optional curve is labelled `자료 없음`.
+
+Partial reports validate `stage_journal.json` when present and describe completed, failed, interrupted, in-progress, and missing stages. Arm availability requires valid runtime and paired evaluation artifacts; a partial report never creates or changes `COMPLETE.json`.
