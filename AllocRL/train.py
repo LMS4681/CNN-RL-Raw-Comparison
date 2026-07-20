@@ -697,6 +697,60 @@ def evaluate_fixed_scenarios(
     )
 
 
+def create_holdout_eval_callback(
+    scenarios,
+    evaluate_fn,
+    output_dir: str | Path,
+    eval_freq: int,
+    selection_count: int,
+):
+    """Build fixed-holdout selection unless it is explicitly disabled."""
+    if eval_freq < 0:
+        raise ValueError("holdout eval frequency must be non-negative")
+    if scenarios is None or eval_freq == 0:
+        return None
+
+    from holdout_model_selection import FixedHoldoutEvalCallback
+
+    return FixedHoldoutEvalCallback(
+        scenarios,
+        evaluate_fn,
+        output_dir,
+        eval_freq=eval_freq,
+        selection_count=selection_count,
+    )
+
+
+def evaluate_selected_holdout_report(
+    model_class,
+    *,
+    output_dir: str | Path,
+    training_env,
+    scenario_records: list[dict],
+    device: str,
+    evaluate_fn,
+) -> list[dict]:
+    """Load the selected checkpoint and evaluate all fixed scenarios."""
+    from evaluation_runner import ModelActionPolicy
+    from holdout_model_selection import (
+        BEST_MODEL_FILENAME,
+        validate_fixed_holdout_scenarios,
+    )
+
+    validate_fixed_holdout_scenarios(scenario_records)
+    best_path = resolve_model_archive_path(
+        Path(output_dir) / BEST_MODEL_FILENAME
+    )
+    selected_model = model_class.load(
+        str(best_path), env=training_env, device=device
+    )
+    rows = evaluate_fn(
+        lambda _seed: ModelActionPolicy(selected_model, name="model"),
+        scenario_records,
+    )
+    return [{**row, "checkpoint": "best_model"} for row in rows]
+
+
 def train(args):
     """MaskablePPO 학습 실행."""
     from sb3_contrib import MaskablePPO
@@ -708,6 +762,10 @@ def train(args):
     fixed_scenarios = load_requested_evaluation_scenarios(
         getattr(args, "eval_scenarios", None)
     )
+    if args.final_holdout_report and fixed_scenarios is None:
+        raise ValueError(
+            "--final-holdout-report requires --eval-scenarios"
+        )
     set_global_seed(args.seed)
 
     data_dir = Path(args.data_dir)
@@ -729,6 +787,21 @@ def train(args):
         workspaces,
         DROPOUT_THRESHOLD,
     )
+    active_workspace_code_list = [
+        workspace.code for workspace in workspaces
+    ]
+
+    def run_fixed_holdout(policy_factory, selected_scenarios):
+        from evaluation_runner import evaluate_scenarios
+
+        return evaluate_scenarios(
+            policy_factory,
+            list(selected_scenarios),
+            workspace_codes=active_workspace_code_list,
+            observation_scales=observation_scales,
+            state_context_mode=args.state_context,
+        )
+
     from alloc_env.data_split import split_blocks_by_ship
 
     source_split = split_blocks_by_ship(
@@ -811,7 +884,7 @@ def train(args):
     # 이어학습 경로 결정: --resume-from(명시) 우선, 없으면 --auto-resume 자동 탐지
     run_config = current_run_config(
         args,
-        [workspace.code for workspace in workspaces],
+        active_workspace_code_list,
         source_split.manifest,
         observation_scales,
     )
@@ -855,6 +928,15 @@ def train(args):
             log_dir=args.output_dir, verbose=1, append=is_resume
         ),
     ]
+    holdout_callback = create_holdout_eval_callback(
+        fixed_scenarios,
+        run_fixed_holdout,
+        output_dir,
+        eval_freq=args.holdout_eval_freq,
+        selection_count=args.holdout_selection_count,
+    )
+    if holdout_callback is not None:
+        callback.append(holdout_callback)
     if args.checkpoint_freq > 0:
         # SB3 CheckpointCallback은 콜백 호출 횟수 기준이라 n_envs로 나눠 step 단위를 맞춘다.
         save_freq = max(args.checkpoint_freq // max(args.n_envs, 1), 1)
@@ -916,16 +998,15 @@ def train(args):
         [csv_row],
     )
 
-    if fixed_scenarios is not None:
-        print("\n  Fixed evaluation scenarios")
-        scenario_rows = evaluate_fixed_scenarios(
-            model,
-            fixed_scenarios,
-            observation_scales=observation_scales,
-            state_context_mode=args.state_context,
-            workspace_codes=[
-                workspace.code for workspace in workspaces
-            ],
+    if args.final_holdout_report:
+        print("\n  Selected model fixed holdout report")
+        scenario_rows = evaluate_selected_holdout_report(
+            MaskablePPO,
+            output_dir=output_dir,
+            training_env=env,
+            scenario_records=fixed_scenarios,
+            device=args.device,
+            evaluate_fn=run_fixed_holdout,
         )
         write_evaluation_metrics(
             output_dir / "evaluation_scenarios.csv", scenario_rows
@@ -1112,6 +1193,24 @@ def main():
         type=str,
         default=None,
         help="fixed evaluation scenario JSON prepared by run_ablation.py",
+    )
+    parser.add_argument(
+        "--holdout-eval-freq",
+        type=int,
+        default=50_000,
+        help="fixed-holdout selection frequency; 0 disables selection",
+    )
+    parser.add_argument(
+        "--holdout-selection-count",
+        type=int,
+        choices=[5],
+        default=5,
+        help="number of fixed scenarios used for periodic model selection",
+    )
+    parser.add_argument(
+        "--final-holdout-report",
+        action="store_true",
+        help="evaluate selected best_model.sb3 on all fixed scenarios",
     )
     parser.add_argument(
         "--extractor",

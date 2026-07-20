@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -795,6 +796,66 @@ class EvaluationScenarioTests(unittest.TestCase):
         self.assertEqual(150, rows[0]["seed"])
         self.assertIn("mean_terminal_score", rows[0])
         self.assertIn("mean_retained_choice_ratio", rows[0])
+
+    def test_selected_holdout_report_loads_exact_best_model_and_tags_all_20(
+        self,
+    ):
+        scenarios = [{"seed": seed} for seed in range(1000, 1020)]
+        training_env = object()
+        evaluated = {}
+
+        class FakeMaskablePPO:
+            loaded = None
+
+            @classmethod
+            def load(cls, path, **kwargs):
+                cls.loaded = (path, kwargs)
+                return "selected-model"
+
+        def evaluate_fn(policy_factory, scenario_records):
+            evaluated["policy"] = policy_factory(1000)
+            evaluated["scenarios"] = scenario_records
+            return [
+                {"seed": item["seed"]}
+                for item in scenario_records
+            ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            best_path = Path(tmpdir) / "best_model.sb3"
+            with zipfile.ZipFile(best_path, "w") as archive:
+                archive.writestr("probe", "selected")
+
+            rows = train_module.evaluate_selected_holdout_report(
+                FakeMaskablePPO,
+                output_dir=tmpdir,
+                training_env=training_env,
+                scenario_records=scenarios,
+                device="cpu",
+                evaluate_fn=evaluate_fn,
+            )
+
+        loaded_path, load_kwargs = FakeMaskablePPO.loaded
+        self.assertEqual(str(best_path.resolve()), loaded_path)
+        self.assertIs(training_env, load_kwargs["env"])
+        self.assertEqual("cpu", load_kwargs["device"])
+        self.assertEqual(list(range(1000, 1020)), [row["seed"] for row in rows])
+        self.assertTrue(all(row["checkpoint"] == "best_model" for row in rows))
+        self.assertEqual("selected-model", evaluated["policy"].model)
+        self.assertIs(scenarios, evaluated["scenarios"])
+
+    def test_selected_holdout_report_requires_best_model(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(FileNotFoundError, "best_model.sb3"):
+                train_module.evaluate_selected_holdout_report(
+                    object(),
+                    output_dir=tmpdir,
+                    training_env=object(),
+                    scenario_records=[
+                        {"seed": seed} for seed in range(1000, 1020)
+                    ],
+                    device="cpu",
+                    evaluate_fn=lambda policy_factory, scenarios: [],
+                )
 
     def test_all_real_fixed_scenarios_obey_and_reset_with_full_source_scales(
         self,

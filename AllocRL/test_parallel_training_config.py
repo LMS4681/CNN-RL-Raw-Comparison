@@ -143,6 +143,11 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             )
             captured["state_context"] = args.state_context
             captured["grid_size"] = args.grid_size
+            captured["holdout_eval_freq"] = args.holdout_eval_freq
+            captured["holdout_selection_count"] = (
+                args.holdout_selection_count
+            )
+            captured["final_holdout_report"] = args.final_holdout_report
 
         argv = [
             "train.py",
@@ -164,6 +169,11 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             "current",
             "--grid-size",
             "64",
+            "--holdout-eval-freq",
+            "25000",
+            "--holdout-selection-count",
+            "5",
+            "--final-holdout-report",
             "--no-export-onnx",
         ]
 
@@ -179,6 +189,9 @@ class ParallelTrainingConfigTests(unittest.TestCase):
         self.assertEqual(0.35, captured["empirical_profile_probability"])
         self.assertEqual("current", captured["state_context"])
         self.assertEqual(64, captured["grid_size"])
+        self.assertEqual(25_000, captured["holdout_eval_freq"])
+        self.assertEqual(5, captured["holdout_selection_count"])
+        self.assertTrue(captured["final_holdout_report"])
 
     def test_cli_defaults_match_ten_workspace_episode_shape(self):
         captured = {}
@@ -190,6 +203,11 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             captured["empirical_profile_probability"] = (
                 args.empirical_profile_probability
             )
+            captured["holdout_eval_freq"] = args.holdout_eval_freq
+            captured["holdout_selection_count"] = (
+                args.holdout_selection_count
+            )
+            captured["final_holdout_report"] = args.final_holdout_report
 
         with (
             patch.object(sys, "argv", ["train.py", "--no-export-onnx"]),
@@ -204,6 +222,56 @@ class ParallelTrainingConfigTests(unittest.TestCase):
         )
         self.assertEqual(20, captured["monthly_jitter"])
         self.assertEqual(0.2, captured["empirical_profile_probability"])
+        self.assertEqual(50_000, captured["holdout_eval_freq"])
+        self.assertEqual(5, captured["holdout_selection_count"])
+        self.assertFalse(captured["final_holdout_report"])
+
+    def test_holdout_selection_count_cli_rejects_values_other_than_five(self):
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["train.py", "--holdout-selection-count", "4"],
+            ),
+            self.assertRaises(SystemExit),
+        ):
+            train_module.main()
+
+    def test_holdout_callback_wiring_honors_disabled_and_enabled_modes(self):
+        scenarios = [{"seed": seed} for seed in range(1000, 1020)]
+        evaluate_fn = lambda policy_factory, selected: []
+
+        self.assertIsNone(train_module.create_holdout_eval_callback(
+            None,
+            evaluate_fn,
+            "./output",
+            eval_freq=50_000,
+            selection_count=5,
+        ))
+        self.assertIsNone(train_module.create_holdout_eval_callback(
+            scenarios,
+            evaluate_fn,
+            "./output",
+            eval_freq=0,
+            selection_count=5,
+        ))
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            train_module.create_holdout_eval_callback(
+                scenarios,
+                evaluate_fn,
+                "./output",
+                eval_freq=-1,
+                selection_count=5,
+            )
+
+        callback = train_module.create_holdout_eval_callback(
+            scenarios,
+            evaluate_fn,
+            "./output",
+            eval_freq=25_000,
+            selection_count=5,
+        )
+        self.assertEqual("FixedHoldoutEvalCallback", type(callback).__name__)
 
     def test_auto_vec_env_selection_is_platform_aware(self):
         with patch.object(train_module.sys, "platform", "win32"):
