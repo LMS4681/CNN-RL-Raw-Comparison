@@ -13,7 +13,7 @@ from sb3_contrib import MaskablePPO
 import evaluation_runner
 from alloc_env.observation_state import ObservationScales
 from comparison.artifact_manifest import sha256_file
-from comparison.wall_clock_callback import read_wall_clock_state, resolve_state_checkpoint
+from comparison.wall_clock_callback import atomic_write_json, read_wall_clock_state, resolve_state_checkpoint
 from evaluation_runner import ModelActionPolicy
 
 
@@ -282,7 +282,7 @@ def update_checkpoint_manifest(path: Path, arm: str, checkpoints: Mapping[str, C
     if not isinstance(existing, dict):
         raise ValueError("manifest must be a JSON object")
     merged = merge_checkpoint_manifest(existing, arm, checkpoints)
-    manifest_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_json(manifest_path, merged)
     return merged
 
 
@@ -292,7 +292,11 @@ def evaluate_comparison_artifacts(
     regular_interval: int = REGULAR_INTERVAL, model_loader=MaskablePPO.load,
 ) -> dict[str, dict[str, CheckpointRef]]:
     """Evaluate both arms only when an existing root manifest is present."""
-    root = Path(root)
+    root = Path(root).resolve()
+    raw_dir, cnn_dir = Path(raw_dir).resolve(), Path(cnn_dir).resolve()
+    for expected, directory in (("raw_direct", raw_dir), ("candidate_cnn", cnn_dir)):
+        if directory.parent != root or directory.name != expected:
+            raise PartialResultError("comparison arm directory escapes root")
     manifest_path = root / "manifest.json"
     if not manifest_path.is_file():
         raise PartialResultError("root manifest.json must already exist")
@@ -304,7 +308,7 @@ def evaluate_comparison_artifacts(
     refs: dict[str, dict[str, CheckpointRef]] = {}
     manifest_updates: dict[str, dict[str, CheckpointRef]] = {}
     configs = {"raw_direct": raw_config, "candidate_cnn": cnn_config}
-    directories = {"raw_direct": Path(raw_dir), "candidate_cnn": Path(cnn_dir)}
+    directories = {"raw_direct": raw_dir, "candidate_cnn": cnn_dir}
     common_rows: list[dict] = []
     for arm in ARMS:
         final = resolve_final_checkpoint(directories[arm], model_loader=model_loader)
@@ -317,15 +321,15 @@ def evaluate_comparison_artifacts(
         selected_rows = evaluate_checkpoint(selected.path, configs[arm], scenarios, selected.label, arm, model_loader)
         write_arm_evaluations(root, arm, selected_rows)
         common_rows.extend(evaluate_checkpoint(common.path, configs[arm], scenarios, "common_step", arm, model_loader))
-        relative_refs = {
-            name: CheckpointRef(ref.path.relative_to(root), ref.label, ref.timestep, ref.sha256)
-            for name, ref in refs[arm].items()
-        }
+        try:
+            relative_refs = {name: CheckpointRef(ref.path.resolve().relative_to(root), ref.label, ref.timestep, ref.sha256) for name, ref in refs[arm].items()}
+        except ValueError as error:
+            raise PartialResultError("checkpoint reference escapes root") from error
         manifest_updates[arm] = relative_refs
     write_common_step_evaluation(root, common_rows)
     import json
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     for arm in ARMS:
         manifest = merge_checkpoint_manifest(manifest, arm, manifest_updates[arm])
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_json(manifest_path, manifest)
     return refs

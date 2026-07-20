@@ -305,3 +305,12 @@ def test_evaluate_comparison_artifacts_failure_does_not_partially_update_manifes
     with pytest.raises(evaluator.PartialResultError):
         evaluator.evaluate_comparison_artifacts(tmp_path, tmp_path / "raw_direct", tmp_path / "candidate_cnn", [], {}, {})
     assert (tmp_path / "manifest.json").read_bytes() == original
+
+
+def test_manifest_update_uses_atomic_publication(tmp_path, monkeypatch):
+    from comparison import checkpoint_evaluator as evaluator
+    path = tmp_path / "manifest.json"; path.write_text('{"sentinel":true}', encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(evaluator, "atomic_write_json", lambda target, payload: calls.append((target, payload)))
+    evaluator.update_checkpoint_manifest(path, "raw_direct", {"final": evaluator.CheckpointRef(Path("raw/final.sb3"), "final", 1, "a" * 64)})
+    assert calls and path.read_text(encoding="utf-8") == '{"sentinel":true}'
