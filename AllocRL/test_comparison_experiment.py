@@ -337,3 +337,28 @@ def test_public_stage_harness_completes_once_then_skips_every_action(tmp_path: P
     assert (tmp_path / "COMPLETE.json").is_file()
     before = list(calls); run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
     assert calls == before and json.loads((tmp_path / "lease.json").read_text())["status"] == "released"
+
+
+def _public_harness():
+    from comparison.experiment_runner import JOURNAL_STAGES
+    calls = []
+    return calls, {stage: (lambda stage=stage: calls.append(stage)) for stage in JOURNAL_STAGES}, {stage: (lambda stage=stage: f"{JOURNAL_STAGES.index(stage):064x}") for stage in JOURNAL_STAGES}
+
+
+def test_public_harness_interrupt_retries_only_interrupted_and_downstream(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, JOURNAL_STAGES, run_overnight_experiment
+    calls, actions, hashers = _public_harness(); actions["train_raw_direct"] = lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt): run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    journal = json.loads((tmp_path / "stage_journal.json").read_text()); assert journal["train_raw_direct"]["status"] == "interrupted" and not (tmp_path / "COMPLETE.json").exists() and (tmp_path / "comparison" / "PARTIAL_REPORT.md").is_file()
+    before = {stage: journal[stage]["output_sha256"] for stage in JOURNAL_STAGES[:3]}; calls.clear(); actions = {stage: (lambda stage=stage: calls.append(stage)) for stage in JOURNAL_STAGES}
+    run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    assert calls == list(JOURNAL_STAGES[3:]) and all(json.loads((tmp_path / "stage_journal.json").read_text())[stage]["output_sha256"] == value for stage, value in before.items()) and (tmp_path / "COMPLETE.json").exists()
+
+
+def test_public_harness_live_lease_refusal_does_not_mutate_root(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, LeaseError, run_overnight_experiment
+    (tmp_path / "lease.json").write_text(json.dumps({"token":"owner","pid":1,"boot_id":"process-1","heartbeat_utc":"x","heartbeat_monotonic":0,"status":"active"}), encoding="utf-8")
+    (tmp_path / ".lease.acquire").write_text("owner\n", encoding="utf-8"); before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    calls, actions, hashers = _public_harness()
+    with pytest.raises(LeaseError): run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    assert calls == [] and {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
