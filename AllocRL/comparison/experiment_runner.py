@@ -311,7 +311,13 @@ class _Runner:
     def smoke(self, arm: str) -> None:
         self.command(f"smoke_{arm}",build_smoke_command(arm,self.config,output_root=self.root,python_executable=self.python))
         marker=self.root/"smoke"/arm/"runner_verified.json"
-        atomic_write_json(marker,{"arm":arm,"config_sha256":self.config.config_sha256})
+        _, extractor = _arm(arm)
+        archive = marker.parent / f"{extractor}.sb3"
+        from train import model_num_timesteps
+        timestep = (self.archive_reader or model_num_timesteps)(archive)
+        if not archive.is_file() or timestep is None or timestep < self.config.smoke_timesteps:
+            raise ExperimentStageError("smoke subprocess did not produce a readable requested-timestep archive")
+        atomic_write_json(marker,{"arm":arm,"config_sha256":self.config.config_sha256,"path":archive.name,"sha256":sha256_file(archive),"timestep":timestep})
     def evaluate_arm(self, arm: str) -> None:
         # The paired evaluator is the sole authority for selected/final CSVs;
         # this ordered stage proves the arm's complete state before CNN starts.
@@ -334,7 +340,7 @@ class _Runner:
         state=read_wall_clock_state(state_path)
         if not self._state_complete(root,state): raise ExperimentStageError("training exited without a complete verified wall-clock state")
     def _state_complete(self, root: Path, state: Any) -> bool:
-        if state.status!="complete" or state.config_sha256!=self.config.config_sha256: return False
+        if state.status!="complete" or state.config_sha256!=self.config.config_sha256 or state.target_training_seconds != self.config.target_training_seconds_per_arm or state.completed_training_seconds < self.config.target_training_seconds_per_arm: return False
         checkpoint=resolve_state_checkpoint(root,state)
         from train import model_num_timesteps
         timestep=(self.archive_reader or model_num_timesteps)(checkpoint)
