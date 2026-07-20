@@ -97,18 +97,19 @@ class ExperimentConfig:
         unknown = set(operational_overrides) - _OPERATING_OVERRIDES
         if unknown: raise ValueError(f"test overrides are operational only: {sorted(unknown)}")
         payload = dict(PRODUCTION_CONFIG); payload.update(operational_overrides)
-        _validate_config_payload(payload)
+        _validate_config_payload(payload, allow_operational_overrides=True)
         return cls(**payload, config_sha256=canonical_json_sha256(payload), production_loaded=False)
 
 
-def _validate_config_payload(payload: Mapping[str, Any]) -> None:
+def _validate_config_payload(payload: Mapping[str, Any], *, allow_operational_overrides: bool = False) -> None:
     expected = set(PRODUCTION_CONFIG)
     if set(payload) != expected:
         raise ValueError(f"config keys differ: missing={sorted(expected-set(payload))}, extra={sorted(set(payload)-expected)}")
     for key, expected_value in PRODUCTION_CONFIG.items():
         value = payload[key]
-        if key in _OPERATING_OVERRIDES:
-            if not _valid_number(value) or float(value) <= 0: raise ValueError(f"{key} must be a positive finite number")
+        if key in _OPERATING_OVERRIDES and allow_operational_overrides:
+            if not _valid_number(value) or float(value) < 0: raise ValueError(f"{key} must be a non-negative finite number")
+            if key != "holdout_eval_freq" and float(value) <= 0: raise ValueError(f"{key} must be a positive finite number")
             if key in {"timesteps_ceiling", "checkpoint_freq", "holdout_eval_freq", "smoke_timesteps"} and (not isinstance(value, int) or isinstance(value, bool)): raise ValueError(f"{key} must be an integer")
             continue
         if isinstance(expected_value, float):
@@ -163,25 +164,49 @@ def _journal_entry(status: str = "pending", *, input_sha256: str | None = None, 
 
 class _Lease(AbstractContextManager["_Lease"]):
     def __init__(self, root: Path, *, stale_takeover: bool, clock: Callable[[], float], interval: float = 60, stale_after: float = 900) -> None:
-        self.path=root/"lease.json"; self.stale_takeover=stale_takeover; self.clock=clock; self.interval=interval; self.stale_after=stale_after; self.token=uuid.uuid4().hex; self.stop=threading.Event(); self.thread: threading.Thread | None=None
+        self.path=root/"lease.json"; self.sentinel=root/".lease.acquire"; self.stale_takeover=stale_takeover; self.clock=clock; self.interval=interval; self.stale_after=stale_after; self.token=uuid.uuid4().hex; self.stop=threading.Event(); self.thread: threading.Thread | None=None; self.acquired=False; self.failure: BaseException | None=None
     def _payload(self, status: str) -> dict[str, Any]: return {"token": self.token, "pid": os.getpid(), "boot_id": _boot_id(), "heartbeat_utc": _utc(), "heartbeat_monotonic": self.clock(), "status": status}
-    def _write(self, status: str) -> None: atomic_write_json(self.path, self._payload(status))
+    def _write(self, status: str) -> None:
+        if self.path.exists() and _json(self.path).get("token") != self.token:
+            raise LeaseError("lease ownership token changed")
+        atomic_write_json(self.path, self._payload(status))
+    def _claim_sentinel(self) -> None:
+        try:
+            handle=os.open(self.sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            raise LeaseError("another live comparison runner owns this output root")
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(self.token + "\n"); stream.flush(); os.fsync(stream.fileno())
     def __enter__(self):
         if self.path.exists():
-            prior=_json(self.path); age=self.clock()-float(prior.get("heartbeat_monotonic", float("-inf")))
-            if age < self.stale_after: raise LeaseError("another live comparison runner owns this output root")
-            if not self.stale_takeover: raise LeaseError("stale lease requires explicit --take-over-stale-lease")
-        self._write("active")
+            prior=_json(self.path); status=prior.get("status"); age=self.clock()-float(prior.get("heartbeat_monotonic", float("-inf"))); foreign_boot=prior.get("boot_id") != _boot_id()
+            if status != "released" and not foreign_boot and age < self.stale_after:
+                raise LeaseError("another live comparison runner owns this output root")
+            if status != "released" and not self.stale_takeover:
+                raise LeaseError("stale lease requires explicit --take-over-stale-lease")
+            if self.sentinel.exists():
+                # Recheck the payload before stealing a stale sentinel so a live
+                # owner cannot be overwritten between the first observation and unlink.
+                current=_json(self.path)
+                if current.get("token") != prior.get("token"):
+                    raise LeaseError("lease changed while attempting stale takeover")
+                self.sentinel.unlink()
+        self._claim_sentinel(); self.acquired=True
+        atomic_write_json(self.path, self._payload("active"))
         def refresh() -> None:
             while not self.stop.wait(self.interval):
                 try: self._write("active")
-                except OSError: pass
+                except BaseException as error: self.failure=error; self.stop.set(); return
         self.thread=threading.Thread(target=refresh, daemon=True, name="comparison-lease"); self.thread.start(); return self
     def __exit__(self, *exc: object) -> None:
         self.stop.set()
         if self.thread: self.thread.join(timeout=max(1, self.interval + 1))
         try: self._write("released")
-        except OSError: pass
+        finally:
+            try:
+                if self.sentinel.exists() and self.sentinel.read_text(encoding="utf-8").strip() == self.token: self.sentinel.unlink()
+            except OSError: pass
+        if self.failure is not None and exc[0] is None: raise self.failure
 
 
 def _boot_id() -> str:
@@ -199,21 +224,66 @@ class _Runner:
         result={name:data.get(name,_journal_entry()) for name in JOURNAL_STAGES}
         for entry in result.values():
             if set(entry)!={"status","input_sha256","output_sha256","started_at_utc","completed_at_utc","error"} or entry["status"] not in JOURNAL_STATUSES: raise ExperimentIntegrityError("invalid stage journal")
+            for key in ("input_sha256", "output_sha256"):
+                if entry[key] is not None and (not isinstance(entry[key], str) or _SHA256.fullmatch(entry[key]) is None): raise ExperimentIntegrityError("invalid stage journal")
+            for key in ("started_at_utc", "completed_at_utc"):
+                if entry[key] is not None:
+                    try: valid_time = isinstance(entry[key], str) and datetime.fromisoformat(entry[key].replace("Z", "+00:00")).tzinfo is not None
+                    except ValueError: valid_time = False
+                    if not valid_time: raise ExperimentIntegrityError("invalid stage journal")
+            if entry["error"] is not None and (not isinstance(entry["error"], str) or "\ufffd" in entry["error"]): raise ExperimentIntegrityError("invalid stage journal")
+            if entry["status"] == "complete" and (entry["input_sha256"] is None or entry["output_sha256"] is None or entry["started_at_utc"] is None or entry["completed_at_utc"] is None or entry["error"] is not None): raise ExperimentIntegrityError("invalid stage journal")
+            if entry["status"] in {"failed", "interrupted"} and entry["completed_at_utc"] is None: raise ExperimentIntegrityError("invalid stage journal")
             if entry["status"]=="in_progress": entry.update(_journal_entry("interrupted", input_sha256=entry["input_sha256"], output_sha256=entry["output_sha256"], started_at_utc=entry["started_at_utc"], completed_at_utc=_utc(), error="previous runner interrupted"))
         self.save_journal(result); return result
     def save_journal(self, data: Mapping[str, Any]) -> None: atomic_write_json(self.journal_path, dict(data))
     def stage_path(self, name: str) -> Path:
-        return {"preflight":self.root/"manifest.json", "smoke_raw_direct":self.root/"smoke"/"raw_direct", "smoke_candidate_cnn":self.root/"smoke"/"candidate_cnn", "train_raw_direct":self.root/"raw_direct", "evaluate_raw_direct":self.root/"raw_direct"/"evaluation_stage.json", "train_candidate_cnn":self.root/"candidate_cnn", "evaluate_candidate_cnn":self.root/"candidate_cnn"/"evaluation_stage.json", "evaluate_common_step":self.root/"comparison"/"common_step_evaluation.csv", "build_report":self.root/"comparison"/"preliminary_comparison_ko.md", "integrity_verification":self.root/"manifest.json"}[name]
-    def input_hash(self, name: str) -> str:
+        return {"preflight":self.root/"manifest.json", "smoke_raw_direct":self.root/"smoke"/"raw_direct"/"runner_verified.json", "smoke_candidate_cnn":self.root/"smoke"/"candidate_cnn"/"runner_verified.json", "train_raw_direct":self.root/"raw_direct"/"run_state.json", "evaluate_raw_direct":self.root/"raw_direct"/"evaluation_stage.json", "train_candidate_cnn":self.root/"candidate_cnn"/"run_state.json", "evaluate_candidate_cnn":self.root/"candidate_cnn"/"evaluation_stage.json", "evaluate_common_step":self.root/"comparison"/"common_step_evaluation.csv", "build_report":self.root/"comparison"/"preliminary_comparison_ko.md", "integrity_verification":self.root/"integrity_verification.json"}[name]
+    def output_hash(self, name: str) -> str:
+        """Hash only artifacts owned by this stage, never mutable descendants."""
+        if name == "preflight":
+            manifest = _json(self.root / "manifest.json")
+            environment = _json(self.root / "environment.json")
+            stable_manifest = {key: manifest.get(key) for key in ("schema_version", "baseline_sha256", "config_sha256", "scenario_sha256", "split_sha256", "lock_sha256")}
+            return canonical_json_sha256({"manifest": stable_manifest, "environment": environment})
+        if name.startswith("smoke_"):
+            return sha256_file(self.stage_path(name))
+        if name.startswith("train_"):
+            arm = name.removeprefix("train_")
+            root = self.root / arm
+            state = read_wall_clock_state(root / "run_state.json")
+            checkpoint = resolve_state_checkpoint(root, state)
+            owned = {"state": asdict(state), "checkpoint_sha256": sha256_file(checkpoint)}
+            for filename in ("run_config.json", "runtime_metrics.json", "progress_timing.csv"):
+                path = root / filename
+                if path.is_file(): owned[filename] = sha256_file(path)
+            return canonical_json_sha256(owned)
+        if name.startswith("evaluate_") and name != "evaluate_common_step":
+            return sha256_file(self.stage_path(name))
+        if name == "evaluate_common_step":
+            manifest = _json(self.root / "manifest.json")
+            return canonical_json_sha256({"common_csv": sha256_file(self.stage_path(name)), "checkpoints": manifest.get("checkpoints")})
+        if name == "build_report":
+            base = self.root / "comparison"
+            required = ("summary.json", "scenario_paired_differences.csv", "learning_curves.png", "holdout_comparison.png", "preliminary_comparison_ko.md")
+            return canonical_json_sha256({item: sha256_file(base / item) for item in required})
+        return sha256_file(self.stage_path(name))
+    def input_hash(self, name: str, journal: Mapping[str, Mapping[str, Any]]) -> str:
         lock = _allocrl_dir()/self.config.dependency_lock_path
         observed_lock = sha256_file(lock) if lock.is_file() else "missing"
-        return canonical_json_sha256({"stage":name,"config":self.config.config_sha256,"lock":observed_lock,"previous":{stage:_tree_sha(self.stage_path(stage)) for stage in JOURNAL_STAGES[:JOURNAL_STAGES.index(name)]}})
+        previous = {stage: journal[stage]["output_sha256"] for stage in JOURNAL_STAGES[:JOURNAL_STAGES.index(name)]}
+        return canonical_json_sha256({"stage":name,"config":self.config.config_sha256,"lock":observed_lock,"previous":previous})
     def run_stage(self, name: str, action: Callable[[], None]) -> None:
-        journal=self.journal(); entry=journal[name]; incoming=self.input_hash(name); output=self.stage_path(name)
-        if entry["status"]=="complete" and entry["input_sha256"]==incoming and entry["output_sha256"]==_tree_sha(output): return
+        # The daemon cannot throw on the worker thread; surface a refresh failure
+        # before issuing another stage/subprocess.
+        if getattr(self, "lease", None) is not None and self.lease.failure is not None: raise LeaseError(f"lease heartbeat failed: {self.lease.failure}")
+        journal=self.journal(); entry=journal[name]; incoming=self.input_hash(name, journal); output=self.stage_path(name)
+        try: current_output = self.output_hash(name)
+        except (OSError, ValueError, KeyError, TypeError): current_output = None
+        if entry["status"]=="complete" and entry["input_sha256"]==incoming and entry["output_sha256"]==current_output: return
         journal[name]=_journal_entry("in_progress", input_sha256=incoming, started_at_utc=_utc()); self.save_journal(journal)
         try:
-            action(); output_hash=_tree_sha(output)
+            action(); output_hash=self.output_hash(name)
             if not output.exists(): raise ExperimentStageError(f"stage produced no output: {name}")
         except KeyboardInterrupt:
             journal[name]=_journal_entry("interrupted", input_sha256=incoming, started_at_utc=journal[name]["started_at_utc"], completed_at_utc=_utc(), error="interrupted"); self.save_journal(journal); raise
@@ -302,13 +372,16 @@ class _Runner:
                 if self.root not in path.parents or not path.is_file() or sha256_file(path)!=ref["sha256"]: raise ExperimentIntegrityError("tampered checkpoint reference")
         for path in (self.root/"comparison"/"summary.json", self.root/"comparison"/"scenario_paired_differences.csv", self.root/"comparison"/"learning_curves.png", self.root/"comparison"/"holdout_comparison.png", self.root/"comparison"/"preliminary_comparison_ko.md"):
             if not path.is_file() or path.stat().st_size == 0: raise ExperimentIntegrityError(f"missing report artifact: {path.name}")
+        atomic_write_json(self.root/"integrity_verification.json", {"manifest_sha256": sha256_file(self.root / "manifest.json"), "verified_at_utc": _utc()})
 
 
 def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_root: str | Path, *, subprocess_runner: Callable[..., Any] = subprocess.run, clock: Callable[[], float] = time.monotonic, python_executable: str | None = None, archive_timestep_reader: Callable[[Path], int | None] | None = None, stale_takeover: bool = False, lease_interval_seconds: float = 60, lease_stale_seconds: float = 900) -> None:
     config=config_path if isinstance(config_path,ExperimentConfig) else load_experiment_config(config_path)
     root=Path(output_root).resolve(); root.mkdir(parents=True,exist_ok=True); runner=_Runner(config,root,subprocess_runner=subprocess_runner,clock=clock,python_executable=python_executable,archive_timestep_reader=archive_timestep_reader)
+    lease = _Lease(root,stale_takeover=stale_takeover,clock=clock,interval=lease_interval_seconds,stale_after=lease_stale_seconds)
+    runner.lease = lease
     try:
-        with _Lease(root,stale_takeover=stale_takeover,clock=clock,interval=lease_interval_seconds,stale_after=lease_stale_seconds):
+        with lease:
             runner.run_stage("preflight",runner.preflight)
             runner.run_stage("smoke_raw_direct",lambda: runner.smoke("raw_direct"))
             runner.run_stage("smoke_candidate_cnn",lambda: runner.smoke("candidate_cnn"))
@@ -321,8 +394,9 @@ def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_
             runner.run_stage("integrity_verification",runner.integrity)
             atomic_write_json(root/"COMPLETE.json",{"status":"complete","stages":REQUIRED_COMPLETE_STAGES})
     except BaseException as error:
-        try: write_partial_report(root,f"{type(error).__name__}: {error}")
-        except BaseException: pass
+        if lease.acquired:
+            try: write_partial_report(root,f"{type(error).__name__}: {error}")
+            except BaseException: pass
         raise
 
 
