@@ -295,6 +295,8 @@ def test_evaluate_comparison_artifacts_writes_complete_paired_outputs_and_manife
     evaluator.evaluate_comparison_artifacts(root, root / "raw_direct", root / "candidate_cnn", [{"seed":s} for s in range(1000,1020)], {}, {}, model_loader=object())
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8")); assert manifest["sentinel"] is True
     assert set(manifest["checkpoints"]) == set(evaluator.ARMS)
+    expected = {arm: {name: {"path": f"{arm}/{name}.sb3", "label": ("final" if name == "final" else ("common_step" if name == "common" else "best_model")), "sha256": arm[0] * 64, "timestep": 10_000} for name in ("selected", "final", "common")} for arm in evaluator.ARMS}
+    assert manifest["checkpoints"] == expected
     assert len(list(csv.DictReader((root / "comparison" / "common_step_evaluation.csv").open(encoding="utf-8")))) == 40
 
 
@@ -314,3 +316,36 @@ def test_manifest_update_uses_atomic_publication(tmp_path, monkeypatch):
     monkeypatch.setattr(evaluator, "atomic_write_json", lambda target, payload: calls.append((target, payload)))
     evaluator.update_checkpoint_manifest(path, "raw_direct", {"final": evaluator.CheckpointRef(Path("raw/final.sb3"), "final", 1, "a" * 64)})
     assert calls and path.read_text(encoding="utf-8") == '{"sentinel":true}'
+
+
+def test_evaluate_comparison_artifacts_rejects_outside_arm_directory_without_manifest_change(tmp_path):
+    from comparison import checkpoint_evaluator as evaluator
+    original = b'{"sentinel":true}'; (tmp_path / "manifest.json").write_bytes(original)
+    outside = tmp_path.parent / "outside"; outside.mkdir(exist_ok=True)
+    with pytest.raises(evaluator.PartialResultError):
+        evaluator.evaluate_comparison_artifacts(tmp_path, tmp_path / "sub" / ".." / ".." / "outside", tmp_path / "candidate_cnn", [], {}, {})
+    assert (tmp_path / "manifest.json").read_bytes() == original
+
+
+def test_evaluate_comparison_artifacts_rejects_symlink_escape_without_manifest_change(tmp_path):
+    from comparison import checkpoint_evaluator as evaluator
+    import os
+    original = b'{"sentinel":true}'; (tmp_path / "manifest.json").write_bytes(original)
+    outside = tmp_path.parent / "outside_arm"; outside.mkdir(exist_ok=True)
+    link = tmp_path / "raw_direct"
+    try:
+        os.symlink(outside, link, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink unavailable: {error}")
+    with pytest.raises(evaluator.PartialResultError):
+        evaluator.evaluate_comparison_artifacts(tmp_path, link, tmp_path / "candidate_cnn", [], {}, {})
+    assert (tmp_path / "manifest.json").read_bytes() == original
+
+
+def test_atomic_publication_failure_preserves_manifest_bytes(tmp_path, monkeypatch):
+    from comparison import checkpoint_evaluator as evaluator
+    path = tmp_path / "manifest.json"; original = b'{"sentinel":true}'; path.write_bytes(original)
+    monkeypatch.setattr(evaluator, "atomic_write_json", lambda *_: (_ for _ in ()).throw(OSError("replace failed")))
+    with pytest.raises(OSError, match="replace failed"):
+        evaluator.update_checkpoint_manifest(path, "raw_direct", {"final": evaluator.CheckpointRef(Path("raw/final.sb3"), "final", 1, "a" * 64)})
+    assert path.read_bytes() == original
