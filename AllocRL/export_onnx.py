@@ -15,34 +15,40 @@ def export_saved_model(
     """Recreate the saved observation space and export the actor to ONNX."""
     from sb3_contrib import MaskablePPO
 
+    from alloc_env.observation_state import GRID_SIZE
     from alloc_env.strategy import BaseGridStrategy
     from train import (
         create_evaluation_env,
         export_to_onnx,
         load_allocation_scenario,
         load_model_run_config,
-        require_current_training_data_schema,
+        observation_contract_from_run_config,
         resolve_model_archive_path,
     )
 
     model_path = resolve_model_archive_path(model_path)
     run_config = load_model_run_config(model_path)
-    require_current_training_data_schema(run_config, source="ONNX export")
+    workspace_codes, state_context, observation_scales = (
+        observation_contract_from_run_config(
+            run_config, source="ONNX export"
+        )
+    )
     data_dir = Path(data_dir).expanduser().resolve()
 
     strategy = BaseGridStrategy(step=5.0)
     blocks, workspaces = load_allocation_scenario(
         data_dir,
         strategy,
-        run_config.get("active_workspace_codes"),
+        workspace_codes,
     )
 
     env = create_evaluation_env(
         blocks,
         workspaces,
         strategy,
-        grid_size=int(run_config["grid_size"]),
-        n_future_blocks=int(run_config["n_future_blocks"]),
+        observation_scales=observation_scales,
+        grid_size=GRID_SIZE,
+        state_context_mode=state_context,
         seed=int(run_config.get("seed", 0)),
     )
     try:

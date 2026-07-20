@@ -95,7 +95,6 @@ def make_ten_workspace_env(
     state_context_mode: str = "full",
     *,
     observation_scales: ObservationScales | None = None,
-    n_future_blocks: int | None = None,
 ) -> BlockPlacementEnv:
     fixture = make_observation_fixture(block_count=40)
     return BlockPlacementEnv(
@@ -106,7 +105,6 @@ def make_ten_workspace_env(
         grid_size=64,
         state_context_mode=state_context_mode,
         observation_scales=observation_scales,
-        n_future_blocks=n_future_blocks,
     )
 
 
@@ -377,7 +375,6 @@ def test_fixture_scale_fallback_propagates_zero_working_day_span():
         (make_scales(max_length=9.0), "max_length"),
         (make_scales(max_breadth=4.0), "max_breadth"),
         (make_scales(max_duration=9), "max_duration"),
-        (make_scales(base_date=date(2026, 1, 6)), "base_date"),
         (make_scales(date_span_workdays=1), "date_span_workdays"),
         (make_scales(max_workspace_length=99.0), "max_workspace_length"),
         (make_scales(max_workspace_breadth=49.0), "max_workspace_breadth"),
@@ -399,10 +396,6 @@ def test_constructor_rejects_incompatible_source_scales(scales, message):
         (
             lambda blocks: setattr(blocks[0], "original_duration", 11),
             "max_duration",
-        ),
-        (
-            lambda blocks: setattr(blocks[0], "in_date", date(2026, 1, 2)),
-            "base_date",
         ),
         (
             lambda blocks: setattr(
@@ -486,17 +479,15 @@ def test_synthetic_reset_rejects_generated_workspace_outside_scales(
         env.reset(seed=0)
 
 
-def test_legacy_n_future_blocks_keyword_does_not_change_schema_or_content():
-    default_env = make_ten_workspace_env()
-    legacy_env = make_ten_workspace_env(n_future_blocks=1)
+def test_obsolete_n_future_blocks_constructor_keyword_is_rejected():
+    fixture = make_observation_fixture(block_count=40)
 
-    default_observation, _ = default_env.reset(seed=0)
-    legacy_observation, _ = legacy_env.reset(seed=0)
-
-    assert list(default_observation) == list(legacy_observation)
-    for key in default_observation:
-        np.testing.assert_array_equal(
-            legacy_observation[key], default_observation[key]
+    with pytest.raises(TypeError, match="n_future_blocks"):
+        BlockPlacementEnv(
+            fixture["blocks"],
+            fixture["workspaces"],
+            BaseGridStrategy(step=1.0),
+            n_future_blocks=1,
         )
 
 

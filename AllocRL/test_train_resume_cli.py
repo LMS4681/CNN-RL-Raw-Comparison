@@ -13,16 +13,38 @@ import train as train_module
 
 class TrainResumeCliTest(unittest.TestCase):
     @staticmethod
-    def _run_config(observation_schema_version=2):
+    def _run_config(observation_schema_version=3):
         return {
             "training_data_schema_version": 2,
             "observation_schema_version": observation_schema_version,
             "reward_schema_version": 2,
             "extractor": "candidate-cnn",
-            "n_future_blocks": 4,
-            "grid_size": 32,
+            "state_context": "full",
+            "grid_size": 64,
+            "ordered_future_count": 16,
+            "pending_queue_slots": 32,
+            "future_day_windows": [[0, 5], [6, 20], [21, 60]],
+            "observation_scales": {
+                "max_length": 100.0,
+                "max_breadth": 50.0,
+                "max_duration": 60,
+                "base_date": "2025-12-01",
+                "date_span_workdays": 150,
+                "max_workspace_area": 10_000.0,
+                "total_workspace_area": 80_000.0,
+                "max_workspace_length": 200.0,
+                "max_workspace_breadth": 100.0,
+                "dropout_threshold": 7,
+            },
             "features_dim": 256,
-            "active_workspace_codes": ["PE001"],
+            "active_workspace_codes": [
+                "PE049", "PE050", "PE055", "PE054", "PE056",
+                "PE048", "PE044", "PE059", "PE060", "PE061",
+            ],
+            "data_split_seed": 20260716,
+            "source_sha256": "abc123",
+            "episode_block_count": 913,
+            "target_month_counts": {"2026-01": 913},
             "excluded_start_months": [7, 11],
             "monthly_jitter": 20,
             "empirical_profile_probability": 0.2,
@@ -102,7 +124,7 @@ class TrainResumeCliTest(unittest.TestCase):
         def fake_train(args):
             captured["resume_from"] = args.resume_from
             captured["extractor"] = args.extractor
-            captured["n_future_blocks"] = args.n_future_blocks
+            captured["state_context"] = args.state_context
             captured["gae_lambda"] = args.gae_lambda
             captured["seed"] = args.seed
             captured["eval_scenarios"] = args.eval_scenarios
@@ -121,13 +143,27 @@ class TrainResumeCliTest(unittest.TestCase):
 
         self.assertEqual(captured["resume_from"], ".\\output\\block_placement_ppo.zip")
         self.assertEqual("candidate-cnn", captured["extractor"])
-        self.assertEqual(4, captured["n_future_blocks"])
+        self.assertEqual("full", captured["state_context"])
         self.assertEqual(0.98, captured["gae_lambda"])
         self.assertEqual(0, captured["seed"])
         self.assertEqual(
             ".\\data\\fixed_eval_scenarios.json",
             captured["eval_scenarios"],
         )
+
+    def test_obsolete_future_cli_argument_is_rejected(self):
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["train.py", "--n-future-blocks", "4"],
+            ),
+            patch.object(train_module, "train") as train,
+            self.assertRaises(SystemExit),
+        ):
+            train_module.main()
+
+        train.assert_not_called()
 
     def test_explicit_resume_rejects_incompatible_run_config(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -204,6 +240,50 @@ class TrainResumeCliTest(unittest.TestCase):
         validator(
             {"training_data_schema_version": 2}, source="test"
         )
+
+    def test_model_tools_require_observation_schema3(self):
+        validator = getattr(
+            train_module, "require_current_observation_schema", None
+        )
+        self.assertIsNotNone(validator)
+
+        with self.assertRaisesRegex(ValueError, "observation_schema_version"):
+            validator({}, source="test")
+        with self.assertRaisesRegex(ValueError, "schema-3"):
+            validator(
+                {"observation_schema_version": 2}, source="test"
+            )
+
+        validator({"observation_schema_version": 3}, source="test")
+
+    def test_model_contract_reconstructs_saved_schema3_observation_values(self):
+        parser = getattr(
+            train_module, "observation_contract_from_run_config", None
+        )
+        self.assertIsNotNone(parser)
+
+        workspace_codes, state_context, scales = parser(
+            self._run_config(), source="test"
+        )
+
+        self.assertEqual(
+            self._run_config()["active_workspace_codes"], workspace_codes
+        )
+        self.assertEqual("full", state_context)
+        self.assertEqual(
+            self._run_config()["observation_scales"], scales.to_dict()
+        )
+
+    def test_model_contract_rejects_changed_fixed_grid_constant(self):
+        parser = getattr(
+            train_module, "observation_contract_from_run_config", None
+        )
+        self.assertIsNotNone(parser)
+        config = self._run_config()
+        config["grid_size"] = 32
+
+        with self.assertRaisesRegex(ValueError, "grid_size"):
+            parser(config, source="test")
 
 
 if __name__ == "__main__":

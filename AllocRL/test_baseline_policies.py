@@ -1,8 +1,10 @@
 import unittest
+from datetime import date
 
 import numpy as np
 
 from alloc_env.alloc_env import BlockPlacementEnv
+from alloc_env.observation_state import ObservationScales
 from alloc_env.strategy import BaseGridStrategy
 from baseline_policies import GreedyImmediateAreaPolicy, RandomValidPolicy
 from test_evaluation_scenarios import make_blocks, make_plain_workspace
@@ -95,7 +97,18 @@ class BaselinePolicyTests(unittest.TestCase):
             BaseGridStrategy(step=1.0),
             use_synthetic=False,
             grid_size=32,
-            n_future_blocks=2,
+            observation_scales=ObservationScales(
+                max_length=100.0,
+                max_breadth=100.0,
+                max_duration=365,
+                base_date=date(2026, 1, 1),
+                date_span_workdays=365,
+                max_workspace_area=10_000.0,
+                total_workspace_area=20_000.0,
+                max_workspace_length=100.0,
+                max_workspace_breadth=100.0,
+                dropout_threshold=7,
+            ),
         )
         try:
             observation, _ = env.reset(seed=0)
@@ -113,7 +126,7 @@ class BaselinePolicyTests(unittest.TestCase):
             self.assertEqual(observation_keys, set(env.observation_space.spaces))
             self.assertEqual(observation_keys, set(observation))
             np.testing.assert_array_equal(
-                placeability, observation["ws_meta"][:, 2].astype(bool)
+                placeability, observation["ws_meta"][:, 3].astype(bool)
             )
             np.testing.assert_allclose(
                 free_areas,

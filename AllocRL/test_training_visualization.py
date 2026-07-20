@@ -18,10 +18,10 @@ from plot_training_curves import plot_training_curves
 class TrainingVisualizationTests(unittest.TestCase):
     def test_run_config_json_round_trip(self):
         config = {
-            "observation_schema_version": 2,
+            "observation_schema_version": 3,
             "extractor": "candidate-cnn",
-            "n_future_blocks": 4,
-            "grid_size": 32,
+            "state_context": "full",
+            "grid_size": 64,
             "active_workspace_codes": ["PE001"],
         }
         with tempfile.TemporaryDirectory() as tmpdir:

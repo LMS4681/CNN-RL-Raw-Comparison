@@ -4,23 +4,41 @@ sys.path.insert(0, ".")
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
-from datetime import date
-from alloc_env.data_loader import load_workspaces, load_blocks
 from alloc_env.strategy import BaseGridStrategy
-from alloc_env.alloc_env import BlockPlacementEnv
+from alloc_env.alloc_env import DROPOUT_THRESHOLD
 from alloc_env.block_generator import SyntheticBlockGenerator
+from alloc_env.observation_state import build_observation_scales
+from train import (
+    DEFAULT_ACTIVE_WORKSPACE_CODES,
+    create_training_env,
+    load_allocation_scenario,
+    parse_workspace_codes,
+)
 
 s = BaseGridStrategy(step=5.0)
-ws = load_workspaces(
-    "data/선행건조 작업장 기준정보.csv",
-    "data/선행건조 지번 기준정보.csv", s)
-bl = load_blocks("data/블록데이터.csv", ws)
+bl, ws = load_allocation_scenario(
+    "data", s, parse_workspace_codes(DEFAULT_ACTIVE_WORKSPACE_CODES)
+)
+observation_scales = build_observation_scales(
+    bl, ws, DROPOUT_THRESHOLD
+)
 
-gen = SyntheticBlockGenerator.from_csv("data/블록데이터.csv")
+gen = SyntheticBlockGenerator.from_blocks(bl)
 
 # 1. Obs 차원 확인
-env = BlockPlacementEnv(bl, ws, s, use_synthetic=True, generator=gen, synthetic_n_blocks=50)
+env = create_training_env(
+    bl,
+    ws,
+    s,
+    gen,
+    observation_scales=observation_scales,
+    episode_n_blocks=50,
+    grid_size=64,
+    n_envs=1,
+)
 obs, _ = env.reset()
+assert env.observation_space.contains(obs)
+assert env.unwrapped._observation_scales is observation_scales
 print(f"=== Obs Structure ===")
 print(f"  Keys: {list(obs.keys())}")
 print(f"  block shape: {obs['block'].shape}")
@@ -37,9 +55,9 @@ print(f"  Step 1 reward: {r:+.4f}, finite: {np.isfinite(r)}")
 # 3. Obs 구조 확인
 print(f"\n=== Obs Structure (step=1) ===")
 print(f"  block[0-4]: {obs2['block'][:5]}")
-print(f"  urgency:    {obs2['block'][5]:.3f}")
-print(f"  duration:   {obs2['block'][6]:.3f}")
-print(f"  progress:   {obs2['block'][7]:.3f}")
+print(f"  assigned:   {obs2['block'][5]:.3f}")
+print(f"  area:       {obs2['block'][6]:.3f}")
+print(f"  max axis:   {obs2['block'][7]:.3f}")
 print(f"  ws_meta[0]: {obs2['ws_meta'][0]}")
 
 # 4. 에피소드 완료 후 terminal reward
@@ -87,4 +105,5 @@ print(f"  Min: {min(rewards):.4f}, Max: {max(rewards):.4f}")
 print(f"  Mean: {np.mean(rewards):.4f}, Std: {np.std(rewards):.4f}")
 print(f"  Range valid [-2.0, +1.0]: {all(-2.0 <= r <= 1.0 for r in rewards)}")
 
+env.close()
 print(f"\nAll tests passed!")

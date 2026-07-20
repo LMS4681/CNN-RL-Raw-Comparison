@@ -25,18 +25,11 @@ from alloc_env.simulator import SimulationResult
 from alloc_env.workspace import Workspace
 from train import (
     load_model_run_config,
-    require_current_training_data_schema,
+    observation_contract_from_run_config,
     resolve_model_archive_path,
 )
 
 EPSILON = 1e-5
-
-
-def parse_workspace_codes(value: str | None) -> list[str] | None:
-    if value is None:
-        return None
-    codes = [code.strip().upper() for code in value.split(",") if code.strip()]
-    return codes or None
 
 
 def _setup_korean_font() -> None:
@@ -431,13 +424,11 @@ def evaluate_model_and_export(
     data_dir: str | Path,
     model_path: str | Path,
     output_dir: str | Path,
-    grid_size: int | None = None,
     frame_stride_days: int = 1,
-    active_workspace_codes: str | list[str] | None = None,
-    n_future_blocks: int | None = None,
 ) -> list[dict[str, str]]:
     from sb3_contrib import MaskablePPO
 
+    from alloc_env.observation_state import GRID_SIZE
     from alloc_env.strategy import BaseGridStrategy
     from train import create_evaluation_env, load_allocation_scenario
 
@@ -445,25 +436,11 @@ def evaluate_model_and_export(
 
     model_path = resolve_model_archive_path(model_path)
     run_config = load_model_run_config(model_path)
-    require_current_training_data_schema(
-        run_config, source="placement visualization"
-    )
-    grid_size = int(run_config.get("grid_size", grid_size or 64))
-    n_future_blocks = int(
-        run_config.get(
-            "n_future_blocks",
-            n_future_blocks if n_future_blocks is not None else 4,
+    active_codes, state_context, observation_scales = (
+        observation_contract_from_run_config(
+            run_config, source="placement visualization"
         )
     )
-    configured_codes = run_config.get("active_workspace_codes")
-    if isinstance(configured_codes, str):
-        active_codes = parse_workspace_codes(configured_codes)
-    elif configured_codes is not None:
-        active_codes = list(configured_codes) or None
-    elif isinstance(active_workspace_codes, str):
-        active_codes = parse_workspace_codes(active_workspace_codes)
-    else:
-        active_codes = active_workspace_codes
 
     data_dir = Path(data_dir)
     strategy = BaseGridStrategy(step=5.0)
@@ -475,20 +452,27 @@ def evaluate_model_and_export(
         blocks,
         workspaces,
         strategy,
-        grid_size=grid_size,
-        n_future_blocks=n_future_blocks,
+        observation_scales=observation_scales,
+        grid_size=GRID_SIZE,
+        state_context_mode=state_context,
         seed=int(run_config.get("seed", 0)),
     )
-    model = MaskablePPO.load(str(model_path), env=env, device="auto")
-
-    obs, _ = env.reset()
-    done = False
-    info = {}
-    while not done:
-        action_masks = env.action_masks() if hasattr(env, "action_masks") else None
-        action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
-        obs, _, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
+    try:
+        model = MaskablePPO.load(str(model_path), env=env, device="auto")
+        obs, _ = env.reset()
+        done = False
+        info = {}
+        while not done:
+            action_masks = (
+                env.action_masks() if hasattr(env, "action_masks") else None
+            )
+            action, _ = model.predict(
+                obs, action_masks=action_masks, deterministic=True
+            )
+            obs, _, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+    finally:
+        env.close()
 
     result = info.get("raw_result")
     if result is None:
@@ -508,34 +492,14 @@ def main() -> None:
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--model-path", default="./output/block_placement_ppo.sb3")
     parser.add_argument("--output-dir", default="./output/eval_visualization")
-    parser.add_argument(
-        "--grid-size", type=int, default=None,
-        help="fallback for legacy runs; saved run_config.json takes precedence",
-    )
     parser.add_argument("--frame-stride-days", type=int, default=1)
-    parser.add_argument(
-        "--n-future-blocks", type=int, default=None,
-        help=(
-            "used only when n_future_blocks is missing from run_config.json"
-        ),
-    )
-    parser.add_argument(
-        "--active-workspace-codes",
-        default=None,
-        help=(
-            "fallback for legacy runs; saved run_config.json takes precedence"
-        ),
-    )
     args = parser.parse_args()
 
     violations = evaluate_model_and_export(
         args.data_dir,
         args.model_path,
         args.output_dir,
-        grid_size=args.grid_size,
         frame_stride_days=args.frame_stride_days,
-        active_workspace_codes=args.active_workspace_codes,
-        n_future_blocks=args.n_future_blocks,
     )
     print(f"Visualization files saved to: {Path(args.output_dir).resolve()}")
     print(f"Violation count: {len(violations)}")

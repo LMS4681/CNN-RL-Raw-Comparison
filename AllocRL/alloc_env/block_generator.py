@@ -253,7 +253,7 @@ class SyntheticBlockGenerator:
                         기본값 90은 기존 30~90일 랜덤 동작을 유지.
         """
         if self._source_blocks:
-            return self._generate_monthly_bootstrap(n_blocks)
+            return self._generate_monthly_bootstrap(n_blocks, base_date)
 
         dist = self._dist
 
@@ -307,7 +307,9 @@ class SyntheticBlockGenerator:
 
         return blocks
 
-    def _generate_monthly_bootstrap(self, n_blocks: int) -> List[Block]:
+    def _generate_monthly_bootstrap(
+        self, n_blocks: int, base_date: date
+    ) -> List[Block]:
         if n_blocks < 1:
             return []
 
@@ -328,7 +330,16 @@ class SyntheticBlockGenerator:
         for key, count in zip(month_keys, month_counts):
             year, month = key
             templates = source_by_month[key]
-            working_dates = _working_dates_in_month(year, month)
+            working_dates = [
+                value
+                for value in _working_dates_in_month(year, month)
+                if value >= base_date
+            ]
+            if count and not working_dates:
+                raise ValueError(
+                    f"target month {year:04d}-{month:02d} has no working "
+                    f"dates on or after base_date {base_date.isoformat()}"
+                )
             template_indices = self._rng.integers(
                 0, len(templates), size=int(count)
             )

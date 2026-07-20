@@ -6,10 +6,17 @@ import argparse
 
 import numpy as np
 
+from alloc_env.alloc_env import DROPOUT_THRESHOLD
+from alloc_env.observation_state import build_observation_scales
+from alloc_env.strategy import BaseGridStrategy
 from baseline_policies import GreedyImmediateAreaPolicy, RandomValidPolicy
 from evaluation_runner import evaluate_scenarios, write_evaluation_metrics
 from evaluation_scenarios import read_scenarios
-from train import DEFAULT_ACTIVE_WORKSPACE_CODES, parse_workspace_codes
+from train import (
+    DEFAULT_ACTIVE_WORKSPACE_CODES,
+    load_allocation_scenario,
+    parse_workspace_codes,
+)
 
 
 def main() -> None:
@@ -24,8 +31,7 @@ def main() -> None:
         default="./output_ablation/baselines/evaluation_scenarios.csv",
     )
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--grid-size", type=int, default=64)
-    parser.add_argument("--n-future-blocks", type=int, default=4)
+    parser.add_argument("--data-dir", default="./data")
     parser.add_argument(
         "--active-workspace-codes",
         default=DEFAULT_ACTIVE_WORKSPACE_CODES,
@@ -39,6 +45,15 @@ def main() -> None:
         scenarios = scenarios[:args.limit]
 
     workspace_codes = parse_workspace_codes(args.active_workspace_codes)
+    strategy = BaseGridStrategy(step=5.0)
+    full_blocks, workspaces = load_allocation_scenario(
+        args.data_dir, strategy, workspace_codes
+    )
+    observation_scales = build_observation_scales(
+        full_blocks,
+        workspaces,
+        DROPOUT_THRESHOLD,
+    )
     factories = (
         lambda seed: RandomValidPolicy(seed),
         lambda _seed: GreedyImmediateAreaPolicy(),
@@ -49,9 +64,9 @@ def main() -> None:
             evaluate_scenarios(
                 factory,
                 scenarios,
-                grid_size=args.grid_size,
-                n_future_blocks=args.n_future_blocks,
                 workspace_codes=workspace_codes,
+                observation_scales=observation_scales,
+                state_context_mode="full",
             )
         )
 

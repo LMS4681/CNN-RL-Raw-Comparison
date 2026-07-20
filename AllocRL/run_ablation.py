@@ -10,11 +10,11 @@ from pathlib import Path
 
 
 ABLATIONS = {
-    "A": ("structured", 0),
-    "B": ("structured", 4),
-    "C": ("fixed-grid", 4),
-    "D": ("candidate-cnn", 0),
-    "E": ("candidate-cnn", 4),
+    "A": ("structured", "current"),
+    "B": ("structured", "full"),
+    "C": ("fixed-grid", "full"),
+    "D": ("candidate-cnn", "current"),
+    "E": ("candidate-cnn", "full"),
 }
 BLOCK_SOURCE_FILENAME = "\ube14\ub85d\ub370\uc774\ud130.csv"
 
@@ -43,7 +43,7 @@ def build_ablation_commands(
     timesteps = 20_000 if mode == "screening" else 100_000
     commands = []
     for seed in seeds:
-        for label, (extractor, horizon) in ABLATIONS.items():
+        for label, (extractor, state_context) in ABLATIONS.items():
             output = f"./output_ablation/{mode}/{label}/seed_{seed}"
             commands.append(
                 [
@@ -54,8 +54,8 @@ def build_ablation_commands(
                     str(timesteps),
                     "--extractor",
                     extractor,
-                    "--n-future-blocks",
-                    str(horizon),
+                    "--state-context",
+                    state_context,
                     "--seed",
                     str(seed),
                     "--output-dir",

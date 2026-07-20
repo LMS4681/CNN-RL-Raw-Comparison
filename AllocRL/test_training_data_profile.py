@@ -8,9 +8,11 @@ from pathlib import Path
 import pytest
 
 from alloc_env import data_loader
+from alloc_env.alloc_env import DROPOUT_THRESHOLD
 from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.block_generator import SyntheticBlockGenerator
 from alloc_env.data_split import split_blocks_by_ship
+from alloc_env.observation_state import build_observation_scales
 from alloc_env.strategy import BaseGridStrategy
 import train as train_module
 
@@ -282,6 +284,18 @@ def test_monthly_bootstrap_is_seeded_and_preserves_row_correlations():
     assert all(block.in_date.weekday() < 5 for block in first)
 
 
+def test_monthly_bootstrap_never_generates_before_requested_base_date():
+    source = list(target_blocks())
+    base_date = min(block.in_date for block in source)
+    generated = SyntheticBlockGenerator.from_blocks(
+        source,
+        seed=31,
+        empirical_profile_probability=1.0,
+    ).generate(913, base_date)
+
+    assert min(block.in_date for block in generated) >= base_date
+
+
 def test_training_defaults_use_approved_ten_workspace_scenario():
     assert train_module.parse_workspace_codes(
         train_module.DEFAULT_ACTIVE_WORKSPACE_CODES
@@ -323,8 +337,11 @@ def test_training_env_keeps_real_geometry_empty_and_generates_913_targets():
         workspaces,
         strategy,
         generator,
+        observation_scales=build_observation_scales(
+            target_blocks(), workspaces, DROPOUT_THRESHOLD
+        ),
         episode_n_blocks=913,
-        grid_size=16,
+        grid_size=64,
         n_envs=1,
         seed=41,
     )
@@ -341,7 +358,7 @@ def test_training_env_keeps_real_geometry_empty_and_generates_913_targets():
         assert all(not item.pre_placements for item in base_env._workspaces)
         assert max(
             block.original_duration for block in base_env._blocks
-        ) <= base_env._max_duration
+        ) <= base_env._observation_scales.max_duration
     finally:
         env.close()
 

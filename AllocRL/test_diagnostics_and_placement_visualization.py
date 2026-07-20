@@ -1,6 +1,7 @@
 """Tests for synthetic-data diagnostics and placement visualization exports."""
 
 import csv
+import inspect
 import tempfile
 import unittest
 from datetime import date
@@ -11,6 +12,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import visualize_eval_placement as visualization_module
+import visualize_grids as grid_visualization
 from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.simulator import SimulationResult
 from alloc_env.strategy import BaseGridStrategy
@@ -66,10 +68,10 @@ class DiagnosticsAndPlacementVisualizationTests(unittest.TestCase):
             model_path = output_dir / "block_placement_ppo.sb3"
             model_path.touch()
             expected = {
-                "observation_schema_version": 2,
+                "observation_schema_version": 3,
                 "extractor": "candidate-cnn",
-                "n_future_blocks": 4,
-                "grid_size": 32,
+                "state_context": "full",
+                "grid_size": 64,
                 "active_workspace_codes": ["PE001"],
             }
             import json
@@ -85,6 +87,26 @@ class DiagnosticsAndPlacementVisualizationTests(unittest.TestCase):
             loaded = loader(model_path)
 
         self.assertEqual(expected, loaded)
+
+    def test_grid_channel_labels_match_schema3_semantics(self):
+        self.assertEqual(
+            (
+                "collision exclusion",
+                "remaining working days",
+                "post-candidate lot state",
+                "candidate exclusion",
+            ),
+            getattr(grid_visualization, "CHANNEL_LABELS", None),
+        )
+
+    def test_saved_model_visualizer_has_no_legacy_observation_fallbacks(self):
+        parameters = inspect.signature(
+            visualization_module.evaluate_model_and_export
+        ).parameters
+
+        self.assertNotIn("grid_size", parameters)
+        self.assertNotIn("n_future_blocks", parameters)
+        self.assertNotIn("active_workspace_codes", parameters)
 
     def test_synthetic_diagnostic_report_flags_zero_valid_synthetic_blocks(self):
         workspace = make_workspace()

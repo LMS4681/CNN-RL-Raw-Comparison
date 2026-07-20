@@ -15,6 +15,7 @@ import os
 import sys
 import warnings
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 # Windows cp949 콘솔에서 Unicode 출력 에러 방지
@@ -23,8 +24,18 @@ if sys.platform == "win32" and os.environ.get("PYTHONIOENCODING") is None:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import gymnasium as gym
 import numpy as np
 from stable_baselines3.common.callbacks import CheckpointCallback
+
+from alloc_env.observation_state import (
+    FUTURE_DAY_WINDOWS,
+    GRID_SIZE,
+    N_WORKSPACES,
+    ORDERED_FUTURE_COUNT,
+    PENDING_QUEUE_SLOTS,
+    ObservationScales,
+)
 
 
 DEFAULT_ACTIVE_WORKSPACE_CODES = (
@@ -37,7 +48,7 @@ DEFAULT_EXCLUDED_START_MONTHS = (7, 11)
 DEFAULT_MONTHLY_JITTER = 20
 DEFAULT_EMPIRICAL_PROFILE_PROBABILITY = 0.2
 TRAINING_DATA_SCHEMA_VERSION = 2
-OBSERVATION_SCHEMA_VERSION = 2
+OBSERVATION_SCHEMA_VERSION = 3
 REWARD_SCHEMA_VERSION = 2
 MODEL_FILENAME = "block_placement_ppo.sb3"
 LEGACY_MODEL_FILENAME = "block_placement_ppo.zip"
@@ -136,26 +147,26 @@ def build_policy_kwargs(
     }
 
 
-def estimate_rollout_buffer_mb(
-    n_workspaces: int,
-    grid_size: int,
-    n_steps: int,
-    n_envs: int = 1,
-    n_future_blocks: int = 0,
-) -> float:
-    from alloc_env.alloc_env import FUTURE_BLOCK_FEATURE_DIM
-
-    future_floats = (
-        n_future_blocks * (FUTURE_BLOCK_FEATURE_DIM + 1)  # future_blocks + mask
-        if n_future_blocks > 0 else 0
+def observation_float_count(observation_space: gym.spaces.Dict) -> int:
+    return sum(
+        int(np.prod(space.shape))
+        for space in observation_space.spaces.values()
     )
-    obs_bytes = (
-        10
-        + n_workspaces * 4 * grid_size * grid_size
-        + n_workspaces * 3
-        + future_floats
-    ) * 4
-    return obs_bytes * n_steps * n_envs / 1024 / 1024
+
+
+def estimate_rollout_buffer_mb(
+    observation_space: gym.spaces.Dict,
+    n_steps: int,
+    n_envs: int,
+) -> float:
+    return (
+        observation_float_count(observation_space)
+        * 4
+        * n_steps
+        * n_envs
+        / 1024
+        / 1024
+    )
 
 
 def resolve_vec_env_type(vec_env: str, n_envs: int) -> str:
@@ -168,6 +179,26 @@ def resolve_vec_env_type(vec_env: str, n_envs: int) -> str:
     if vec_env in {"dummy", "subproc"}:
         return vec_env
     raise ValueError(f"Unknown vec env type: {vec_env}")
+
+
+def _validate_production_env_contract(
+    workspaces: Sequence,
+    grid_size: int,
+    observation_scales: ObservationScales | None,
+) -> None:
+    if len(workspaces) != N_WORKSPACES:
+        raise ValueError(
+            f"production environments require exactly {N_WORKSPACES} "
+            f"workspaces, got {len(workspaces)}"
+        )
+    if grid_size != GRID_SIZE:
+        raise ValueError(
+            f"production grid_size must be {GRID_SIZE}, got {grid_size}"
+        )
+    if not isinstance(observation_scales, ObservationScales):
+        raise TypeError(
+            "observation_scales must be the full-source ObservationScales"
+        )
 
 
 def make_env(
@@ -184,13 +215,18 @@ def make_env(
     generator_target_month_counts=None,
     synthetic_n_blocks=None,
     vary_layout=True,
-    grid_size=64,
-    n_future_blocks=4,
+    grid_size=GRID_SIZE,
+    state_context_mode="full",
+    observation_scales=None,
     env_seed=0,
 ):
     """환경 팩토리 (SubprocVecEnv용)."""
     from alloc_env.alloc_env import BlockPlacementEnv
     from alloc_env.block_generator import SyntheticBlockGenerator
+
+    _validate_production_env_contract(
+        workspaces, grid_size, observation_scales
+    )
 
     def _init():
         local_generator = (
@@ -214,7 +250,8 @@ def make_env(
             synthetic_n_blocks=synthetic_n_blocks,
             vary_layout=vary_layout,
             grid_size=grid_size,
-            n_future_blocks=n_future_blocks,
+            state_context_mode=state_context_mode,
+            observation_scales=observation_scales,
         )
         env.action_space.seed(env_seed)
         env.observation_space.seed(env_seed)
@@ -227,10 +264,11 @@ def create_training_env(
     workspaces,
     strategy,
     generator,
-    grid_size: int = 64,
+    observation_scales: ObservationScales,
+    grid_size: int = GRID_SIZE,
     n_envs: int = 1,
     vec_env: str = "auto",
-    n_future_blocks: int = 4,
+    state_context_mode: str = "full",
     seed: int = 0,
     episode_n_blocks: int = 913,
 ):
@@ -238,6 +276,9 @@ def create_training_env(
     from sb3_contrib.common.wrappers import ActionMasker
     from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
+    _validate_production_env_contract(
+        workspaces, grid_size, observation_scales
+    )
     resolved_vec_env = resolve_vec_env_type(vec_env, n_envs)
     env_kwargs = {
         "blocks": blocks,
@@ -265,7 +306,8 @@ def create_training_env(
         "synthetic_n_blocks": episode_n_blocks,
         "vary_layout": False,
         "grid_size": grid_size,
-        "n_future_blocks": n_future_blocks,
+        "state_context_mode": state_context_mode,
+        "observation_scales": observation_scales,
     }
 
     if resolved_vec_env == "single":
@@ -286,8 +328,9 @@ def create_evaluation_env(
     blocks,
     workspaces,
     strategy,
-    grid_size: int = 64,
-    n_future_blocks: int = 4,
+    observation_scales: ObservationScales,
+    grid_size: int = GRID_SIZE,
+    state_context_mode: str = "full",
     seed: int = 0,
 ):
     """CSV 원본 블록으로 평가하는 마스크 적용 환경을 생성합니다."""
@@ -295,13 +338,17 @@ def create_evaluation_env(
 
     from alloc_env.alloc_env import BlockPlacementEnv
 
+    _validate_production_env_contract(
+        workspaces, grid_size, observation_scales
+    )
     env = BlockPlacementEnv(
         blocks,
         workspaces,
         strategy,
         use_synthetic=False,
         grid_size=grid_size,
-        n_future_blocks=n_future_blocks,
+        state_context_mode=state_context_mode,
+        observation_scales=observation_scales,
     )
     env.action_space.seed(seed)
     env.observation_space.seed(seed)
@@ -316,37 +363,60 @@ ARCH_CONFIG_KEYS = (
     "observation_schema_version",
     "reward_schema_version",
     "extractor",
-    "n_future_blocks",
+    "state_context",
     "grid_size",
+    "ordered_future_count",
+    "pending_queue_slots",
+    "future_day_windows",
+    "observation_scales",
     "features_dim",
     "active_workspace_codes",
+    "data_split_seed",
+    "source_sha256",
+    "episode_block_count",
+    "target_month_counts",
     "excluded_start_months",
     "monthly_jitter",
     "empirical_profile_probability",
+    "seed",
 )
 
 
-def current_run_config(args, active_workspace_codes) -> dict:
+def current_run_config(
+    args,
+    active_workspace_codes: Sequence[str],
+    source_manifest: Mapping[str, object],
+    observation_scales: ObservationScales,
+) -> dict:
+    if len(active_workspace_codes) != N_WORKSPACES:
+        raise ValueError(
+            f"run configuration requires exactly {N_WORKSPACES} active "
+            f"workspace codes, got {len(active_workspace_codes)}"
+        )
     return {
         "training_data_schema_version": TRAINING_DATA_SCHEMA_VERSION,
         "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
         "reward_schema_version": REWARD_SCHEMA_VERSION,
         "extractor": args.extractor,
-        "n_future_blocks": args.n_future_blocks,
-        "grid_size": args.grid_size,
         "features_dim": args.features_dim,
-        "active_workspace_codes": list(active_workspace_codes or []),
+        "active_workspace_codes": list(active_workspace_codes),
+        "state_context": args.state_context,
+        "grid_size": GRID_SIZE,
+        "ordered_future_count": ORDERED_FUTURE_COUNT,
+        "pending_queue_slots": PENDING_QUEUE_SLOTS,
+        "future_day_windows": [list(item) for item in FUTURE_DAY_WINDOWS],
+        "observation_scales": observation_scales.to_dict(),
+        "data_split_seed": int(source_manifest["split_seed"]),
+        "source_sha256": str(source_manifest["source_sha256"]),
+        "episode_block_count": int(source_manifest["source_row_count"]),
+        "target_month_counts": dict(source_manifest["source_month_counts"]),
         "excluded_start_months": list(DEFAULT_EXCLUDED_START_MONTHS),
-        "monthly_jitter": getattr(
-            args, "monthly_jitter", DEFAULT_MONTHLY_JITTER
+        "monthly_jitter": int(args.monthly_jitter),
+        "empirical_profile_probability": float(
+            args.empirical_profile_probability
         ),
-        "empirical_profile_probability": getattr(
-            args,
-            "empirical_profile_probability",
-            DEFAULT_EMPIRICAL_PROFILE_PROBABILITY,
-        ),
-        "seed": args.seed,
-        "eval_scenarios": getattr(args, "eval_scenarios", None),
+        "seed": int(args.seed),
+        "eval_scenarios": args.eval_scenarios,
     }
 
 
@@ -466,6 +536,69 @@ def require_current_training_data_schema(
     )
 
 
+def require_current_observation_schema(
+    config: Mapping[str, object],
+    source: str,
+) -> None:
+    saved_version = config.get("observation_schema_version")
+    if saved_version == OBSERVATION_SCHEMA_VERSION:
+        return
+    raise ValueError(
+        f"[{source}] Saved model observation_schema_version is "
+        f"incompatible: saved={saved_version}, "
+        f"current={OBSERVATION_SCHEMA_VERSION}. Schema-2 models cannot be "
+        "used with the schema-3 environment; train or select a schema-3 model."
+    )
+
+
+def observation_contract_from_run_config(
+    config: dict,
+    source: str,
+) -> tuple[list[str], str, ObservationScales]:
+    require_current_training_data_schema(config, source=source)
+    require_current_observation_schema(config, source=source)
+
+    fixed_values = {
+        "grid_size": GRID_SIZE,
+        "ordered_future_count": ORDERED_FUTURE_COUNT,
+        "pending_queue_slots": PENDING_QUEUE_SLOTS,
+        "future_day_windows": [list(item) for item in FUTURE_DAY_WINDOWS],
+    }
+    for key, expected in fixed_values.items():
+        actual = config.get(key)
+        if actual != expected:
+            raise ValueError(
+                f"[{source}] Saved model {key} is incompatible: "
+                f"saved={actual}, current={expected}"
+            )
+
+    workspace_codes = config.get("active_workspace_codes")
+    if (
+        isinstance(workspace_codes, (str, bytes))
+        or not isinstance(workspace_codes, Sequence)
+        or len(workspace_codes) != N_WORKSPACES
+        or any(not isinstance(code, str) for code in workspace_codes)
+    ):
+        raise ValueError(
+            f"[{source}] active_workspace_codes must contain exactly "
+            f"{N_WORKSPACES} string codes"
+        )
+
+    state_context = config.get("state_context")
+    if state_context not in {"full", "current"}:
+        raise ValueError(
+            f"[{source}] state_context must be 'full' or 'current', "
+            f"got {state_context!r}"
+        )
+    try:
+        scales = ObservationScales.from_dict(config["observation_scales"])
+    except KeyError as error:
+        raise ValueError(
+            f"[{source}] Saved model is missing observation_scales"
+        ) from error
+    return list(workspace_codes), str(state_context), scales
+
+
 def require_compatible_run_config(
     saved: dict,
     current: dict,
@@ -549,8 +682,8 @@ def write_evaluation_metrics(
 def evaluate_fixed_scenarios(
     model,
     scenario_records: list[dict],
-    grid_size: int,
-    n_future_blocks: int,
+    observation_scales: ObservationScales,
+    state_context_mode: str,
     workspace_codes: list[str] | None = None,
 ) -> list[dict]:
     from evaluation_runner import ModelActionPolicy, evaluate_scenarios
@@ -558,9 +691,9 @@ def evaluate_fixed_scenarios(
     return evaluate_scenarios(
         lambda seed: ModelActionPolicy(model),
         scenario_records,
-        grid_size=grid_size,
-        n_future_blocks=n_future_blocks,
         workspace_codes=workspace_codes,
+        observation_scales=observation_scales,
+        state_context_mode=state_context_mode,
     )
 
 
@@ -587,6 +720,14 @@ def train(args):
     active_workspace_codes = parse_workspace_codes(args.active_workspace_codes)
     full_blocks, workspaces = load_allocation_scenario(
         data_dir, strategy, active_workspace_codes
+    )
+    from alloc_env.alloc_env import DROPOUT_THRESHOLD
+    from alloc_env.observation_state import build_observation_scales
+
+    observation_scales = build_observation_scales(
+        full_blocks,
+        workspaces,
+        DROPOUT_THRESHOLD,
     )
     from alloc_env.data_split import split_blocks_by_ship
 
@@ -632,20 +773,20 @@ def train(args):
         workspaces,
         strategy,
         generator,
+        observation_scales=observation_scales,
         episode_n_blocks=len(full_blocks),
         grid_size=args.grid_size,
         n_envs=args.n_envs,
         vec_env=args.vec_env,
-        n_future_blocks=args.n_future_blocks,
+        state_context_mode=args.state_context,
         seed=args.seed,
     )
     resolved_vec_env = resolve_vec_env_type(args.vec_env, args.n_envs)
 
     # 메모리 사용량 예측
-    N = len(workspaces)
     G = args.grid_size
     buffer_mb = estimate_rollout_buffer_mb(
-        N, G, args.n_steps, args.n_envs, args.n_future_blocks
+        env.observation_space, args.n_steps, args.n_envs
     )
     print(f"Obs space: {env.observation_space}")
     print(f"Action space: {env.action_space}")
@@ -669,7 +810,10 @@ def train(args):
     )
     # 이어학습 경로 결정: --resume-from(명시) 우선, 없으면 --auto-resume 자동 탐지
     run_config = current_run_config(
-        args, [workspace.code for workspace in workspaces]
+        args,
+        [workspace.code for workspace in workspaces],
+        source_split.manifest,
+        observation_scales,
     )
     resume_path = resolve_resume_path(args, output_dir, run_config)
     is_resume = resume_path is not None
@@ -756,8 +900,9 @@ def train(args):
         full_blocks,
         workspaces,
         strategy,
+        observation_scales=observation_scales,
         grid_size=args.grid_size,
-        n_future_blocks=args.n_future_blocks,
+        state_context_mode=args.state_context,
         seed=args.seed,
     )
     try:
@@ -776,8 +921,8 @@ def train(args):
         scenario_rows = evaluate_fixed_scenarios(
             model,
             fixed_scenarios,
-            grid_size=args.grid_size,
-            n_future_blocks=args.n_future_blocks,
+            observation_scales=observation_scales,
+            state_context_mode=args.state_context,
             workspace_codes=[
                 workspace.code for workspace in workspaces
             ],
@@ -829,8 +974,7 @@ def evaluate_original_csv_row(model, env, n_eval: int = 5) -> dict:
 def export_to_onnx(model, env, onnx_path: str):
     """SB3 모델을 ONNX 형식으로 export (Dict obs 대응, 동적 키).
 
-    관측 키 집합을 하드코딩하지 않고 observation_space에서 읽어오므로,
-    n_future_blocks > 0으로 future_blocks/future_mask가 추가되어도 그대로 export된다.
+    관측 키 집합과 텐서 shape는 observation_space에서 직접 읽는다.
     """
     import inspect
 
@@ -845,11 +989,14 @@ def export_to_onnx(model, env, onnx_path: str):
             "ONNX export는 Dict 관측 공간을 기대합니다 (flat obs 미지원)."
         )
 
-    # 키 순서 고정 (gymnasium Dict는 키를 정렬 순으로 유지 → 결정적).
-    obs_keys = list(obs_space.spaces.keys())
+    obs_keys = sorted(obs_space.spaces)
     dummy_obs = {
-        key: torch.zeros(1, *space.shape, device=policy.device)
-        for key, space in obs_space.spaces.items()
+        key: torch.zeros(
+            1,
+            *obs_space.spaces[key].shape,
+            device=policy.device,
+        )
+        for key in obs_keys
     }
 
     # Actor 네트워크만 export (추론에 필요한 부분)
@@ -865,7 +1012,12 @@ def export_to_onnx(model, env, onnx_path: str):
                 obs_dict, self.policy.pi_features_extractor
             )
             latent_pi = self.policy.mlp_extractor.forward_actor(features)
-            return self.policy.action_net(latent_pi)
+            logits = self.policy.action_net(latent_pi)
+            input_anchor = sum(
+                tensor.flatten(start_dim=1)[:, :1] * 0.0
+                for tensor in obs_tensors
+            )
+            return logits + input_anchor
 
     wrapper = PolicyWrapper(policy, obs_keys)
     wrapper.eval()
@@ -898,6 +1050,10 @@ def export_to_onnx(model, env, onnx_path: str):
     # 검증
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
+    with torch.no_grad():
+        output = wrapper(*dummy_inputs)
+    if not bool(torch.isfinite(output).all().item()):
+        raise ValueError("ONNX actor output must be finite")
     print(f"  ONNX inputs: {[inp.name for inp in onnx_model.graph.input]}")
 
 
@@ -931,8 +1087,13 @@ def main():
                         help="학습률 (learning rate)")
     parser.add_argument("--n-steps", type=int, default=960,
                         help="PPO n_steps (913-block episode 근사, batch 64 배수)")
-    parser.add_argument("--grid-size", type=int, default=64,
-                        help="점유 그리드 해상도 (64 or 128, 메모리에 영향)")
+    parser.add_argument(
+        "--grid-size",
+        type=int,
+        default=GRID_SIZE,
+        choices=[GRID_SIZE],
+        help="fixed observation grid size",
+    )
     parser.add_argument("--batch-size", type=int, default=64,
                         help="미니배치 크기")
     parser.add_argument("--n-epochs", type=int, default=10,
@@ -959,8 +1120,12 @@ def main():
         choices=["structured", "fixed-grid", "candidate-cnn"],
         help="feature extractor ablation mode",
     )
-    parser.add_argument("--n-future-blocks", type=int, default=4,
-                        help="ordered future blocks included in observations")
+    parser.add_argument(
+        "--state-context",
+        default="full",
+        choices=["full", "current"],
+        help="state context ablation mode",
+    )
     parser.add_argument("--features-dim", type=int, default=256,
                         help="policy feature vector dimension")
     parser.add_argument("--device", type=str, default="auto",

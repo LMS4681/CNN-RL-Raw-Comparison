@@ -508,9 +508,7 @@ class CandidateObservationTests(unittest.TestCase):
             in_date=date(2026, 1, 6),
             out_date=date(2026, 1, 30),
         )
-        env = BlockPlacementEnv(
-            [current, future], [workspace], strategy, n_future_blocks=1
-        )
+        env = BlockPlacementEnv([current, future], [workspace], strategy)
         env.reset(seed=0)
         future_indices = env.future_workspace_choice_indices()
         current_state = (
@@ -588,9 +586,7 @@ class CandidateObservationTests(unittest.TestCase):
             ),
             rotation_only_workspace,
         ]
-        env = BlockPlacementEnv(
-            [current, future], workspaces, strategy, n_future_blocks=1
-        )
+        env = BlockPlacementEnv([current, future], workspaces, strategy)
         env.reset(seed=0)
         future_indices = env.future_workspace_choice_indices()
         future_state = (

@@ -11,6 +11,7 @@ from alloc_env.data_loader import (
     select_workspaces,
     select_workspaces_in_order,
 )
+from alloc_env.observation_state import ObservationScales
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.workspace import Workspace
 from train import create_evaluation_env, create_training_env, set_global_seed
@@ -44,16 +45,35 @@ def blocks() -> list[Block]:
     ]
 
 
+def ten_workspaces() -> list[Workspace]:
+    return [workspace(f"PE{index:03d}") for index in range(1, 11)]
+
+
+def observation_scales() -> ObservationScales:
+    return ObservationScales(
+        max_length=500.0,
+        max_breadth=500.0,
+        max_duration=365,
+        base_date=date(2026, 1, 1),
+        date_span_workdays=365,
+        max_workspace_area=250_000.0,
+        total_workspace_area=2_500_000.0,
+        max_workspace_length=500.0,
+        max_workspace_breadth=500.0,
+        dropout_threshold=7,
+    )
+
+
 def make_seeded_training_env(seed: int):
     return create_training_env(
         blocks(),
-        [workspace("PE001"), workspace("PE002")],
+        ten_workspaces(),
         BaseGridStrategy(step=10.0),
         SyntheticBlockGenerator.from_defaults(seed=999),
-        grid_size=32,
+        observation_scales=observation_scales(),
+        grid_size=64,
         n_envs=1,
         vec_env="auto",
-        n_future_blocks=4,
         seed=seed,
     )
 
@@ -79,27 +99,19 @@ class WorkspaceFilteringAndSeedTests(unittest.TestCase):
 
         self.assertEqual(["PE002", "PE003"], [ws.code for ws in selected])
 
-    def test_filtered_environment_has_filtered_shapes(self):
+    def test_production_environment_rejects_filtered_workspace_count(self):
         selected = select_workspaces(
             [workspace("PE001"), workspace("PE002")],
             ["PE002"],
         )
-        env = create_evaluation_env(
-            blocks(),
-            selected,
-            BaseGridStrategy(step=10.0),
-            grid_size=32,
-            n_future_blocks=4,
-            seed=11,
-        )
-        try:
-            obs, _ = env.reset(seed=11)
-        finally:
-            env.close()
-
-        self.assertEqual(1, env.action_space.n)
-        self.assertEqual(1, obs["grids"].shape[0])
-        self.assertEqual(1, obs["ws_meta"].shape[0])
+        with self.assertRaisesRegex(ValueError, "exactly 10 workspaces"):
+            create_evaluation_env(
+                blocks(),
+                selected,
+                BaseGridStrategy(step=10.0),
+                observation_scales=observation_scales(),
+                seed=11,
+            )
 
     def test_same_seed_repeats_synthetic_initial_observation(self):
         first = make_seeded_training_env(seed=123)

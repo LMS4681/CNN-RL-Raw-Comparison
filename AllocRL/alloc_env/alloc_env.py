@@ -73,7 +73,6 @@ class BlockPlacementEnv(gym.Env):
         grid_size: int = GRID_SIZE,
         state_context_mode: str = "full",
         observation_scales: ObservationScales | None = None,
-        n_future_blocks: Optional[int] = None,
     ):
         super().__init__()
 
@@ -98,8 +97,6 @@ class BlockPlacementEnv(gym.Env):
             observation_scales, ObservationScales
         ):
             raise TypeError("observation_scales must be an ObservationScales")
-        # Temporary B5 compatibility only. B7 removes this keyword from callers.
-        del n_future_blocks
         self._state_context_mode = state_context_mode
         if not workspaces:
             raise ValueError("at least one workspace is required")
@@ -235,11 +232,8 @@ class BlockPlacementEnv(gym.Env):
                 raise ValueError(
                     "source blocks exceed observation scales max_duration"
                 )
-            earliest_start = min(block.in_date for block in source_blocks)
-            if scales.base_date > earliest_start:
-                raise ValueError(
-                    "observation scales base_date is later than source blocks"
-                )
+            # Fixed monthly scenarios may begin before the first source row;
+            # temporal encoders intentionally clip those positions to zero.
             latest_start = max(block.in_date for block in source_blocks)
             if (
                 working_day_position(scales.base_date, latest_start)

@@ -13,9 +13,10 @@ from unittest.mock import patch
 
 import numpy as np
 
+import evaluate_baselines as baseline_module
 import train as train_module
 from alloc_env.alloc_env import BlockPlacementEnv
-from alloc_env.alloc_env import DELAY_THRESHOLD
+from alloc_env.alloc_env import DELAY_THRESHOLD, DROPOUT_THRESHOLD
 from alloc_env.block import Block, PrePlacedBlock
 from alloc_env.block_generator import BlockDistribution
 from alloc_env.data_split import (
@@ -25,6 +26,10 @@ from alloc_env.data_split import (
 )
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.simulator import SimulationResult
+from alloc_env.observation_state import (
+    ObservationScales,
+    build_observation_scales,
+)
 from alloc_env.workspace import LotRegion, Workspace
 from evaluation_runner import (
     ModelActionPolicy,
@@ -58,6 +63,21 @@ from train import (
 DATA_DIR = Path(__file__).parent / "data"
 BLOCK_SOURCE_FILENAME = "\ube14\ub85d\ub370\uc774\ud130.csv"
 BLOCK_CSV = DATA_DIR / BLOCK_SOURCE_FILENAME
+
+
+def full_source_scales() -> ObservationScales:
+    return ObservationScales(
+        max_length=100.0,
+        max_breadth=100.0,
+        max_duration=60,
+        base_date=date(2025, 12, 1),
+        date_span_workdays=150,
+        max_workspace_area=10_000.0,
+        total_workspace_area=100_000.0,
+        max_workspace_length=100.0,
+        max_workspace_breadth=100.0,
+        dropout_threshold=7,
+    )
 
 
 def make_workspace(code: str = "PE001") -> Workspace:
@@ -175,7 +195,7 @@ class EvaluationScenarioTests(unittest.TestCase):
             BaseGridStrategy(step=1.0),
             use_synthetic=False,
             grid_size=32,
-            n_future_blocks=2,
+            observation_scales=full_source_scales(),
         )
 
     def test_scenario_json_round_trip_and_materialization(self):
@@ -424,13 +444,13 @@ class EvaluationScenarioTests(unittest.TestCase):
         joined = [" ".join(command) for command in commands]
         self.assertTrue(
             any(
-                "--extractor structured --n-future-blocks 0" in command
+                "--extractor structured --state-context current" in command
                 for command in joined
             )
         )
         self.assertTrue(
             any(
-                "--extractor candidate-cnn --n-future-blocks 4"
+                "--extractor candidate-cnn --state-context full"
                 in command
                 for command in joined
             )
@@ -482,6 +502,65 @@ class EvaluationScenarioTests(unittest.TestCase):
             run_ablation_main()
 
         run.assert_called_once_with(expected, check=True)
+
+    def test_baseline_main_builds_scales_from_full_source_once(self):
+        scenarios = [
+            {
+                "seed": 1000,
+                "source": "holdout_fixed",
+                "blocks": [],
+                "workspaces": [],
+            }
+        ]
+        full_blocks = [object()] * 913
+        workspaces = [object()] * 10
+        scales = full_source_scales()
+        row = {
+            "source": "holdout_fixed20",
+            "policy": "stub",
+            "seed": 1000,
+            "mean_terminal_score": 0.0,
+            "mean_dropout_rate": 0.0,
+            "mean_delay_days": 0.0,
+        }
+
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["evaluate_baselines.py", "--data-dir", "./data"],
+            ),
+            patch.object(
+                baseline_module, "read_scenarios", return_value=scenarios
+            ),
+            patch.object(
+                baseline_module,
+                "load_allocation_scenario",
+                return_value=(full_blocks, workspaces),
+                create=True,
+            ),
+            patch.object(
+                baseline_module,
+                "build_observation_scales",
+                return_value=scales,
+                create=True,
+            ) as build_scales,
+            patch.object(
+                baseline_module,
+                "evaluate_scenarios",
+                return_value=[row],
+            ) as evaluate,
+            patch.object(baseline_module, "write_evaluation_metrics"),
+        ):
+            baseline_module.main()
+
+        build_scales.assert_called_once()
+        self.assertIs(full_blocks, build_scales.call_args.args[0])
+        self.assertIs(workspaces, build_scales.call_args.args[1])
+        self.assertEqual(2, evaluate.call_count)
+        for call in evaluate.call_args_list:
+            self.assertIs(scales, call.kwargs["observation_scales"])
+            self.assertEqual("full", call.kwargs["state_context_mode"])
 
     def test_retained_choice_ratio(self):
         self.assertEqual(1.0, compute_retained_choice_ratio(0, 0))
@@ -661,26 +740,64 @@ class EvaluationScenarioTests(unittest.TestCase):
         scenarios = generate_scenarios(
             distribution=BlockDistribution.from_defaults(),
             workspaces=[
-                make_plain_workspace("PE001", 30.0, 30.0),
-                make_plain_workspace("PE002", 100.0, 100.0),
+                make_plain_workspace(f"PE{index:03d}", 100.0, 100.0)
+                for index in range(1, 11)
             ],
             seeds=[150],
             n_blocks=3,
             base_date=date(2026, 1, 5),
             spread_days=5,
+            vary_layout=False,
         )
 
         rows = train_module.evaluate_fixed_scenarios(
             FirstValidModel(),
             scenarios,
-            grid_size=32,
-            n_future_blocks=2,
+            observation_scales=full_source_scales(),
+            state_context_mode="full",
         )
 
         self.assertEqual(1, len(rows))
         self.assertEqual(150, rows[0]["seed"])
         self.assertIn("mean_terminal_score", rows[0])
         self.assertIn("mean_retained_choice_ratio", rows[0])
+
+    def test_real_fixed_scenario_resets_with_exact_full_source_scales(self):
+        strategy = BaseGridStrategy(step=5.0)
+        workspace_codes = parse_workspace_codes(
+            DEFAULT_ACTIVE_WORKSPACE_CODES
+        )
+        full_blocks, source_workspaces = load_allocation_scenario(
+            DATA_DIR, strategy, workspace_codes
+        )
+        scales = build_observation_scales(
+            full_blocks, source_workspaces, DROPOUT_THRESHOLD
+        )
+        scenario = read_scenarios(
+            DATA_DIR / "fixed_eval_scenarios.json"
+        )[0]
+        scenario_strategy = BaseGridStrategy(step=5.0)
+        blocks, workspaces = materialize_scenario(
+            scenario, scenario_strategy
+        )
+        from alloc_env.data_loader import select_workspaces_in_order
+
+        ordered = select_workspaces_in_order(workspaces, workspace_codes)
+        env = train_module.create_evaluation_env(
+            blocks,
+            ordered,
+            scenario_strategy,
+            observation_scales=scales,
+            state_context_mode="full",
+            seed=int(scenario["seed"]),
+        )
+        try:
+            observation, _ = env.reset()
+        finally:
+            env.close()
+
+        self.assertIs(scales, env.unwrapped._observation_scales)
+        self.assertTrue(env.observation_space.contains(observation))
 
     def test_shared_scenarios_create_and_close_env_and_policy_per_seed(self):
         scenarios = [
@@ -689,6 +806,7 @@ class EvaluationScenarioTests(unittest.TestCase):
         ]
         envs = [CountingEvaluationEnv(), CountingEvaluationEnv()]
         policies = []
+        scales = full_source_scales()
 
         def policy_factory(seed):
             policy = FirstValidPolicy()
@@ -704,9 +822,9 @@ class EvaluationScenarioTests(unittest.TestCase):
             rows = evaluate_scenarios(
                 policy_factory,
                 scenarios,
-                grid_size=32,
-                n_future_blocks=2,
                 workspace_codes=["PE001"],
+                observation_scales=scales,
+                state_context_mode="current",
             )
 
         self.assertEqual([11, 12], [row["seed"] for row in rows])
@@ -719,6 +837,10 @@ class EvaluationScenarioTests(unittest.TestCase):
             [row["source"] for row in rows],
         )
         self.assertEqual(2, create_env.call_count)
+        for call in create_env.call_args_list:
+            self.assertEqual(64, call.kwargs["grid_size"])
+            self.assertIs(scales, call.kwargs["observation_scales"])
+            self.assertEqual("current", call.kwargs["state_context_mode"])
         self.assertIsNot(policies[0], policies[1])
         self.assertEqual([1, 1], [env.reset_count for env in envs])
         self.assertEqual([1, 1], [env.close_count for env in envs])
@@ -731,6 +853,7 @@ class EvaluationScenarioTests(unittest.TestCase):
             "workspaces": [],
         }
         env = CountingEvaluationEnv()
+        scales = full_source_scales()
 
         with (
             patch("evaluation_runner.materialize_scenario", return_value=([], [])),
@@ -743,9 +866,8 @@ class EvaluationScenarioTests(unittest.TestCase):
                     RuntimeError("factory failed")
                 ),
                 [scenario],
-                grid_size=32,
-                n_future_blocks=2,
                 workspace_codes=None,
+                observation_scales=scales,
             )
 
         self.assertEqual(1, env.close_count)

@@ -420,17 +420,24 @@ class RlRegressionTests(unittest.TestCase):
             make_block("CSV-001", date(2026, 1, 5)),
             make_block("CSV-002", date(2026, 1, 6)),
         ]
+        workspaces = [make_sized_workspace(100.0, 80.0) for _ in range(10)]
+        for index, workspace in enumerate(workspaces):
+            workspace.code = f"PE{index + 1:03d}"
 
         env = create_evaluation_env(
             blocks,
-            [make_workspace()],
+            workspaces,
             BaseGridStrategy(step=10.0),
-            grid_size=32,
+            observation_scales=fixture_observation_scales(),
+            grid_size=64,
         )
-        env.reset()
+        try:
+            env.reset()
 
-        self.assertFalse(env.unwrapped._use_synthetic)
-        self.assertEqual("CSV-001", env.unwrapped._blocks[0].name)
+            self.assertFalse(env.unwrapped._use_synthetic)
+            self.assertEqual("CSV-001", env.unwrapped._blocks[0].name)
+        finally:
+            env.close()
 
     def test_resolved_rewards_conserve_terminal_score(self):
         blocks = [

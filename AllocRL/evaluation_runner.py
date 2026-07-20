@@ -10,6 +10,7 @@ import numpy as np
 
 from alloc_env.alloc_env import DELAY_THRESHOLD
 from alloc_env.data_loader import select_workspaces_in_order
+from alloc_env.observation_state import GRID_SIZE, ObservationScales
 from alloc_env.simulator import SimulationResult
 from alloc_env.strategy import BaseGridStrategy
 from baseline_policies import ActionPolicy
@@ -123,9 +124,9 @@ def evaluate_policy(
 def evaluate_scenarios(
     policy_factory: Callable[[int], ActionPolicy],
     scenarios: list[dict],
-    grid_size: int,
-    n_future_blocks: int,
     workspace_codes: list[str] | None,
+    observation_scales: ObservationScales,
+    state_context_mode: str = "full",
 ) -> list[dict]:
     from train import create_evaluation_env
 
@@ -139,8 +140,9 @@ def evaluate_scenarios(
             blocks=blocks,
             workspaces=ordered,
             strategy=strategy,
-            grid_size=grid_size,
-            n_future_blocks=n_future_blocks,
+            grid_size=GRID_SIZE,
+            state_context_mode=state_context_mode,
+            observation_scales=observation_scales,
             seed=seed,
         )
         try:
