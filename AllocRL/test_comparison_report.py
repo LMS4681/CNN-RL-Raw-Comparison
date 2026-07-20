@@ -193,3 +193,26 @@ def test_dynamic_timings_fallback_and_partial_failure_safety(tmp_path):
     assert "17.0" in text and "fallback 사유: 자료 없음" in text and "10,800" not in text
     with pytest.raises(ValueError, match="replacement"):
         write_partial_report(tmp_path, "bad\ufffdfailure")
+
+
+def test_optional_curve_logs_are_strict_and_loss_is_rendered(tmp_path):
+    from comparison.report_builder import write_complete_report
+    write_complete_fixture(tmp_path)
+    (tmp_path / "raw_direct" / "loss_log.csv").write_text("bad\n1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="loss_log"):
+        write_complete_report(tmp_path)
+    (tmp_path / "raw_direct" / "loss_log.csv").write_text("timestep,policy_gradient_loss,value_loss,entropy_loss,approx_kl,clip_fraction,loss,explained_variance,cnn_gradient_norm,cnn_weight_change,workspace_feature_variance,candidate_channel_sensitivity\n10000,,,,,,0.1,,,,,\n", encoding="utf-8")
+    write_complete_report(tmp_path)
+    assert (tmp_path / "comparison" / "learning_curves.png").stat().st_size > 0
+
+
+def test_plots_close_figures_when_save_fails(tmp_path, monkeypatch):
+    import matplotlib.pyplot as plt
+    from comparison import report_builder
+    write_complete_fixture(tmp_path)
+    summary = report_builder.build_comparison_summary(tmp_path); pairs = report_builder.build_paired_differences(tmp_path)
+    before = set(plt.get_fignums())
+    monkeypatch.setattr(report_builder.Figure, "savefig", lambda *_a, **_k: (_ for _ in ()).throw(OSError("save")))
+    with pytest.raises(OSError): report_builder._learning_plot(tmp_path, tmp_path / "x.png")
+    with pytest.raises(OSError): report_builder._holdout_plot(summary, pairs, tmp_path / "x.png")
+    assert set(plt.get_fignums()) == before

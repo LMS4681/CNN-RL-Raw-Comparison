@@ -7,6 +7,7 @@ import html
 import json
 import math
 import re
+import warnings
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -14,6 +15,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 
 from comparison.artifact_manifest import REQUIRED_ENVIRONMENT_KEYS
 from comparison.checkpoint_evaluator import ARMS, EVALUATION_COLUMNS, PRIMARY_TEST_SEEDS, SELECTION_SEEDS
@@ -26,6 +28,9 @@ PAIR_COLUMNS = (
     "seed", "terminal_score_delta_cnn_minus_raw", "dropout_rate_delta_cnn_minus_raw",
     "mean_delay_days_delta_cnn_minus_raw", "delayed_count_delta_cnn_minus_raw",
 )
+TRAINING_LOG_COLUMNS = ("episode", "timestep", "resolved_reward", "terminal_residual", "terminal_score", "episode_reward", "delayed_count", "dropout_count", "total_delay_days", "success_rate")
+LOSS_LOG_COLUMNS = ("timestep", "policy_gradient_loss", "value_loss", "entropy_loss", "approx_kl", "clip_fraction", "loss", "explained_variance", "cnn_gradient_norm", "cnn_weight_change", "workspace_feature_variance", "candidate_channel_sensitivity")
+PROGRESS_TIMING_COLUMNS = ("generation", "timestep", "recorded_training_seconds", "updated_at_utc", "status", "checkpoint_file")
 MISSING = "자료 없음"
 RUNTIME_FIELDS = (
     "target_training_seconds", "recorded_training_seconds", "end_to_end_training_seconds",
@@ -313,27 +318,43 @@ def _cell(value: Any) -> str:
     return MISSING if value is None else str(value)
 
 
+def _curve_rows(path: Path, columns: tuple[str, ...], name: str) -> list[dict[str, str]] | None:
+    if not path.is_file(): return None
+    with path.open(encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if tuple(reader.fieldnames or ()) != columns: raise ValueError(f"{name} has incompatible header")
+        rows = list(reader)
+    prior = -1
+    for row in rows:
+        if set(row) != set(columns): raise ValueError(f"{name} has malformed row")
+        if not row["timestep"].isdigit() or int(row["timestep"]) < prior: raise ValueError(f"{name} timestep is invalid")
+        prior = int(row["timestep"])
+        for key, value in row.items():
+            if key in {"updated_at_utc", "status", "checkpoint_file"} or value == "": continue
+            _csv_number(value, f"{name}.{key}")
+        if name == "progress_timing" and (not row["generation"].isdigit() or row["status"] not in {"running", "complete"}): raise ValueError("progress_timing row is invalid")
+    return rows
+
+
 def _learning_plot(root: Path, output: Path) -> None:
-    figure, axes = plt.subplots(1, 2, figsize=(12, 4))
-    for arm, label in (("raw_direct", "raw-direct"), ("candidate_cnn", "candidate-CNN")):
-        path = root / arm / "training_log.csv"
-        if path.is_file():
-            with path.open(encoding="utf-8", newline="") as stream:
-                rows = list(csv.DictReader(stream))
-            if rows and {"timestep", "terminal_score"} <= set(rows[0]):
-                axes[0].plot([_csv_number(row["timestep"], "timestep") for row in rows], [_csv_number(row["terminal_score"], "terminal_score") for row in rows], label=label)
-        progress = root / arm / "progress_timing.csv"
-        if progress.is_file():
-            with progress.open(encoding="utf-8", newline="") as stream:
-                rows = list(csv.DictReader(stream))
-            if rows and {"recorded_training_seconds", "timestep"} <= set(rows[0]):
-                axes[1].plot([_csv_number(row["recorded_training_seconds"], "recorded_training_seconds") for row in rows], [_csv_number(row["timestep"], "timestep") for row in rows], label=label)
-    axes[0].set(title="Episode terminal score", xlabel="timestep", ylabel="score")
-    axes[1].set(title="Checkpoint progress", xlabel="recorded subprocess seconds", ylabel="timestep")
-    for axis in axes:
-        if axis.lines: axis.legend()
-        else: axis.text(.5, .5, MISSING, ha="center", va="center", transform=axis.transAxes)
-    figure.tight_layout(); figure.savefig(output, dpi=150); plt.close(figure)
+    figure, axes = plt.subplots(1, 3, figsize=(15, 4))
+    try:
+        for arm, label in (("raw_direct", "raw-direct"), ("candidate_cnn", "candidate-CNN")):
+            training = _curve_rows(root / arm / "training_log.csv", TRAINING_LOG_COLUMNS, "training_log")
+            progress = _curve_rows(root / arm / "progress_timing.csv", PROGRESS_TIMING_COLUMNS, "progress_timing")
+            loss = _curve_rows(root / arm / "loss_log.csv", LOSS_LOG_COLUMNS, "loss_log")
+            if training: axes[0].plot([float(r["timestep"]) for r in training], [float(r["terminal_score"]) for r in training], label=label)
+            if progress: axes[1].plot([float(r["recorded_training_seconds"]) for r in progress], [float(r["timestep"]) for r in progress], label=label)
+            if loss: axes[2].plot([float(r["timestep"]) for r in loss if r["loss"]], [float(r["loss"]) for r in loss if r["loss"]], label=label)
+        for axis, title, x, y in zip(axes, ("Episode terminal score", "Checkpoint progress", "Training loss"), ("timestep", "recorded subprocess seconds", "timestep"), ("score", "timestep", "loss")):
+            axis.set(title=title, xlabel=x, ylabel=y)
+            if axis.lines: axis.legend()
+            else: axis.text(.5, .5, MISSING, ha="center", va="center", transform=axis.transAxes)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Glyph .* missing from font")
+            figure.tight_layout(); figure.savefig(output, dpi=150)
+    finally:
+        plt.close(figure)
 
 
 def _holdout_plot(summary: Mapping[str, Any], pairs: list[dict], output: Path) -> None:
@@ -343,7 +364,8 @@ def _holdout_plot(summary: Mapping[str, Any], pairs: list[dict], output: Path) -
     axes[0].set(title="Primary test terminal score (15 paired scenarios)", ylabel="score")
     axes[1].bar([str(row["seed"]) for row in pairs], [row["terminal_score_delta_cnn_minus_raw"] for row in pairs])
     axes[1].axhline(0, color="black", linewidth=.8); axes[1].set(title="CNN minus raw paired terminal-score difference", xlabel="scenario seed", ylabel="delta")
-    figure.tight_layout(); figure.savefig(output, dpi=150); plt.close(figure)
+    try: figure.tight_layout(); figure.savefig(output, dpi=150)
+    finally: plt.close(figure)
 
 
 def _report_text(summary: Mapping[str, Any], pairs: list[dict]) -> str:
