@@ -60,10 +60,19 @@ def test_notebook_clones_only_the_pinned_public_tag_into_the_exact_safe_path():
 
 def test_notebook_installs_hashed_lock_without_mutating_colab_torch_stack():
     *_, install, _, _, _ = code_cells(load_notebook())
+    assert install.startswith("import json\n")
     assert "requirements-comparison.txt" in install and "--require-hashes" in install
     assert '"pip", "check"' in install
-    assert all(term in install for term in ("before_torch", "torch.__version__", "torch.__file__", "torch.cuda.is_available()", "torch.version.cuda"))
+    assert "def child_torch_snapshot" in install
+    assert "sys.executable" in install and '"-c"' in install and "json.loads" in install
+    assert all(term in install for term in (
+        "torch.__version__", "torch.__file__", "torch.cuda.is_available()",
+        "torch.version.cuda", "torch.backends.cudnn.version()", "importlib.metadata",
+        "before_torch", "after_torch", "before_distributions", "after_distributions",
+    ))
+    assert "import torch as torch_after" not in install
     assert "assert after_torch == before_torch" in install
+    assert "assert after_distributions == before_distributions" in install
     assert "check=True" in install
 
 
@@ -86,10 +95,16 @@ def test_notebook_runs_one_exact_runner_command_and_honestly_reports_completion(
     assert "python -m comparison.experiment_runner" in runner
     assert "--config ./configs/overnight_seed0.json" in runner
     assert "--output-root /content/drive/MyDrive/CNN-RL-comparison/overnight-20260721" in runner
+    assert "--take-over-stale-lease" in runner
     assert "check=True" in runner
+    assert "runner_error = None" in runner
+    assert "except subprocess.CalledProcessError as error" in runner
+    assert "runner_error = error" in runner
     assert "COMPLETE.json" in status and "preliminary_comparison_ko.md" in status
     assert "PARTIAL_REPORT.md" in status
-    assert "python -m comparison.experiment_runner --config ./configs/overnight_seed0.json --output-root /content/drive/MyDrive/CNN-RL-comparison/overnight-20260721" in status
+    assert "--take-over-stale-lease" in status
+    assert "runner_error is not None" in status and "raise RuntimeError" in status
+    assert status.index("display(") < status.index("if runner_error is not None")
 
 
 def test_direct_requirements_are_exact_and_lock_is_hashed_without_colab_gpu_packages():
@@ -102,7 +117,11 @@ def test_direct_requirements_are_exact_and_lock_is_hashed_without_colab_gpu_pack
     lock = (ALLOC_RL / "requirements-comparison.txt").read_text(encoding="utf-8")
     blocks = re.findall(r"(?ms)^[a-z0-9][a-z0-9-]+==.*?(?=^[a-z0-9][a-z0-9-]+==|\Z)", lock)
     assert blocks and all("--hash=sha256:" in block for block in blocks)
-    assert not re.search(r"^(?:torch|triton|nvidia-[a-z0-9-]+)==", lock, re.MULTILINE)
+    assert not re.search(
+        r"^(?:torch|triton|nvidia-[a-z0-9-]+|cuda-[a-z0-9-]+|filelock|fsspec|jinja2|networkx|sympy|mpmath)==",
+        lock,
+        re.MULTILINE,
+    )
     for pin in ("gymnasium==1.3.0", "stable-baselines3==2.9.0", "sb3-contrib==2.9.0"):
         assert pin in lock
 
@@ -113,6 +132,7 @@ def test_operator_docs_bind_the_lock_and_disclose_colab_limitations():
         "one gpu colab notebook", "run all once", "keep the browser tab/runtime active",
         "6 hours plus setup/eval", "drive is authoritative", "rerun all to resume",
         "300 seconds plus the current callback interval", "cannot guarantee uninterrupted completion",
+        "more than 15 minutes old", "guarded stale takeover",
     ))
     provenance = (REPOSITORY_ROOT / "UPSTREAM_BASELINE.md").read_text(encoding="utf-8")
     lock = (ALLOC_RL / "requirements-comparison.txt").read_bytes()
