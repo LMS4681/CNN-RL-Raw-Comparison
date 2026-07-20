@@ -192,7 +192,7 @@ def test_malformed_lease_json_fails_closed_without_root_mutation(tmp_path: Path,
 def test_valid_released_lease_reacquires_immediately_and_active_foreign_boot_needs_takeover(tmp_path: Path):
     from comparison.experiment_runner import LeaseError, _Lease, atomic_write_json
 
-    payload = {"token": "released-token", "pid": 1, "boot_id": "other-boot", "heartbeat_utc": "2026-01-01T00:00:00Z", "heartbeat_monotonic": 0.0, "status": "released"}
+    payload = {"token": "released-token", "pid": 1, "boot_id": "other-boot", "heartbeat_utc": "1970-01-01T00:00:00Z", "heartbeat_monotonic": 0.0, "status": "released"}
     atomic_write_json(tmp_path / "lease.json", payload); (tmp_path / ".lease.acquire").write_text("released-token\n", encoding="utf-8")
     with _Lease(tmp_path, stale_takeover=False, clock=lambda: 0.0, wall_time=lambda: 0.0, interval=999) as lease:
         assert lease.acquired
@@ -709,6 +709,11 @@ def _public_harness():
     return calls, {stage: (lambda stage=stage: calls.append(stage)) for stage in JOURNAL_STAGES}, {stage: (lambda stage=stage: f"{JOURNAL_STAGES.index(stage):064x}") for stage in JOURNAL_STAGES}
 
 
+def _capture(errors: list[BaseException], action) -> None:
+    try: action()
+    except BaseException as error: errors.append(error)
+
+
 def test_public_harness_interrupt_retries_only_interrupted_and_downstream(tmp_path: Path):
     from comparison.experiment_runner import ExperimentConfig, JOURNAL_STAGES, run_overnight_experiment
     calls, actions, hashers = _public_harness(); actions["train_raw_direct"] = lambda: (_ for _ in ()).throw(KeyboardInterrupt())
@@ -838,7 +843,7 @@ def test_public_marker_has_exact_provenance_and_stage_hash_schema(tmp_path: Path
     from comparison.experiment_runner import ExperimentConfig, JOURNAL_STAGES, REQUIRED_COMPLETE_STAGES, run_overnight_experiment
     calls, actions, hashers = _public_harness(); run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
     marker = json.loads((tmp_path / "COMPLETE.json").read_text(encoding="utf-8"))
-    assert set(marker) == {"schema_version", "status", "stages", "config_sha256", "baseline_sha256", "scenario_sha256", "split_sha256", "lock_sha256", "comparison_git_sha", "manifest_sha256", "environment_sha256", "stage_output_sha256", "report_artifact_sha256", "completed_at_utc"}
+    assert set(marker) == {"schema_version", "status", "stages", "config_sha256", "baseline_sha256", "scenario_sha256", "split_sha256", "lock_sha256", "comparison_git_sha", "manifest_sha256", "environment_sha256", "stage_output_sha256", "report_artifact_sha256", "completed_at_utc", "lease_token"}
     assert marker["schema_version"] == 1 and marker["status"] == "complete" and marker["stages"] == REQUIRED_COMPLETE_STAGES
     assert marker["stage_output_sha256"] == {stage: hashers[stage]() for stage in JOURNAL_STAGES}
 
@@ -952,3 +957,160 @@ def test_live_lease_refusal_preserves_existing_complete_and_root_bytes(tmp_path:
     (tmp_path / ".lease.acquire").write_text("owner\n", encoding="utf-8"); before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
     with pytest.raises(LeaseError): run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
     assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+def test_active_foreign_windows_fallback_lease_needs_proven_stale_wall_heartbeat(tmp_path: Path):
+    from comparison.experiment_runner import LeaseError, _Lease, atomic_write_json
+
+    payload = {"token": "owner", "pid": 2, "boot_id": "process-2", "heartbeat_utc": "1970-01-01T00:01:30Z", "heartbeat_monotonic": 0.0, "status": "active"}
+    atomic_write_json(tmp_path / "lease.json", payload); (tmp_path / ".lease.acquire").write_text("owner\n", encoding="utf-8")
+    with pytest.raises(LeaseError, match="live"):
+        with _Lease(tmp_path, stale_takeover=True, clock=lambda: 10_000.0, wall_time=lambda: 100.0, stale_after=20, interval=999):
+            pass
+
+
+def test_public_marker_is_published_while_first_runner_still_owns_lease(tmp_path: Path, monkeypatch):
+    from comparison import experiment_runner as runner_module
+
+    entered, release, errors = threading.Event(), threading.Event(), []
+    original = runner_module._Runner._complete_marker
+    def paused_marker(self):
+        entered.set(); assert release.wait(2)
+        return original(self)
+    monkeypatch.setattr(runner_module._Runner, "_complete_marker", paused_marker)
+    calls, actions, hashers = _public_harness()
+    worker = threading.Thread(target=lambda: _capture(errors, lambda: runner_module.run_overnight_experiment(runner_module.ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)), daemon=True)
+    worker.start(); assert entered.wait(2)
+    with pytest.raises(runner_module.LeaseError):
+        with runner_module._Lease(tmp_path, stale_takeover=False, clock=time.monotonic, wall_time=time.time, interval=999):
+            pass
+    release.set(); worker.join(2)
+    assert not errors and json.loads((tmp_path / "COMPLETE.json").read_text(encoding="utf-8"))["lease_token"] == json.loads((tmp_path / "lease.json").read_text(encoding="utf-8"))["token"]
+
+
+def test_late_lease_heartbeat_failure_refuses_complete_marker(tmp_path: Path, monkeypatch):
+    from comparison import experiment_runner as runner_module
+
+    original = runner_module._Runner._complete_marker
+    def fail_late(self):
+        self.lease.failure = runner_module.LeaseError("late heartbeat")
+        return original(self)
+    monkeypatch.setattr(runner_module._Runner, "_complete_marker", fail_late)
+    calls, actions, hashers = _public_harness()
+    with pytest.raises(runner_module.LeaseError, match="late heartbeat"):
+        runner_module.run_overnight_experiment(runner_module.ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    assert not (tmp_path / "COMPLETE.json").exists()
+
+
+def test_failure_cleanup_never_removes_newer_complete_marker(tmp_path: Path):
+    from comparison.experiment_runner import _remove_owned_complete_marker
+
+    marker = tmp_path / "COMPLETE.json"; marker.write_text('{"lease_token":"new-owner"}', encoding="utf-8")
+    _remove_owned_complete_marker(marker, "old-owner")
+    assert marker.read_text(encoding="utf-8") == '{"lease_token":"new-owner"}'
+
+
+def test_run_stage_marks_blocking_action_failed_when_heartbeat_fails_before_completion(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, ExperimentStageError, _Runner
+
+    runner = _Runner(ExperimentConfig.for_test(), tmp_path, subprocess_runner=lambda *args, **kwargs: None, clock=lambda: 0, python_executable=None, archive_timestep_reader=None, output_hasher=lambda _: "a" * 64)
+    runner.lease = type("Lease", (), {"failure": None})()
+    def block_then_fail(): runner.lease.failure = RuntimeError("refresh failed")
+    with pytest.raises(ExperimentStageError, match="heartbeat"):
+        runner.run_stage("smoke_raw_direct", block_then_fail)
+    assert runner.journal()["smoke_raw_direct"]["status"] == "failed"
+
+
+def test_integrity_output_hash_revalidates_environment_segments_before_skip(tmp_path: Path, monkeypatch):
+    from comparison import experiment_runner as runner_module
+
+    _, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner, "_state_complete", lambda *args: True)
+    monkeypatch.setattr(runner_module, "_validate_checkpoint_manifest", lambda *args: None)
+    monkeypatch.setattr(runner_module, "_validate_report_artifacts", lambda *args: {"summary.json": "a" * 64})
+    runner.integrity()
+    (runner.root / "raw_direct" / "environment_segments.jsonl").write_text(json.dumps(environment | {"vm_boot_id": "tampered"}) + "\n", encoding="utf-8")
+    with pytest.raises(runner_module.ExperimentIntegrityError):
+        runner.output_hash("integrity_verification")
+
+
+def test_existing_journal_requires_every_stage_key(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, ExperimentIntegrityError, _Runner
+
+    (tmp_path / "stage_journal.json").write_text("{}", encoding="utf-8")
+    runner = _Runner(ExperimentConfig.for_test(), tmp_path, subprocess_runner=lambda *args, **kwargs: None, clock=lambda: 0, python_executable=None, archive_timestep_reader=None)
+    with pytest.raises(ExperimentIntegrityError, match="exact"):
+        runner.journal()
+
+
+@pytest.mark.parametrize("relative", ["config.json", "environment.json", "manifest.json", "stage_journal.json", "COMPLETE.json"])
+def test_json_loader_rejects_duplicate_keys_for_every_root_artifact(tmp_path: Path, relative: str):
+    from comparison.experiment_runner import _json
+
+    path = tmp_path / relative; path.write_text('{"key":1,"key":2}', encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid JSON"):
+        _json(path)
+
+
+def test_root_manifest_rejects_extra_key_but_accepts_task4_atomic_format(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import ExperimentIntegrityError, _validate_root_manifest
+
+    _, runner, manifest, environment = _integrity_fixture(tmp_path, monkeypatch)
+    _validate_root_manifest(json.loads((runner.root / "manifest.json").read_text(encoding="utf-8")), runner.provenance(), environment)
+    manifest["extra"] = True
+    with pytest.raises(ExperimentIntegrityError, match="schema"):
+        _validate_root_manifest(manifest, runner.provenance(), environment)
+
+
+@pytest.mark.parametrize("timestamp", ["2026-01-01T00:00:00", "2026-01-01T00:00:00+09:00", "bad"])
+def test_root_environment_rejects_naive_non_utc_or_invalid_capture_timestamp(tmp_path: Path, monkeypatch, timestamp: str):
+    from comparison.experiment_runner import ExperimentIntegrityError, _validate_root_environment
+
+    _, runner = _preflight_runner(tmp_path, monkeypatch); provenance = runner.provenance()
+    with pytest.raises(ExperimentIntegrityError, match="captured_at_utc"):
+        _validate_root_environment(_valid_root_environment(provenance, command=runner.runner_command) | {"captured_at_utc": timestamp}, provenance, production_loaded=False)
+
+
+def test_root_environment_accepts_task3_plus_zero_zero_capture_timestamp(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import _validate_root_environment
+
+    _, runner = _preflight_runner(tmp_path, monkeypatch); provenance = runner.provenance()
+    _validate_root_environment(_valid_root_environment(provenance, command=runner.runner_command) | {"captured_at_utc": "2026-01-01T00:00:00+00:00"}, provenance, production_loaded=False)
+
+
+@pytest.mark.parametrize("status,field,value", [
+    ("pending", "error", "unexpected"),
+    ("failed", "error", None),
+    ("interrupted", "output_sha256", "a" * 64),
+    ("complete", "completed_at_utc", "2026-01-01T00:00:00"),
+    ("complete", "completed_at_utc", "2025-01-01T00:00:00Z"),
+])
+def test_journal_rejects_noncanonical_pending_terminal_or_timestamp_shapes(tmp_path: Path, status: str, field: str, value: object):
+    from comparison.experiment_runner import ExperimentConfig, ExperimentIntegrityError, JOURNAL_STAGES, _Runner, _journal_entry
+
+    entry = _journal_entry(status, input_sha256="a" * 64, output_sha256="a" * 64, started_at_utc="2026-01-01T00:00:00Z", completed_at_utc="2026-01-01T00:00:01Z", error=None)
+    if status == "pending": entry = _journal_entry()
+    if status in {"failed", "interrupted"}: entry = _journal_entry(status, input_sha256="a" * 64, started_at_utc="2026-01-01T00:00:00Z", completed_at_utc="2026-01-01T00:00:01Z", error="stop")
+    entry[field] = value
+    (tmp_path / "stage_journal.json").write_text(json.dumps({stage: dict(entry) for stage in JOURNAL_STAGES}), encoding="utf-8")
+    runner = _Runner(ExperimentConfig.for_test(), tmp_path, subprocess_runner=lambda *args, **kwargs: None, clock=lambda: 0, python_executable=None, archive_timestep_reader=None)
+    with pytest.raises(ExperimentIntegrityError, match="invalid stage journal"):
+        runner.journal()
+
+
+@pytest.mark.parametrize("mutation", ["tamper", "delete"])
+def test_complete_marker_revalidates_environment_segments_after_integrity_stage(tmp_path: Path, monkeypatch, mutation: str):
+    from comparison import experiment_runner as runner_module
+
+    _, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner, "_state_complete", lambda *args: True)
+    monkeypatch.setattr(runner_module, "_validate_checkpoint_manifest", lambda *args: None)
+    monkeypatch.setattr(runner_module, "_validate_report_artifacts", lambda *args: {"summary.json": "a" * 64})
+    runner.integrity()
+    runner.lease = type("Lease", (), {"token": "runner-token"})()
+    runner._verify_completion_journal = lambda: {stage: {"output_sha256": "a" * 64} for stage in runner_module.JOURNAL_STAGES}
+    segment = runner.root / "candidate_cnn" / "environment_segments.jsonl"
+    if mutation == "tamper": segment.write_text(json.dumps(environment | {"torch_version": "tampered"}) + "\n", encoding="utf-8")
+    else: segment.unlink()
+    with pytest.raises(runner_module.ExperimentIntegrityError):
+        runner._complete_marker()

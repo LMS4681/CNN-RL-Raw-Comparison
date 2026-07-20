@@ -71,9 +71,15 @@ def _canonical(payload: Mapping[str, Any]) -> bytes:
 
 
 def _json(path: Path) -> dict[str, Any]:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result: raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
         raise ValueError(f"invalid JSON: {path}") from error
     if not isinstance(value, dict): raise ValueError(f"JSON object required: {path}")
     return value
@@ -85,6 +91,14 @@ def _valid_number(value: Any) -> bool:
 
 def _nonempty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _utc_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str): return None
+    try: parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError: return None
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed): return None
+    return parsed
 
 
 def _validate_root_environment(
@@ -116,6 +130,8 @@ def _validate_root_environment(
     for key in ("captured_at_utc", "python_version", "platform", "vm_boot_id", "torch_version"):
         if not _nonempty_string(environment[key]):
             raise ExperimentIntegrityError(f"root environment type mismatch: {key}")
+    if _utc_datetime(environment["captured_at_utc"]) is None:
+        raise ExperimentIntegrityError("root environment type mismatch: captured_at_utc")
     if environment["cuda_version"] is not None and not _nonempty_string(environment["cuda_version"]):
         raise ExperimentIntegrityError("root environment type mismatch: cuda_version")
     if (environment["cudnn_version"] is not None
@@ -145,7 +161,8 @@ def _validate_root_manifest(
     provenance: Mapping[str, str],
     environment: Mapping[str, Any],
 ) -> None:
-    if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 1:
+    manifest_keys = {"schema_version", *provenance, "comparison_git_sha", "comparison_git_dirty", "checkpoints"}
+    if not isinstance(manifest, Mapping) or set(manifest) != manifest_keys or manifest.get("schema_version") != 1:
         raise ExperimentIntegrityError("root manifest schema differs")
     for key, value in provenance.items():
         if manifest.get(key) != value:
@@ -465,13 +482,21 @@ class _Lease(AbstractContextManager["_Lease"]):
         self.path=root/"lease.json"; self.sentinel=root/".lease.acquire"; self.stale_takeover=stale_takeover; self.clock=clock; self.wall_time=wall_time; self.interval=interval; self.stale_after=stale_after; self.token=uuid.uuid4().hex; self.stop=threading.Event(); self.thread: threading.Thread | None=None; self.acquired=False; self.failure: BaseException | None=None
     def _payload(self, status: str) -> dict[str, Any]: return {"token": self.token, "pid": os.getpid(), "boot_id": _boot_id(), "heartbeat_utc": _utc(), "heartbeat_monotonic": self.clock(), "status": status}
     def _read_prior(self) -> dict[str, Any]:
-        try: payload = _strict_json_line(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error: raise LeaseError("invalid lease.json") from error
+        error: BaseException | None = None
+        for attempt in range(3):
+            try:
+                payload = _strict_json_line(self.path.read_text(encoding="utf-8"))
+                break
+            except PermissionError as caught:
+                error = caught
+                if attempt < 2: time.sleep(.001); continue
+                raise LeaseError("invalid lease.json") from caught
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as caught:
+                raise LeaseError("invalid lease.json") from caught
+        else: raise LeaseError("invalid lease.json") from error
         if set(payload) != self._KEYS or not _nonempty_string(payload["token"]) or not isinstance(payload["pid"], int) or isinstance(payload["pid"], bool) or payload["pid"] <= 0 or not _nonempty_string(payload["boot_id"]) or not isinstance(payload["status"], str) or payload["status"] not in {"active", "released"} or not _valid_number(payload["heartbeat_monotonic"]) or float(payload["heartbeat_monotonic"]) < 0 or float(payload["heartbeat_monotonic"]) > self.clock():
             raise LeaseError("invalid lease.json")
-        try: valid_time = isinstance(payload["heartbeat_utc"], str) and datetime.fromisoformat(payload["heartbeat_utc"].replace("Z", "+00:00")).tzinfo is not None
-        except ValueError: valid_time = False
-        if not valid_time: raise LeaseError("invalid lease.json")
+        if _utc_datetime(payload["heartbeat_utc"]) is None: raise LeaseError("invalid lease.json")
         return payload
     def _snapshot_sentinel(self) -> tuple[bytes, int, int]:
         try:
@@ -493,6 +518,12 @@ class _Lease(AbstractContextManager["_Lease"]):
         if self.path.exists() and self._read_prior().get("token") != self.token:
             raise LeaseError("lease ownership token changed")
         atomic_write_json(self.path, self._payload(status))
+    def assert_owned(self) -> None:
+        if self.failure is not None: raise LeaseError(f"lease heartbeat failed: {self.failure}")
+        if not self.acquired or not self.path.exists(): raise LeaseError("lease ownership is absent")
+        if self._read_prior()["token"] != self.token: raise LeaseError("lease ownership token changed")
+        if not self.sentinel.exists() or self._sentinel_token(self._snapshot_sentinel()) != self.token:
+            raise LeaseError("lease sentinel ownership changed")
     def _claim_sentinel(self) -> None:
         try:
             handle=os.open(self.sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -502,8 +533,10 @@ class _Lease(AbstractContextManager["_Lease"]):
             stream.write(self.token + "\n"); stream.flush(); os.fsync(stream.fileno())
     def __enter__(self):
         if self.path.exists():
-            prior=self._read_prior(); status=prior["status"]; age=self.clock()-float(prior["heartbeat_monotonic"]); foreign_boot=prior["boot_id"] != _boot_id()
-            if status == "active" and not foreign_boot and age < self.stale_after:
+            prior=self._read_prior(); status=prior["status"]; age=self.clock()-float(prior["heartbeat_monotonic"]); foreign_boot=prior["boot_id"] != _boot_id(); heartbeat=_utc_datetime(prior["heartbeat_utc"])
+            assert heartbeat is not None
+            wall_age=self.wall_time()-heartbeat.timestamp()
+            if status == "active" and (wall_age < self.stale_after or (not foreign_boot and age < self.stale_after)):
                 raise LeaseError("another live comparison runner owns this output root")
             if status == "active" and not self.stale_takeover:
                 raise LeaseError("stale lease requires explicit --take-over-stale-lease")
@@ -553,21 +586,21 @@ class _Runner:
     def journal(self) -> dict[str, dict[str, Any]]:
         if not self.journal_path.exists(): return {name:_journal_entry() for name in JOURNAL_STAGES}
         data=_json(self.journal_path)
-        if set(data)-set(JOURNAL_STAGES): raise ExperimentIntegrityError("unknown stage in journal")
-        result={name:data.get(name,_journal_entry()) for name in JOURNAL_STAGES}
+        if set(data) != set(JOURNAL_STAGES): raise ExperimentIntegrityError("journal requires an exact stage set")
+        result={name:data[name] for name in JOURNAL_STAGES}
         for entry in result.values():
             if set(entry)!={"status","input_sha256","output_sha256","started_at_utc","completed_at_utc","error"} or entry["status"] not in JOURNAL_STATUSES: raise ExperimentIntegrityError("invalid stage journal")
             for key in ("input_sha256", "output_sha256"):
                 if entry[key] is not None and (not isinstance(entry[key], str) or _SHA256.fullmatch(entry[key]) is None): raise ExperimentIntegrityError("invalid stage journal")
             for key in ("started_at_utc", "completed_at_utc"):
                 if entry[key] is not None:
-                    try: valid_time = isinstance(entry[key], str) and datetime.fromisoformat(entry[key].replace("Z", "+00:00")).tzinfo is not None
-                    except ValueError: valid_time = False
-                    if not valid_time: raise ExperimentIntegrityError("invalid stage journal")
+                    if _utc_datetime(entry[key]) is None: raise ExperimentIntegrityError("invalid stage journal")
             if entry["error"] is not None and (not isinstance(entry["error"], str) or "\ufffd" in entry["error"]): raise ExperimentIntegrityError("invalid stage journal")
+            if entry["status"] == "pending" and any(entry[key] is not None for key in ("input_sha256", "output_sha256", "started_at_utc", "completed_at_utc", "error")): raise ExperimentIntegrityError("invalid stage journal")
             if entry["status"] == "complete" and (entry["input_sha256"] is None or entry["output_sha256"] is None or entry["started_at_utc"] is None or entry["completed_at_utc"] is None or entry["error"] is not None): raise ExperimentIntegrityError("invalid stage journal")
             if entry["status"] == "in_progress" and (entry["input_sha256"] is None or entry["started_at_utc"] is None or entry["output_sha256"] is not None or entry["completed_at_utc"] is not None or entry["error"] is not None): raise ExperimentIntegrityError("invalid stage journal")
-            if entry["status"] in {"failed", "interrupted"} and entry["completed_at_utc"] is None: raise ExperimentIntegrityError("invalid stage journal")
+            if entry["status"] in {"failed", "interrupted"} and (entry["input_sha256"] is None or entry["output_sha256"] is not None or entry["started_at_utc"] is None or entry["completed_at_utc"] is None or entry["error"] is None): raise ExperimentIntegrityError("invalid stage journal")
+            if entry["started_at_utc"] is not None and entry["completed_at_utc"] is not None and _utc_datetime(entry["started_at_utc"]) > _utc_datetime(entry["completed_at_utc"]): raise ExperimentIntegrityError("invalid stage journal")
             if entry["status"]=="in_progress": entry.update(_journal_entry("interrupted", input_sha256=entry["input_sha256"], output_sha256=entry["output_sha256"], started_at_utc=entry["started_at_utc"], completed_at_utc=_utc(), error="previous runner interrupted"))
         self.save_journal(result); return result
     def save_journal(self, data: Mapping[str, Any]) -> None: atomic_write_json(self.journal_path, dict(data))
@@ -602,6 +635,10 @@ class _Runner:
             base = self.root / "comparison"
             required = ("summary.json", "scenario_paired_differences.csv", "learning_curves.png", "holdout_comparison.png", "preliminary_comparison_ko.md")
             return canonical_json_sha256({item: sha256_file(base / item) for item in required})
+        if name == "integrity_verification":
+            facts = self._validate_integrity(write_record=False)
+            record = self.root / "integrity_verification.json"
+            return canonical_json_sha256({**facts, "integrity_record_sha256": sha256_file(record) if record.is_file() else "missing"})
         return sha256_file(self.stage_path(name))
     def input_hash(self, name: str, journal: Mapping[str, Mapping[str, Any]]) -> str:
         lock = _allocrl_dir()/self.config.dependency_lock_path
@@ -611,7 +648,7 @@ class _Runner:
     def run_stage(self, name: str, action: Callable[[], None]) -> None:
         # The daemon cannot throw on the worker thread; surface a refresh failure
         # before issuing another stage/subprocess.
-        if getattr(self, "lease", None) is not None and self.lease.failure is not None: raise LeaseError(f"lease heartbeat failed: {self.lease.failure}")
+        self._assert_lease_healthy()
         journal=self.journal(); entry=journal[name]; incoming=self.input_hash(name, journal); output=self.stage_path(name)
         try: current_output = self.output_hash(name)
         except (OSError, ValueError, KeyError, TypeError): current_output = None
@@ -624,13 +661,18 @@ class _Runner:
                 journal[downstream] = _journal_entry()
         journal[name]=_journal_entry("in_progress", input_sha256=incoming, started_at_utc=_utc()); self.save_journal(journal)
         try:
-            action(); output_hash=self.output_hash(name)
+            action(); self._assert_lease_healthy(); output_hash=self.output_hash(name); self._assert_lease_healthy()
             if self._injected_output_hasher is None and not output.exists(): raise ExperimentStageError(f"stage produced no output: {name}")
         except KeyboardInterrupt:
             journal[name]=_journal_entry("interrupted", input_sha256=incoming, started_at_utc=journal[name]["started_at_utc"], completed_at_utc=_utc(), error="interrupted"); self.save_journal(journal); raise
         except BaseException as error:
             journal[name]=_journal_entry("failed", input_sha256=incoming, started_at_utc=journal[name]["started_at_utc"], completed_at_utc=_utc(), error=f"{type(error).__name__}: {error}"); self.save_journal(journal); raise ExperimentStageError(f"{name} failed: {error}") from error
         journal[name]=_journal_entry("complete", input_sha256=incoming, output_sha256=output_hash, started_at_utc=journal[name]["started_at_utc"], completed_at_utc=_utc()); self.save_journal(journal)
+    def _assert_lease_healthy(self) -> None:
+        lease = getattr(self, "lease", None)
+        if lease is None: return
+        if lease.failure is not None: raise LeaseError(f"lease heartbeat failed: {lease.failure}")
+        if hasattr(lease, "assert_owned"): lease.assert_owned()
     def command(self, stage: str, argv: Sequence[str]) -> None:
         logs=self.root/"logs"; logs.mkdir(parents=True, exist_ok=True); log=logs/f"{stage}.log"
         with log.open("a", encoding="utf-8", newline="\n") as stream:
@@ -702,21 +744,33 @@ class _Runner:
         if not isinstance(records,list): raise ExperimentIntegrityError("fixed scenarios must be a list")
         raw_config=_json(self.root/"raw_direct"/"run_config.json"); cnn_config=_json(self.root/"candidate_cnn"/"run_config.json")
         evaluate_comparison_artifacts(self.root,self.root/"raw_direct",self.root/"candidate_cnn",records,raw_config,cnn_config)
-    def integrity(self) -> None:
+    def _validate_integrity(self, *, write_record: bool) -> dict[str, Any]:
         provenance=self.provenance(); manifest=_json(self.root/"manifest.json"); environment=_json(self.root/"environment.json")
         _validate_root_environment(environment, provenance, production_loaded=self.config.production_loaded)
         _validate_root_manifest(manifest, provenance, environment)
+        states: dict[str, Any] = {}
         for arm in ("raw_direct","candidate_cnn"):
             state=read_wall_clock_state(self.root/arm/"run_state.json")
             if not self._state_complete(self.root/arm,state): raise ExperimentIntegrityError("incomplete arm")
+            checkpoint = resolve_state_checkpoint(self.root / arm, state)
+            states[arm] = {"state": asdict(state), "checkpoint_sha256": sha256_file(checkpoint)}
         _validate_environment_segments(self.root, environment, provenance, production_loaded=self.config.production_loaded)
         _validate_checkpoint_manifest(self.root, manifest, self.archive_reader)
         reports = _validate_report_artifacts(self.root)
-        atomic_write_json(self.root/"integrity_verification.json", {
+        facts = {
+            "manifest_sha256": sha256_file(self.root / "manifest.json"),
+            "environment_sha256": sha256_file(self.root / "environment.json"),
+            "environment_segments_sha256": {arm: sha256_file(self.root / arm / "environment_segments.jsonl") for arm in _COMPARISON_ARMS},
+            "states": states, "checkpoints": manifest["checkpoints"], "report_artifact_sha256": reports,
+        }
+        if write_record: atomic_write_json(self.root/"integrity_verification.json", {
             "schema_version": 1, "manifest_sha256": sha256_file(self.root / "manifest.json"),
             "environment_sha256": sha256_file(self.root / "environment.json"),
             "report_artifact_sha256": reports, "verified_at_utc": _utc(),
         })
+        return facts
+    def integrity(self) -> None:
+        self._validate_integrity(write_record=True)
 
     def _verify_completion_journal(self) -> dict[str, dict[str, Any]]:
         raw = _json(self.journal_path)
@@ -748,7 +802,7 @@ class _Runner:
             manifest = _json(self.root / "manifest.json"); environment = _json(self.root / "environment.json")
             _validate_root_environment(environment, provenance, production_loaded=self.config.production_loaded)
             _validate_root_manifest(manifest, provenance, environment)
-            report_hashes = _validate_report_artifacts(self.root)
+            report_hashes = self._validate_integrity(write_record=False)["report_artifact_sha256"]
             manifest_hash, environment_hash = sha256_file(self.root / "manifest.json"), sha256_file(self.root / "environment.json")
             provenance = {**provenance, "comparison_git_sha": environment["comparison_git_sha"]}
         return {
@@ -758,8 +812,18 @@ class _Runner:
             "lock_sha256": provenance["lock_sha256"], "comparison_git_sha": provenance["comparison_git_sha"],
             "manifest_sha256": manifest_hash, "environment_sha256": environment_hash,
             "stage_output_sha256": stage_hashes, "report_artifact_sha256": report_hashes,
-            "completed_at_utc": _utc(),
+            "completed_at_utc": _utc(), "lease_token": self.lease.token,
         }
+
+
+def _remove_owned_complete_marker(path: Path, token: str) -> None:
+    """Same-mount best effort: never intentionally unlink another lease's marker."""
+    try:
+        snapshot = path.read_bytes()
+        marker = _strict_json_line(snapshot.decode("utf-8"))
+        if marker.get("lease_token") != token or path.read_bytes() != snapshot: return
+        path.unlink()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError): pass
 
 
 def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_root: str | Path, *, subprocess_runner: Callable[..., Any] = subprocess.run, clock: Callable[[], float] = time.monotonic, lease_wall_time: Callable[[], float] = time.time, python_executable: str | None = None, archive_timestep_reader: Callable[[Path], int | None] | None = None, runner_command: Sequence[str] | None = None, stale_takeover: bool = False, lease_interval_seconds: float = 60, lease_stale_seconds: float = 900, stage_actions: Mapping[str, Callable[[], None]] | None = None, stage_output_hashers: Mapping[str, Callable[[], str]] | None = None) -> None:
@@ -775,17 +839,23 @@ def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_
         with lease:
             complete_path.unlink(missing_ok=True)
             actions = stage_actions or {"preflight":runner.preflight,"smoke_raw_direct":lambda: runner.smoke("raw_direct"),"smoke_candidate_cnn":lambda: runner.smoke("candidate_cnn"),"train_raw_direct":lambda: runner.train("raw_direct"),"evaluate_raw_direct":lambda: runner.evaluate_arm("raw_direct"),"train_candidate_cnn":lambda: runner.train("candidate_cnn"),"evaluate_candidate_cnn":lambda: runner.evaluate_arm("candidate_cnn"),"evaluate_common_step":runner.common_evaluation,"build_report":lambda: write_complete_report(root),"integrity_verification":runner.integrity}
-            for stage in JOURNAL_STAGES: runner.run_stage(stage, actions[stage])
-        # A refresh error raised by __exit__ prevents publication.  The marker
-        # is deliberately outside the lease context so it never claims a run
-        # complete while its ownership heartbeat is uncertain.
-        atomic_write_json(complete_path, runner._complete_marker())
-    except BaseException as error:
+            try:
+                for stage in JOURNAL_STAGES: runner.run_stage(stage, actions[stage])
+                lease.assert_owned()
+                marker = runner._complete_marker()
+                lease.assert_owned()
+                atomic_write_json(complete_path, marker)
+                lease.assert_owned()
+            except BaseException as error:
+                _remove_owned_complete_marker(complete_path, lease.token)
+                try:
+                    lease.assert_owned()
+                    write_partial_report(root,f"{type(error).__name__}: {error}")
+                except BaseException: pass
+                raise
+    except BaseException:
         if lease.acquired:
-            try: complete_path.unlink(missing_ok=True)
-            except OSError: pass
-            try: write_partial_report(root,f"{type(error).__name__}: {error}")
-            except BaseException: pass
+            _remove_owned_complete_marker(complete_path, lease.token)
         raise
 
 
