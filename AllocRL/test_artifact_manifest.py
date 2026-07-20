@@ -13,9 +13,12 @@ from comparison.artifact_manifest import (
     canonical_json_sha256,
     collect_environment,
     count_trainable_parameters,
+    read_run_origin,
+    read_runtime_metrics,
     sanitize_requirement_line,
     sha256_file,
     write_manifest,
+    write_run_origin,
     write_runtime_metrics,
 )
 import train as train_module
@@ -169,8 +172,47 @@ def test_runtime_writers_use_real_json_files(tmp_path):
         {"a": 3},
     ]
     metrics = tmp_path / "runtime_metrics.json"
-    write_runtime_metrics(metrics, {"steps_per_second": 4.0})
-    assert json.loads(metrics.read_text("utf-8")) == {"steps_per_second": 4.0}
+    payload = {
+        "schema_version": 2,
+        "target_training_seconds": 10.0,
+        "recorded_training_seconds": 10.0,
+        "run_wall_span_seconds": 12.0,
+        "overrun_seconds": 0.0,
+        "restart_count": 0,
+        "max_unrecorded_seconds": 1.0,
+        "start_timestep": 0,
+        "start_timestep_source": "run_origin.initial_timestep",
+        "end_timestep": 120,
+        "steps_per_second": 12.0,
+        "parameter_counts": {"total": 10, "feature_extractor": 1, "policy": 5, "value": 4},
+        "peak_cuda_memory_bytes": None,
+        "peak_cuda_memory_scope": "not_cuda",
+        "evaluation_seconds": 2.0,
+        "metrics_recorded_at_utc": "2026-07-21T00:00:12+00:00",
+        "finalization_mode": "in_process",
+        "selected_checkpoint_timestep": 120,
+        "selection_count": 0,
+        "selection_tuple": None,
+        "checkpoint_identity": {"filename": "model.sb3", "sha256": "a" * 64},
+    }
+    write_runtime_metrics(metrics, payload)
+    assert read_runtime_metrics(metrics) == payload
+
+
+def test_run_origin_is_atomic_exact_and_never_inferred(tmp_path):
+    path = tmp_path / "run_origin.json"
+    origin = write_run_origin(
+        path,
+        config_sha256="a" * 64,
+        initial_timestep=0,
+        created_at_utc="2026-07-21T00:00:00+00:00",
+    )
+    assert read_run_origin(path) == origin
+    with pytest.raises(ValueError, match="keys differ"):
+        path.write_text(
+            json.dumps({**origin, "legacy_inference": True}), encoding="utf-8"
+        )
+        read_run_origin(path)
 
 
 def test_jsonl_writer_uses_compact_canonical_json_and_rejects_nan(tmp_path):
@@ -260,9 +302,16 @@ def test_runtime_peak_memory_uses_model_device(
         last_checkpoint_timestep=120,
         last_checkpoint_file="model.sb3",
         last_checkpoint_sha256="a" * 64,
+        started_at_utc="2026-07-21T00:00:00+00:00",
     )
+    origin = {"initial_timestep": 0}
     metrics = train_module.comparison_runtime_metrics(
-        model, state, start_timestep=0, end_to_end_seconds=8.0, evaluation_seconds=0.0
+        model,
+        state,
+        origin=origin,
+        metrics_recorded_at_utc="2026-07-21T00:00:08+00:00",
+        evaluation_seconds=0.0,
+        finalization_mode="in_process",
     )
     assert metrics["peak_cuda_memory_bytes"] == (123 if expected_peak_call is not None else None)
     assert calls == ([] if expected_peak_call is None else [expected_peak_call])
@@ -294,14 +343,23 @@ def test_comparison_runtime_metrics_use_wall_clock_state_and_model_counts(
         last_checkpoint_timestep=120,
         last_checkpoint_file="model_120_g2.sb3",
         last_checkpoint_sha256="a" * 64,
+        started_at_utc="2026-07-21T00:00:00+00:00",
     )
     metrics = train_module.comparison_runtime_metrics(
-        model, state, start_timestep=20, end_to_end_seconds=12.0, evaluation_seconds=3.0
+        model,
+        state,
+        origin={"initial_timestep": 20},
+        metrics_recorded_at_utc="2026-07-21T00:00:12+00:00",
+        evaluation_seconds=3.0,
+        finalization_mode="in_process",
     )
     assert metrics["target_training_seconds"] == 10.0
     assert metrics["recorded_training_seconds"] == 8.0
     assert metrics["start_timestep"] == 20
     assert metrics["end_timestep"] == 120
+    assert metrics["schema_version"] == 2
+    assert metrics["run_wall_span_seconds"] == 12.0
+    assert metrics["start_timestep_source"] == "run_origin.initial_timestep"
     assert metrics["parameter_counts"]["total"] == sum(
         parameter.numel() for parameter in tiny_policy.parameters()
     )

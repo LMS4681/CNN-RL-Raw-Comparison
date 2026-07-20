@@ -49,14 +49,43 @@ def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary:
     _write_csv(root / "comparison" / "common_step_evaluation.csv", common)
     for arm, total, feature in (("raw_direct", 100, 0), ("candidate_cnn", 200, 80)):
         _json(root / arm / "runtime_metrics.json", {
+            "schema_version": 2,
             "target_training_seconds": 10800.0, "recorded_training_seconds": 10800.0,
-            "end_to_end_training_seconds": 10900.0, "overrun_seconds": 0.0,
+            "run_wall_span_seconds": 10900.0, "overrun_seconds": 0.0,
             "restart_count": 1, "max_unrecorded_seconds": 300.0, "start_timestep": 0,
-            "end_timestep": 50000, "steps_per_second": 4.63,
+            "start_timestep_source": "run_origin.initial_timestep",
+            "end_timestep": 50000, "steps_per_second": 50000 / 10800,
             "parameter_counts": {"total": total, "feature_extractor": feature, "policy": 60, "value": total-feature-60},
-            "peak_cuda_memory_bytes": 1234, "evaluation_seconds": 12.0,
+            "peak_cuda_memory_bytes": 1234, "peak_cuda_memory_scope": "training_process",
+            "evaluation_seconds": 12.0,
+            "metrics_recorded_at_utc": "2026-07-21T03:01:40+00:00",
+            "finalization_mode": "in_process",
             "selected_checkpoint_timestep": 50000, "selection_count": 5,
             "selection_tuple": [0.9, -0.1, -4.0], "checkpoint_identity": {"filename": "best_model.sb3", "sha256": ("a" if arm == "raw_direct" else "b") * 64},
+        })
+        _json(root / arm / "run_origin.json", {
+            "schema_version": 1,
+            "config_sha256": "b" * 64,
+            "initial_timestep": 0,
+            "source": "observed_before_first_learn",
+            "created_at_utc": "2026-07-21T00:00:00+00:00",
+        })
+        _json(root / arm / "run_state.json", {
+            "schema_version": 1,
+            "target_training_seconds": 10800.0,
+            "completed_training_seconds": 10800.0,
+            "last_checkpoint_timestep": 50000,
+            "last_regular_checkpoint_timestep": 50000,
+            "last_checkpoint_file": "model_50000_g1.sb3",
+            "last_checkpoint_sha256": "f" * 64,
+            "config_sha256": "b" * 64,
+            "generation": 1,
+            "restart_count": 1,
+            "max_unrecorded_seconds": 300.0,
+            "status": "complete",
+            "started_at_utc": "2026-07-21T00:00:00+00:00",
+            "updated_at_utc": "2026-07-21T03:00:00+00:00",
+            "completed_at_utc": "2026-07-21T03:00:00+00:00",
         })
     environment = {key: None for key in REQUIRED_ENVIRONMENT_KEYS}
     environment.update({"captured_at_utc": "2026-07-21T00:00:00+00:00", "command": ["python", "train.py"], "python_version": "3.12", "platform": "Linux", "comparison_git_sha": "d" * 40, "comparison_git_dirty": False, "baseline_sha256": "a" * 40, "config_sha256": "b" * 64, "scenario_sha256": "c" * 64, "split_sha256": "d" * 64, "lock_sha256": "e" * 64, "vm_boot_id": "boot", "torch_version": "2.0", "cuda_version": "12", "cudnn_version": 1, "resolved_device": "cuda:0", "gpu_name": "Test GPU", "gpu_uuid": "GPU-test", "gpu_total_memory_bytes": 99, "cpu_count": 2, "process_id": 1, "pip_freeze": ["pytest==1"]})
@@ -71,7 +100,7 @@ def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary:
     _json(root / "manifest.json", {"schema_version": 1, "checkpoints": checkpoints})
     for arm in ("raw_direct", "candidate_cnn"):
         arm_root = root / arm
-        (arm_root / "progress_timing.csv").write_text("generation,timestep,recorded_training_seconds,updated_at_utc,status,checkpoint_file\n1,50000,10800,now,complete,best_model.sb3\n", encoding="utf-8")
+        (arm_root / "progress_timing.csv").write_text("generation,timestep,recorded_training_seconds,updated_at_utc,status,checkpoint_file\n1,50000,10800,2026-07-21T03:00:00+00:00,complete,model_50000_g1.sb3\n", encoding="utf-8")
         (arm_root / "training_log.csv").write_text("episode,timestep,resolved_reward,terminal_residual,terminal_score,episode_reward,delayed_count,dropout_count,total_delay_days,success_rate\n1,10000,0,0,0.2,0,3,1,4,0.5\n", encoding="utf-8")
 
 
@@ -135,6 +164,8 @@ def test_korean_report_is_utf8_and_has_no_replacement_character(tmp_path):
     for phrase in ("예비 결과", "seed 0", "통계적 유의성", "자료 없음"):
         assert phrase in text
     assert "\ufffd" not in text
+    assert "wall span" in text
+    assert "end-to-end" not in text
 
 
 def test_missing_runtime_value_is_json_null_not_a_guessed_zero(tmp_path):
@@ -191,8 +222,9 @@ def test_dynamic_timings_fallback_and_partial_failure_safety(tmp_path):
     write_complete_fixture(tmp_path)
     for arm in ("raw_direct", "candidate_cnn"):
         path = tmp_path / arm / "runtime_metrics.json"; payload = json.loads(path.read_text(encoding="utf-8"))
-        payload.update({"target_training_seconds": 17.0, "recorded_training_seconds": 16.0, "end_to_end_training_seconds": 18.0, "overrun_seconds": 1.0, "selection_count": 0, "selection_tuple": None, "checkpoint_identity": {"filename": "fallback.sb3", "sha256": ("a" if arm == "raw_direct" else "b") * 64}})
+        payload.update({"target_training_seconds": 15.0, "recorded_training_seconds": 16.0, "run_wall_span_seconds": 18.0, "metrics_recorded_at_utc": "2026-07-21T00:00:18+00:00", "steps_per_second": 50000 / 16, "overrun_seconds": 1.0, "selection_count": 0, "selection_tuple": None, "checkpoint_identity": {"filename": "fallback.sb3", "sha256": ("a" if arm == "raw_direct" else "b") * 64}})
         _json(path, payload)
+        state_path = tmp_path / arm / "run_state.json"; state = json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds": 15.0, "completed_training_seconds": 16.0}); _json(state_path, state)
         manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8")); manifest["checkpoints"][arm]["selected"].update({"path": f"{arm}/fallback.sb3", "label": "fallback_final"}); _json(tmp_path / "manifest.json", manifest)
         for name in ("evaluation_scenarios.csv", "evaluation_primary_test.csv"):
             file = tmp_path / arm / name
@@ -200,7 +232,7 @@ def test_dynamic_timings_fallback_and_partial_failure_safety(tmp_path):
             for row in rows: row["checkpoint"] = "fallback_final"
             _write_csv(file, rows)
     text = write_complete_report(tmp_path).read_text(encoding="utf-8")
-    assert "17.0" in text and "fallback 사유: 자료 없음" in text and "10,800" not in text
+    assert "15.0" in text and "fallback 사유: 자료 없음" in text and "10,800" not in text
     with pytest.raises(ValueError, match="replacement"):
         write_partial_report(tmp_path, "bad\ufffdfailure")
 
@@ -329,7 +361,9 @@ def test_report_renders_all_actual_runtime_and_selection_fields(tmp_path):
     write_complete_fixture(tmp_path)
     for arm, tag, fallback in (("raw_direct", "11", False), ("candidate_cnn", "22", True)):
         path = tmp_path / arm / "runtime_metrics.json"; p = json.loads(path.read_text("utf-8")); digest = ("a" if arm == "raw_direct" else "b") * 64
-        p.update({"target_training_seconds": float(tag), "recorded_training_seconds": float(tag)+.1, "end_to_end_training_seconds":float(tag)+.2, "overrun_seconds":float(tag)+.3, "restart_count":int(tag), "max_unrecorded_seconds":float(tag)+.4, "start_timestep":int(tag)*100, "end_timestep":int(tag)*100+1, "steps_per_second":float(tag)+.5, "evaluation_seconds":float(tag)+.6, "parameter_counts":{"total":int(tag)*10,"feature_extractor":int(tag),"policy":int(tag)*2,"value":int(tag)*7}, "peak_cuda_memory_bytes":int(tag)*1000, "selection_count":0 if fallback else 5, "selection_tuple":None if fallback else [1.1,2.2,3.3], "selected_checkpoint_timestep":50000, "checkpoint_identity":{"filename":"fallback.sb3" if fallback else "best_model.sb3","sha256":digest}}); _json(path,p)
+        p.update({"target_training_seconds": float(tag), "recorded_training_seconds": float(tag)+.1, "run_wall_span_seconds":float(tag)+.2, "metrics_recorded_at_utc":f"2026-07-21T00:00:{float(tag)+.2:04.1f}+00:00", "overrun_seconds":(float(tag)+.1)-float(tag), "restart_count":int(tag), "max_unrecorded_seconds":float(tag)+.4, "start_timestep":int(tag)*100, "end_timestep":int(tag)*100+1, "steps_per_second":1/(float(tag)+.1), "evaluation_seconds":float(tag)+.6, "parameter_counts":{"total":int(tag)*10,"feature_extractor":int(tag),"policy":int(tag)*2,"value":int(tag)*7}, "peak_cuda_memory_bytes":int(tag)*1000, "selection_count":0 if fallback else 5, "selection_tuple":None if fallback else [1.1,2.2,3.3], "selected_checkpoint_timestep":50000, "checkpoint_identity":{"filename":"fallback.sb3" if fallback else "best_model.sb3","sha256":digest}}); _json(path,p)
+        origin_path=tmp_path/arm/"run_origin.json"; origin=json.loads(origin_path.read_text("utf-8")); origin["initial_timestep"]=int(tag)*100; _json(origin_path,origin)
+        state_path=tmp_path/arm/"run_state.json"; state=json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds":float(tag),"completed_training_seconds":float(tag)+.1,"restart_count":int(tag),"max_unrecorded_seconds":float(tag)+.4,"last_checkpoint_timestep":int(tag)*100+1}); _json(state_path,state)
         manifest=json.loads((tmp_path/"manifest.json").read_text("utf-8")); manifest["checkpoints"][arm]["selected"].update({"label":"fallback_final" if fallback else "best_model","path":f"{arm}/{'fallback.sb3' if fallback else 'best_model.sb3'}"}); _json(tmp_path/"manifest.json",manifest)
         for name in ("evaluation_scenarios.csv","evaluation_primary_test.csv"):
             file=tmp_path/arm/name
@@ -337,7 +371,7 @@ def test_report_renders_all_actual_runtime_and_selection_fields(tmp_path):
             for row in rows: row["checkpoint"]="fallback_final" if fallback else "best_model"
             _write_csv(file,rows)
     text=write_complete_report(tmp_path).read_text("utf-8")
-    for value in ("11.0","11.1","11.2","11.3","11.4","11.5","11.6","22.0","22.1","22.2","22.3","22.4","22.5","22.6","1100","1101","2200","2201","11000","22000","selection count 5","selection count 0","[1.1, 2.2, 3.3]","best_model","fallback_final","fallback 사유: 자료 없음"):
+    for value in ("11.0","11.1","11.2","11.4","11.6","22.0","22.1","22.2","22.4","22.6","1100","1101","2200","2201","11000","22000","selection count 5","selection count 0","[1.1, 2.2, 3.3]","best_model","fallback_final","fallback 사유: 자료 없음"):
         assert value in text
     assert "10,800" not in text
 
@@ -346,7 +380,9 @@ def test_zero_recorded_runtime_allows_null_steps_per_second_and_extra_manifest_m
     from comparison.report_builder import build_comparison_summary, write_complete_report
     write_complete_fixture(tmp_path)
     for arm in ("raw_direct", "candidate_cnn"):
-        path=tmp_path/arm/"runtime_metrics.json"; payload=json.loads(path.read_text("utf-8")); payload.update({"recorded_training_seconds":0.0,"start_timestep":7,"end_timestep":7,"steps_per_second":None}); _json(path,payload)
+        path=tmp_path/arm/"runtime_metrics.json"; payload=json.loads(path.read_text("utf-8")); payload.update({"target_training_seconds":0.0,"recorded_training_seconds":0.0,"overrun_seconds":0.0,"start_timestep":7,"end_timestep":7,"steps_per_second":None}); _json(path,payload)
+        origin_path=tmp_path/arm/"run_origin.json"; origin=json.loads(origin_path.read_text("utf-8")); origin["initial_timestep"]=7; _json(origin_path,origin)
+        state_path=tmp_path/arm/"run_state.json"; state=json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds":0.0,"completed_training_seconds":0.0,"last_checkpoint_timestep":7}); _json(state_path,state)
     manifest=tmp_path/"manifest.json"; payload=json.loads(manifest.read_text("utf-8")); payload["provenance"]={"run":"x"}; _json(manifest,payload)
     summary=build_comparison_summary(tmp_path); assert summary["raw_direct"]["runtime_metrics"]["steps_per_second"] is None and summary["manifest"]["provenance"] == {"run":"x"}
     assert "자료 없음" in write_complete_report(tmp_path).read_text("utf-8")

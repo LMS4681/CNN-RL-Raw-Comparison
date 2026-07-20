@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +47,42 @@ REQUIRED_ENVIRONMENT_KEYS = frozenset(
         "pip_freeze",
     }
 )
+
+RUN_ORIGIN_KEYS = frozenset(
+    {
+        "schema_version",
+        "config_sha256",
+        "initial_timestep",
+        "source",
+        "created_at_utc",
+    }
+)
+RUNTIME_METRICS_KEYS = frozenset(
+    {
+        "schema_version",
+        "target_training_seconds",
+        "recorded_training_seconds",
+        "run_wall_span_seconds",
+        "overrun_seconds",
+        "restart_count",
+        "max_unrecorded_seconds",
+        "start_timestep",
+        "start_timestep_source",
+        "end_timestep",
+        "steps_per_second",
+        "parameter_counts",
+        "peak_cuda_memory_bytes",
+        "peak_cuda_memory_scope",
+        "evaluation_seconds",
+        "metrics_recorded_at_utc",
+        "finalization_mode",
+        "selected_checkpoint_timestep",
+        "selection_count",
+        "selection_tuple",
+        "checkpoint_identity",
+    }
+)
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
 
 _URL_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s]+")
@@ -83,6 +121,188 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 def read_json_object(path: str | Path) -> dict[str, Any]:
     return parse_json_object(Path(path).read_text(encoding="utf-8"))
+
+
+def _utc_text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"{field} must be a UTC timestamp") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError(f"{field} must be a UTC timestamp")
+    return value
+
+
+def _finite_nonnegative(value: object, field: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < 0
+    ):
+        raise ValueError(f"{field} must be finite and non-negative")
+    return float(value)
+
+
+def _nonnegative_integer(value: object, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _sha256(value: object, field: str) -> str:
+    if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{field} must be lowercase SHA-256")
+    return value
+
+
+def read_run_origin(path: str | Path) -> dict[str, Any]:
+    """Read the durable, observed-before-first-learn timestep origin."""
+    payload = read_json_object(path)
+    if set(payload) != set(RUN_ORIGIN_KEYS):
+        raise ValueError("run origin keys differ")
+    if payload["schema_version"] != 1:
+        raise ValueError("run origin schema_version must be 1")
+    _sha256(payload["config_sha256"], "run origin config_sha256")
+    _nonnegative_integer(payload["initial_timestep"], "run origin initial_timestep")
+    if payload["source"] != "observed_before_first_learn":
+        raise ValueError("run origin source is invalid")
+    _utc_text(payload["created_at_utc"], "run origin created_at_utc")
+    return payload
+
+
+def write_run_origin(
+    path: str | Path,
+    *,
+    config_sha256: str,
+    initial_timestep: int,
+    created_at_utc: str | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "schema_version": 1,
+        "config_sha256": config_sha256,
+        "initial_timestep": initial_timestep,
+        "source": "observed_before_first_learn",
+        "created_at_utc": created_at_utc or datetime.now(timezone.utc).isoformat(),
+    }
+    _validate_run_origin_payload(payload)
+    destination = Path(path)
+    if destination.exists():
+        existing = read_run_origin(destination)
+        if existing != payload:
+            raise ValueError("existing run origin differs from observed origin")
+        return existing
+    _write_json(destination, payload)
+    reread = read_run_origin(destination)
+    if reread != payload:
+        raise ValueError("run origin reread differs from written origin")
+    return reread
+
+
+def _validate_run_origin_payload(payload: Mapping[str, Any]) -> None:
+    # Keep construction and disk validation on one exact contract.
+    if set(payload) != set(RUN_ORIGIN_KEYS):
+        raise ValueError("run origin keys differ")
+    if payload["schema_version"] != 1:
+        raise ValueError("run origin schema_version must be 1")
+    _sha256(payload["config_sha256"], "run origin config_sha256")
+    _nonnegative_integer(payload["initial_timestep"], "run origin initial_timestep")
+    if payload["source"] != "observed_before_first_learn":
+        raise ValueError("run origin source is invalid")
+    _utc_text(payload["created_at_utc"], "run origin created_at_utc")
+
+
+def _validate_runtime_metrics_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    payload = dict(payload)
+    if set(payload) != set(RUNTIME_METRICS_KEYS):
+        raise ValueError("runtime metrics keys differ")
+    if payload["schema_version"] != 2:
+        raise ValueError("runtime metrics schema_version must be 2")
+    for field in (
+        "target_training_seconds",
+        "recorded_training_seconds",
+        "run_wall_span_seconds",
+        "overrun_seconds",
+        "max_unrecorded_seconds",
+        "evaluation_seconds",
+    ):
+        _finite_nonnegative(payload[field], f"runtime metrics {field}")
+    for field in (
+        "restart_count",
+        "start_timestep",
+        "end_timestep",
+        "selected_checkpoint_timestep",
+        "selection_count",
+    ):
+        _nonnegative_integer(payload[field], f"runtime metrics {field}")
+    if payload["start_timestep_source"] != "run_origin.initial_timestep":
+        raise ValueError("runtime metrics start_timestep_source is invalid")
+    if payload["finalization_mode"] not in {
+        "in_process",
+        "recovered_complete_state",
+    }:
+        raise ValueError("runtime metrics finalization_mode is invalid")
+    _utc_text(payload["metrics_recorded_at_utc"], "metrics_recorded_at_utc")
+    steps = payload["steps_per_second"]
+    if steps is not None:
+        _finite_nonnegative(steps, "runtime metrics steps_per_second")
+    peak = payload["peak_cuda_memory_bytes"]
+    if peak is not None:
+        _nonnegative_integer(peak, "runtime metrics peak_cuda_memory_bytes")
+    scope = payload["peak_cuda_memory_scope"]
+    if scope not in {
+        "training_process",
+        "unavailable_after_training_process",
+        "not_cuda",
+    }:
+        raise ValueError("runtime metrics peak_cuda_memory_scope is invalid")
+    if scope == "unavailable_after_training_process" and peak is not None:
+        raise ValueError("recovered runtime peak CUDA memory must be null")
+    if scope == "not_cuda" and peak is not None:
+        raise ValueError("CPU runtime peak CUDA memory must be null")
+    counts = payload["parameter_counts"]
+    if not isinstance(counts, dict) or set(counts) != {
+        "total", "feature_extractor", "policy", "value"
+    }:
+        raise ValueError("runtime metrics parameter_counts schema differs")
+    for field, value in counts.items():
+        _nonnegative_integer(value, f"parameter_counts.{field}")
+    if counts["total"] != sum(counts[key] for key in ("feature_extractor", "policy", "value")):
+        raise ValueError("runtime metrics parameter counts do not reconcile")
+    identity = payload["checkpoint_identity"]
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"filename", "sha256"}
+        or not isinstance(identity["filename"], str)
+        or not identity["filename"]
+        or Path(identity["filename"]).name != identity["filename"]
+    ):
+        raise ValueError("runtime metrics checkpoint_identity is invalid")
+    _sha256(identity["sha256"], "runtime checkpoint identity")
+    selection_tuple = payload["selection_tuple"]
+    if payload["selection_count"] == 0:
+        if selection_tuple is not None:
+            raise ValueError("fallback selection tuple must be null")
+    elif (
+        not isinstance(selection_tuple, list)
+        or len(selection_tuple) != 3
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in selection_tuple
+        )
+    ):
+        raise ValueError("runtime metrics selection_tuple is invalid")
+    return payload
+
+
+def read_runtime_metrics(path: str | Path) -> dict[str, Any]:
+    return _validate_runtime_metrics_payload(read_json_object(path))
 
 
 def sha256_file(path: str | Path) -> str:
@@ -292,7 +512,24 @@ def count_trainable_parameters(model: Any) -> dict[str, int]:
 def _write_json(path: str | Path, payload: Mapping[str, Any]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(_canonical_json(payload) + "\n", encoding="utf-8")
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        stream.write(_canonical_json(payload) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        temporary = Path(stream.name)
+    try:
+        os.replace(temporary, destination)
+        read_json_object(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def append_environment_segment(path: str | Path, payload: Mapping[str, Any]) -> None:
@@ -303,7 +540,13 @@ def append_environment_segment(path: str | Path, payload: Mapping[str, Any]) -> 
 
 
 def write_runtime_metrics(path: str | Path, metrics: Mapping[str, Any]) -> None:
-    _write_json(path, metrics)
+    payload = dict(metrics)
+    # Validate the exact schema before publication and again after reread.
+    _validate_runtime_metrics_payload(payload)
+    destination = Path(path)
+    _write_json(destination, payload)
+    if read_runtime_metrics(destination) != payload:
+        raise ValueError("runtime metrics reread differs from written payload")
 
 
 def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> None:

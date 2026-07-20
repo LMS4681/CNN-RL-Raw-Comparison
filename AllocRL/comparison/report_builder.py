@@ -18,8 +18,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
-from comparison.artifact_manifest import REQUIRED_ENVIRONMENT_KEYS, read_json_object
+from comparison.artifact_manifest import (
+    REQUIRED_ENVIRONMENT_KEYS,
+    RUNTIME_METRICS_KEYS,
+    read_json_object,
+    read_run_origin,
+    read_runtime_metrics,
+)
 from comparison.checkpoint_evaluator import ARMS, EVALUATION_COLUMNS, PRIMARY_TEST_SEEDS, SELECTION_SEEDS
+from comparison.wall_clock_callback import read_progress_timing, read_wall_clock_state
 
 
 HEADLINE_COLUMNS = (
@@ -35,13 +42,7 @@ PROGRESS_TIMING_COLUMNS = ("generation", "timestep", "recorded_training_seconds"
 JOURNAL_STAGES = ("preflight", "smoke_raw_direct", "smoke_candidate_cnn", "train_raw_direct", "evaluate_raw_direct", "train_candidate_cnn", "evaluate_candidate_cnn", "evaluate_common_step", "build_report", "integrity_verification")
 JOURNAL_STATUSES = frozenset({"pending", "in_progress", "interrupted", "failed", "complete"})
 MISSING = "자료 없음"
-RUNTIME_FIELDS = (
-    "target_training_seconds", "recorded_training_seconds", "end_to_end_training_seconds",
-    "overrun_seconds", "restart_count", "max_unrecorded_seconds", "start_timestep",
-    "end_timestep", "steps_per_second", "parameter_counts", "peak_cuda_memory_bytes",
-    "evaluation_seconds", "selected_checkpoint_timestep", "selection_count",
-    "selection_tuple", "checkpoint_identity",
-)
+RUNTIME_FIELDS = tuple(sorted(RUNTIME_METRICS_KEYS))
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 
@@ -140,41 +141,54 @@ def _load_arm(root: Path, arm: str) -> dict[str, Any]:
     all_primary = [row for row in all_rows if row["seed"] in PRIMARY_TEST_SEEDS]
     if any(row != corresponding for row, corresponding in zip(primary, all_primary)):
         raise ValueError(f"primary CSV disagrees with all-scenarios CSV: {arm}")
-    return {"selection_rows": selection, "primary_rows": primary, "all_rows": all_rows, "runtime": _runtime(arm_root / "runtime_metrics.json")}
+    return {"selection_rows": selection, "primary_rows": primary, "all_rows": all_rows, "runtime": _runtime(arm_root)}
 
 
-def _runtime(path: Path) -> dict[str, Any]:
-    data = _read_json(path)
-    if set(data) != set(RUNTIME_FIELDS):
-        raise ValueError("runtime_metrics must contain exactly required fields")
-    for key in ("target_training_seconds", "recorded_training_seconds", "end_to_end_training_seconds", "overrun_seconds", "max_unrecorded_seconds", "evaluation_seconds"):
-        _number(data[key], key)
-        if data[key] < 0: raise ValueError(f"{key} must be nonnegative")
-    if data["steps_per_second"] is not None:
-        _number(data["steps_per_second"], "steps_per_second")
-        if data["steps_per_second"] < 0: raise ValueError("steps_per_second must be nonnegative")
-    for key in ("restart_count", "start_timestep", "end_timestep", "selected_checkpoint_timestep"):
-        _integer(data[key], key)
-    peak = data["peak_cuda_memory_bytes"]
-    if peak is not None: _integer(peak, "peak_cuda_memory_bytes")
-    counts = data["parameter_counts"]
-    if not isinstance(counts, Mapping) or set(counts) != {"total", "feature_extractor", "policy", "value"}:
-        raise ValueError("parameter_counts must contain exactly total, feature_extractor, policy, value")
-    parsed = {key: _integer(value, f"parameter_counts.{key}") for key, value in counts.items()}
-    if parsed["total"] != parsed["feature_extractor"] + parsed["policy"] + parsed["value"]:
-        raise ValueError("disjoint parameter counts do not reconcile")
-    identity = data["checkpoint_identity"]
-    if not isinstance(identity, Mapping) or set(identity) != {"filename", "sha256"} or not isinstance(identity["filename"], str) or not identity["filename"]:
-        raise ValueError("checkpoint_identity is invalid")
-    _sha(identity["sha256"], "checkpoint_identity.sha256")
-    count = _integer(data["selection_count"], "selection_count")
-    tuple_value = data["selection_tuple"]
-    if count == 0:
-        if tuple_value is not None: raise ValueError("fallback selection_tuple must be null")
-    else:
-        if not isinstance(tuple_value, list) or len(tuple_value) != 3: raise ValueError("selection_tuple must contain three numbers")
-        for value in tuple_value: _number(value, "selection_tuple")
-    data = dict(data); data["parameter_counts"] = parsed
+def _runtime(arm_root: Path) -> dict[str, Any]:
+    try:
+        data = read_runtime_metrics(arm_root / "runtime_metrics.json")
+        origin = read_run_origin(arm_root / "run_origin.json")
+        state = read_wall_clock_state(arm_root / "run_state.json")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
+        raise ValueError(f"invalid JSON/runtime artifact: {error}") from error
+    if state.status != "complete":
+        raise ValueError("runtime requires complete wall-clock state")
+    if origin["config_sha256"] != state.config_sha256:
+        raise ValueError("runtime origin/state config mismatch")
+    exact = {
+        "target_training_seconds": float(state.target_training_seconds),
+        "recorded_training_seconds": float(state.completed_training_seconds),
+        "restart_count": state.restart_count,
+        "max_unrecorded_seconds": float(state.max_unrecorded_seconds),
+        "start_timestep": origin["initial_timestep"],
+        "end_timestep": state.last_checkpoint_timestep,
+    }
+    for key, expected in exact.items():
+        if data[key] != expected:
+            raise ValueError(f"runtime {key} does not reconcile with state/origin")
+    expected_overrun = max(
+        0.0,
+        data["recorded_training_seconds"] - data["target_training_seconds"],
+    )
+    if data["overrun_seconds"] != expected_overrun:
+        raise ValueError("runtime overrun_seconds does not reconcile")
+    recorded_at = datetime.fromisoformat(
+        data["metrics_recorded_at_utc"].replace("Z", "+00:00")
+    )
+    started_at = datetime.fromisoformat(
+        state.started_at_utc.replace("Z", "+00:00")
+    )
+    expected_span = (recorded_at - started_at).total_seconds()
+    if data["run_wall_span_seconds"] != expected_span:
+        raise ValueError("runtime run_wall_span_seconds does not reconcile")
+    trained_steps = data["end_timestep"] - data["start_timestep"]
+    expected_rate = (
+        trained_steps / data["recorded_training_seconds"]
+        if data["recorded_training_seconds"] > 0
+        else None
+    )
+    if data["steps_per_second"] != expected_rate:
+        raise ValueError("runtime steps_per_second does not reconcile")
     return data
 
 
@@ -326,6 +340,11 @@ def _cell(value: Any) -> str:
 
 def _curve_rows(path: Path, columns: tuple[str, ...], name: str) -> list[dict[str, str]] | None:
     if not path.is_file(): return None
+    if name == "progress_timing":
+        return [
+            {key: str(value) for key, value in vars(row).items()}
+            for row in read_progress_timing(path)
+        ]
     with path.open(encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
         if tuple(reader.fieldnames or ()) != columns: raise ValueError(f"{name} has incompatible header")
@@ -421,7 +440,7 @@ def _report_text(summary: Mapping[str, Any], pairs: list[dict]) -> str:
 
 ## 3시간 budget 및 주 비교
 
-raw-direct: target={_cell(raw['runtime_metrics']['target_training_seconds'])}, recorded={_cell(raw['runtime_metrics']['recorded_training_seconds'])}, end-to-end={_cell(raw['runtime_metrics']['end_to_end_training_seconds'])}, overrun={_cell(raw['runtime_metrics']['overrun_seconds'])}, restarts={_cell(raw['runtime_metrics']['restart_count'])}, max-unrecorded={_cell(raw['runtime_metrics']['max_unrecorded_seconds'])}, timestep={_cell(raw['runtime_metrics']['start_timestep'])}->{_cell(raw['runtime_metrics']['end_timestep'])}, evaluation seconds={_cell(raw['runtime_metrics']['evaluation_seconds'])}; {budget(raw)}. candidate-CNN: target={_cell(cnn['runtime_metrics']['target_training_seconds'])}, recorded={_cell(cnn['runtime_metrics']['recorded_training_seconds'])}, end-to-end={_cell(cnn['runtime_metrics']['end_to_end_training_seconds'])}, overrun={_cell(cnn['runtime_metrics']['overrun_seconds'])}, restarts={_cell(cnn['runtime_metrics']['restart_count'])}, max-unrecorded={_cell(cnn['runtime_metrics']['max_unrecorded_seconds'])}, timestep={_cell(cnn['runtime_metrics']['start_timestep'])}->{_cell(cnn['runtime_metrics']['end_timestep'])}, evaluation seconds={_cell(cnn['runtime_metrics']['evaluation_seconds'])}; {budget(cnn)}. 주 성능은 checkpoint 선택에 쓰지 않은 primary_test seed 1005..1019의 15개 scenario 평균이며, 이는 15개의 독립 학습 실행이 아니라 하나의 seed 0 실행에서 짝지은 평가다. raw terminal score={raw['primary_test']['mean_terminal_score']:.6g}, CNN terminal score={cnn['primary_test']['mean_terminal_score']:.6g}; 이 수치만으로 우열 또는 통계적 유의성을 결론내리지 않는다.
+raw-direct: target={_cell(raw['runtime_metrics']['target_training_seconds'])}, recorded={_cell(raw['runtime_metrics']['recorded_training_seconds'])}, wall span={_cell(raw['runtime_metrics']['run_wall_span_seconds'])}, overrun={_cell(raw['runtime_metrics']['overrun_seconds'])}, restarts={_cell(raw['runtime_metrics']['restart_count'])}, max-unrecorded={_cell(raw['runtime_metrics']['max_unrecorded_seconds'])}, timestep={_cell(raw['runtime_metrics']['start_timestep'])}->{_cell(raw['runtime_metrics']['end_timestep'])}, evaluation seconds={_cell(raw['runtime_metrics']['evaluation_seconds'])}, finalization={_cell(raw['runtime_metrics']['finalization_mode'])}; {budget(raw)}. candidate-CNN: target={_cell(cnn['runtime_metrics']['target_training_seconds'])}, recorded={_cell(cnn['runtime_metrics']['recorded_training_seconds'])}, wall span={_cell(cnn['runtime_metrics']['run_wall_span_seconds'])}, overrun={_cell(cnn['runtime_metrics']['overrun_seconds'])}, restarts={_cell(cnn['runtime_metrics']['restart_count'])}, max-unrecorded={_cell(cnn['runtime_metrics']['max_unrecorded_seconds'])}, timestep={_cell(cnn['runtime_metrics']['start_timestep'])}->{_cell(cnn['runtime_metrics']['end_timestep'])}, evaluation seconds={_cell(cnn['runtime_metrics']['evaluation_seconds'])}, finalization={_cell(cnn['runtime_metrics']['finalization_mode'])}; {budget(cnn)}. wall span은 최초 시작부터 metrics 기록까지의 실제 UTC 구간으로 downtime과 finalization을 포함한다. 주 성능은 checkpoint 선택에 쓰지 않은 primary_test seed 1005..1019의 15개 scenario 평균이며, 이는 15개의 독립 학습 실행이 아니라 하나의 seed 0 실행에서 짝지은 평가다. raw terminal score={raw['primary_test']['mean_terminal_score']:.6g}, CNN terminal score={cnn['primary_test']['mean_terminal_score']:.6g}; 이 수치만으로 우열 또는 통계적 유의성을 결론내리지 않는다.
 
 ## 공통 timestep과 효율
 
@@ -455,7 +474,7 @@ def write_partial_report(root: str | Path, failure: str) -> Path:
     base = Path(root)
     def valid_arm(arm: str) -> bool:
         try:
-            _runtime(base / arm / "runtime_metrics.json")
+            _runtime(base / arm)
             _read_evaluation(base / arm / "evaluation_scenarios.csv", arm, tuple(range(1000, 1020)))
             _read_evaluation(base / arm / "evaluation_primary_test.csv", arm, PRIMARY_TEST_SEEDS)
             return True

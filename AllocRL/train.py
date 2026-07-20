@@ -22,6 +22,7 @@ import warnings
 import zipfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -46,9 +47,11 @@ from comparison.artifact_manifest import (
     append_environment_segment,
     collect_environment,
     count_trainable_parameters,
+    read_run_origin,
     read_json_object,
     sha256_file,
     write_runtime_metrics,
+    write_run_origin,
 )
 
 from alloc_env.observation_state import (
@@ -90,38 +93,80 @@ def comparison_runtime_metrics(
     model,
     wall_clock_state,
     *,
-    start_timestep: int,
-    end_to_end_seconds: float,
+    origin: Mapping[str, Any],
+    metrics_recorded_at_utc: str,
     evaluation_seconds: float,
+    finalization_mode: str,
     selected_checkpoint: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the per-arm metrics payload from the durable wall-clock state."""
     recorded_seconds = float(wall_clock_state.completed_training_seconds)
     end_timestep = int(model.num_timesteps)
-    trained_steps = end_timestep - int(start_timestep)
+    if end_timestep != int(wall_clock_state.last_checkpoint_timestep):
+        raise ValueError("runtime model timestep differs from complete state")
+    start_timestep = int(origin["initial_timestep"])
+    trained_steps = end_timestep - start_timestep
+    if trained_steps < 0:
+        raise ValueError("runtime end timestep precedes durable origin")
+    try:
+        recorded_at = datetime.fromisoformat(
+            metrics_recorded_at_utc.replace("Z", "+00:00")
+        )
+        started_at = datetime.fromisoformat(
+            wall_clock_state.started_at_utc.replace("Z", "+00:00")
+        )
+    except (AttributeError, ValueError) as error:
+        raise ValueError("runtime wall span requires valid UTC timestamps") from error
+    if (
+        recorded_at.tzinfo is None
+        or started_at.tzinfo is None
+        or recorded_at.utcoffset() != timezone.utc.utcoffset(recorded_at)
+        or started_at.utcoffset() != timezone.utc.utcoffset(started_at)
+    ):
+        raise ValueError("runtime wall span requires UTC timestamps")
+    wall_span = (recorded_at - started_at).total_seconds()
+    if wall_span < 0:
+        raise ValueError("runtime metrics timestamp precedes run start")
     cuda_index = _cuda_device_index(getattr(model, "device", "cpu"))
+    if finalization_mode == "recovered_complete_state":
+        peak_memory = None
+        peak_scope = (
+            "unavailable_after_training_process"
+            if cuda_index is not None
+            else "not_cuda"
+        )
+    elif finalization_mode == "in_process":
+        peak_memory = (
+            int(torch.cuda.max_memory_allocated(cuda_index))
+            if cuda_index is not None
+            else None
+        )
+        peak_scope = "training_process" if cuda_index is not None else "not_cuda"
+    else:
+        raise ValueError("runtime finalization mode is invalid")
     return {
+        "schema_version": 2,
         "target_training_seconds": float(wall_clock_state.target_training_seconds),
         "recorded_training_seconds": recorded_seconds,
-        "end_to_end_training_seconds": float(end_to_end_seconds),
+        "run_wall_span_seconds": wall_span,
         "overrun_seconds": max(
             0.0,
             recorded_seconds - float(wall_clock_state.target_training_seconds),
         ),
         "restart_count": int(wall_clock_state.restart_count),
         "max_unrecorded_seconds": float(wall_clock_state.max_unrecorded_seconds),
-        "start_timestep": int(start_timestep),
+        "start_timestep": start_timestep,
+        "start_timestep_source": "run_origin.initial_timestep",
         "end_timestep": end_timestep,
         "steps_per_second": (
             trained_steps / recorded_seconds if recorded_seconds > 0 else None
         ),
         "parameter_counts": count_trainable_parameters(model.policy),
-        "peak_cuda_memory_bytes": (
-            int(torch.cuda.max_memory_allocated(cuda_index))
-            if cuda_index is not None
-            else None
-        ),
+        "peak_cuda_memory_bytes": peak_memory,
+        "peak_cuda_memory_scope": peak_scope,
         "evaluation_seconds": float(evaluation_seconds),
+        "metrics_recorded_at_utc": metrics_recorded_at_utc,
+        "finalization_mode": finalization_mode,
         **(
             selected_checkpoint
             if selected_checkpoint is not None
@@ -1352,6 +1397,30 @@ def _train(args, resources: _TrainingResourceLifecycle):
             tensorboard_log=str(output_dir / "tb_logs"),
         )
     resources.model = model
+    run_origin = None
+    if wall_clock_enabled:
+        origin_path = output_dir / "run_origin.json"
+        if is_resume:
+            try:
+                run_origin = read_run_origin(origin_path)
+            except FileNotFoundError as error:
+                raise ValueError(
+                    "wall-clock resume requires durable run_origin.json; "
+                    "legacy origin inference is forbidden"
+                ) from error
+            if run_origin["config_sha256"] != args.comparison_config_sha256:
+                raise ValueError("run origin config SHA256 changed on resume")
+        else:
+            initial_timestep = int(model.num_timesteps)
+            if initial_timestep != 0:
+                raise ValueError(
+                    "new production wall-clock run must begin at timestep zero"
+                )
+            run_origin = write_run_origin(
+                origin_path,
+                config_sha256=args.comparison_config_sha256,
+                initial_timestep=initial_timestep,
+            )
 
     # ── 5. 콜백 설정 ──────────────────────────────────────────────
     callback = [
@@ -1409,11 +1478,6 @@ def _train(args, resources: _TrainingResourceLifecycle):
     print(f"\n학습 시작: {args.timesteps} timesteps "
           f"({'이어학습(추가)' if is_resume else '신규'})")
     print(f"TensorBoard: tensorboard --logdir {Path(args.output_dir) / 'tb_logs'}")
-    training_start_timestep = None
-    training_started = None
-    if wall_clock_enabled:
-        training_start_timestep = int(model.num_timesteps)
-        training_started = time.monotonic()
     model.learn(
         total_timesteps=args.timesteps,
         progress_bar=True,
@@ -1473,14 +1537,17 @@ def _train(args, resources: _TrainingResourceLifecycle):
         [csv_row],
     )
     if wall_clock_enabled:
+        assert run_origin is not None
+        metrics_recorded_at_utc = datetime.now(timezone.utc).isoformat()
         write_runtime_metrics(
             output_dir / "runtime_metrics.json",
             comparison_runtime_metrics(
                 model,
                 wall_clock_state,
-                start_timestep=training_start_timestep,
-                end_to_end_seconds=time.monotonic() - training_started,
+                origin=run_origin,
+                metrics_recorded_at_utc=metrics_recorded_at_utc,
                 evaluation_seconds=evaluation_seconds,
+                finalization_mode="in_process",
                 selected_checkpoint=runtime_selected_checkpoint(
                     output_dir,
                     wall_clock_state,
