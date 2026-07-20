@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from comparison.artifact_manifest import REQUIRED_ENVIRONMENT_KEYS
 from comparison.checkpoint_evaluator import EVALUATION_COLUMNS
 
 
@@ -22,7 +23,7 @@ def _rows(arm: str, scores: dict[int, tuple[float, float, float, float]], checkp
         score, dropout, delay, delayed = scores.get(seed, (0.1, 0.2, 5.0, 4.0))
         rows.append(dict(zip(EVALUATION_COLUMNS, (
             "holdout_fixed20", arm, seed, score, score, dropout, delay, delayed,
-            0.5, arm, checkpoint, 50_000, arm[0] * 64,
+            0.5, arm, checkpoint, 50_000, ("a" if arm == "raw_direct" else "b") * 64,
             "selection" if seed < 1005 else "primary_test",
         ))))
     return rows
@@ -55,10 +56,19 @@ def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary:
             "parameter_counts": {"total": total, "feature_extractor": feature, "policy": 60, "value": total-feature-60},
             "peak_cuda_memory_bytes": 1234, "evaluation_seconds": 12.0,
             "selected_checkpoint_timestep": 50000, "selection_count": 5,
-            "selection_tuple": [0.9, -0.1, -4.0], "checkpoint_identity": {"filename": "best_model.sb3", "sha256": arm[0] * 64},
+            "selection_tuple": [0.9, -0.1, -4.0], "checkpoint_identity": {"filename": "best_model.sb3", "sha256": ("a" if arm == "raw_direct" else "b") * 64},
         })
-    _json(root / "environment.json", {"resolved_device": "cuda:0", "gpu_name": "Test GPU", "gpu_uuid": "GPU-test", "torch_version": "2.0", "cuda_version": "12", "cudnn_version": 1, "vm_boot_id": "boot", "python_version": "3.12", "platform": "Linux"})
-    _json(root / "manifest.json", {"schema_version": 1, "checkpoints": {"raw_direct": {"selected": {"timestep": 50000}}, "candidate_cnn": {"selected": {"timestep": 50000}}}})
+    environment = {key: None for key in REQUIRED_ENVIRONMENT_KEYS}
+    environment.update({"captured_at_utc": "2026-07-21T00:00:00+00:00", "command": ["python", "train.py"], "python_version": "3.12", "platform": "Linux", "comparison_git_sha": "d" * 40, "comparison_git_dirty": False, "baseline_sha256": "a" * 40, "config_sha256": "b" * 64, "scenario_sha256": "c" * 64, "split_sha256": "d" * 64, "lock_sha256": "e" * 64, "vm_boot_id": "boot", "torch_version": "2.0", "cuda_version": "12", "cudnn_version": 1, "resolved_device": "cuda:0", "gpu_name": "Test GPU", "gpu_uuid": "GPU-test", "gpu_total_memory_bytes": 99, "cpu_count": 2, "process_id": 1, "pip_freeze": ["pytest==1"]})
+    _json(root / "environment.json", environment)
+    checkpoints = {}
+    for arm in ("raw_direct", "candidate_cnn"):
+        checkpoints[arm] = {
+            "selected": {"path": f"{arm}/best_model.sb3", "label": "best_model", "sha256": ("a" if arm == "raw_direct" else "b") * 64, "timestep": 50000},
+            "final": {"path": f"{arm}/final.sb3", "label": "final", "sha256": "f" * 64, "timestep": 50000},
+            "common": {"path": f"{arm}/common.sb3", "label": "common_step", "sha256": ("a" if arm == "raw_direct" else "b") * 64, "timestep": 50000},
+        }
+    _json(root / "manifest.json", {"schema_version": 1, "checkpoints": checkpoints})
     for arm in ("raw_direct", "candidate_cnn"):
         arm_root = root / arm
         (arm_root / "progress_timing.csv").write_text("generation,timestep,recorded_training_seconds,updated_at_utc,status,checkpoint_file\n1,50000,10800,now,complete,best_model.sb3\n", encoding="utf-8")
@@ -133,5 +143,53 @@ def test_missing_runtime_value_is_json_null_not_a_guessed_zero(tmp_path):
     path = tmp_path / "raw_direct" / "runtime_metrics.json"
     payload = json.loads(path.read_text(encoding="utf-8")); del payload["peak_cuda_memory_bytes"]
     _json(path, payload)
-    summary = build_comparison_summary(tmp_path)
-    assert summary["raw_direct"]["runtime_metrics"]["peak_cuda_memory_bytes"] is None
+    with pytest.raises(ValueError, match="runtime"):
+        build_comparison_summary(tmp_path)
+
+
+def test_rejects_coercive_runtime_values_and_reconciles_selected_provenance(tmp_path):
+    from comparison.report_builder import build_comparison_summary
+    write_complete_fixture(tmp_path)
+    path = tmp_path / "raw_direct" / "runtime_metrics.json"
+    payload = json.loads(path.read_text(encoding="utf-8")); payload["restart_count"] = "1"
+    _json(path, payload)
+    with pytest.raises(ValueError, match="restart_count"):
+        build_comparison_summary(tmp_path)
+    payload["restart_count"] = 1; payload["checkpoint_identity"]["sha256"] = "0" * 64
+    _json(path, payload)
+    with pytest.raises(ValueError, match="selected"):
+        build_comparison_summary(tmp_path)
+
+
+def test_rejects_incomplete_environment_and_common_sha_mismatch(tmp_path):
+    from comparison.report_builder import build_comparison_summary
+    write_complete_fixture(tmp_path)
+    _json(tmp_path / "environment.json", {})
+    with pytest.raises(ValueError, match="environment"):
+        build_comparison_summary(tmp_path)
+    write_complete_fixture(tmp_path)
+    common = tmp_path / "comparison" / "common_step_evaluation.csv"
+    with common.open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    rows[-1]["checkpoint_sha256"] = "0" * 64; _write_csv(common, rows)
+    with pytest.raises(ValueError, match="common"):
+        build_comparison_summary(tmp_path)
+
+
+def test_dynamic_timings_fallback_and_partial_failure_safety(tmp_path):
+    from comparison.report_builder import write_complete_report, write_partial_report
+    write_complete_fixture(tmp_path)
+    for arm in ("raw_direct", "candidate_cnn"):
+        path = tmp_path / arm / "runtime_metrics.json"; payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update({"target_training_seconds": 17.0, "recorded_training_seconds": 16.0, "end_to_end_training_seconds": 18.0, "overrun_seconds": 1.0, "selection_count": 0, "selection_tuple": None, "checkpoint_identity": {"filename": "fallback.sb3", "sha256": ("a" if arm == "raw_direct" else "b") * 64}})
+        _json(path, payload)
+        manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8")); manifest["checkpoints"][arm]["selected"].update({"path": f"{arm}/fallback.sb3", "label": "fallback_final"}); _json(tmp_path / "manifest.json", manifest)
+        for name in ("evaluation_scenarios.csv", "evaluation_primary_test.csv"):
+            file = tmp_path / arm / name
+            with file.open(encoding="utf-8", newline="") as stream: rows = list(csv.DictReader(stream))
+            for row in rows: row["checkpoint"] = "fallback_final"
+            _write_csv(file, rows)
+    text = write_complete_report(tmp_path).read_text(encoding="utf-8")
+    assert "17.0" in text and "fallback 사유: 자료 없음" in text and "10,800" not in text
+    with pytest.raises(ValueError, match="replacement"):
+        write_partial_report(tmp_path, "bad\ufffdfailure")

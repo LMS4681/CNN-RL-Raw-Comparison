@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import html
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -13,6 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from comparison.artifact_manifest import REQUIRED_ENVIRONMENT_KEYS
 from comparison.checkpoint_evaluator import ARMS, EVALUATION_COLUMNS, PRIMARY_TEST_SEEDS, SELECTION_SEEDS
 
 
@@ -31,6 +34,8 @@ RUNTIME_FIELDS = (
     "evaluation_seconds", "selected_checkpoint_timestep", "selection_count",
     "selection_tuple", "checkpoint_identity",
 )
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 
 
 def _read_json(path: Path, *, required: bool = True) -> dict[str, Any]:
@@ -48,13 +53,34 @@ def _read_json(path: Path, *, required: bool = True) -> dict[str, Any]:
 
 
 def _number(value: Any, field: str) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{field} must be a finite number") from error
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a finite JSON number")
+    number = float(value)
     if not math.isfinite(number):
         raise ValueError(f"{field} must be a finite number")
     return number
+
+
+def _csv_number(value: Any, field: str) -> float:
+    if not isinstance(value, str): raise ValueError(f"{field} must be a CSV number")
+    try: number = float(value)
+    except ValueError as error: raise ValueError(f"{field} must be a finite CSV number") from error
+    if not math.isfinite(number): raise ValueError(f"{field} must be a finite CSV number")
+    return number
+
+
+def _integer(value: Any, field: str, *, nonnegative: bool = True) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an integer")
+    if nonnegative and value < 0:
+        raise ValueError(f"{field} must be nonnegative")
+    return value
+
+
+def _sha(value: Any, field: str) -> str:
+    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+        raise ValueError(f"{field} must be SHA-256")
+    return value
 
 
 def _read_evaluation(path: Path, arm: str, seeds: tuple[int, ...]) -> list[dict[str, Any]]:
@@ -80,12 +106,21 @@ def _read_evaluation(path: Path, arm: str, seeds: tuple[int, ...]) -> list[dict[
         row_partition = "selection" if seed in SELECTION_SEEDS else "primary_test"
         if row["evaluation_partition"] != row_partition:
             raise ValueError(f"evaluation partition is invalid: {path}")
+        if row["source"] != "holdout_fixed20" or row["policy"] != arm or not row["checkpoint"]:
+            raise ValueError(f"evaluation CSV has invalid source/policy/checkpoint: {path}")
+        if row["checkpoint"] not in {"best_model", "fallback_final", "common_step"}:
+            raise ValueError(f"evaluation CSV has invalid checkpoint label: {path}")
         converted = dict(row); converted["seed"] = seed
-        for column in HEADLINE_COLUMNS:
-            converted[column] = _number(row[column], column)
+        for column in ("mean_reward", *HEADLINE_COLUMNS, "mean_retained_choice_ratio"):
+            converted[column] = _csv_number(row[column], column)
+        converted["checkpoint_timestep"] = _integer(int(row["checkpoint_timestep"]) if row["checkpoint_timestep"].isdigit() else None, "checkpoint_timestep")
+        converted["checkpoint_sha256"] = _sha(row["checkpoint_sha256"], "checkpoint_sha256")
         normalized.append(converted)
     if tuple(sorted(row["seed"] for row in normalized)) != seeds:
         raise ValueError(f"evaluation CSV must contain exact unique {expected_partition} seeds: {path}")
+    provenance = {(row["checkpoint"], row["checkpoint_timestep"], row["checkpoint_sha256"]) for row in normalized}
+    if len(provenance) != 1:
+        raise ValueError(f"evaluation CSV must have one provenance tuple: {path}")
     return sorted(normalized, key=lambda row: row["seed"])
 
 
@@ -95,26 +130,78 @@ def _load_arm(root: Path, arm: str) -> dict[str, Any]:
     selection = [row for row in all_rows if row["seed"] in SELECTION_SEEDS]
     primary = _read_evaluation(arm_root / "evaluation_primary_test.csv", arm, PRIMARY_TEST_SEEDS)
     all_primary = [row for row in all_rows if row["seed"] in PRIMARY_TEST_SEEDS]
-    if any(any(row[column] != corresponding[column] for column in HEADLINE_COLUMNS) for row, corresponding in zip(primary, all_primary)):
+    if any(row != corresponding for row, corresponding in zip(primary, all_primary)):
         raise ValueError(f"primary CSV disagrees with all-scenarios CSV: {arm}")
     return {"selection_rows": selection, "primary_rows": primary, "all_rows": all_rows, "runtime": _runtime(arm_root / "runtime_metrics.json")}
 
 
 def _runtime(path: Path) -> dict[str, Any]:
     data = _read_json(path)
-    data = {field: data.get(field) for field in RUNTIME_FIELDS}
-    counts = data.get("parameter_counts")
-    if counts is not None:
-        if not isinstance(counts, Mapping) or set(counts) != {"total", "feature_extractor", "policy", "value"}:
-            raise ValueError("parameter_counts must contain exactly total, feature_extractor, policy, value")
-        parsed = {key: int(_number(value, f"parameter_counts.{key}")) for key, value in counts.items()}
-        if any(value < 0 for value in parsed.values()) or parsed["total"] != parsed["feature_extractor"] + parsed["policy"] + parsed["value"]:
-            raise ValueError("disjoint parameter counts do not reconcile")
-        data = dict(data); data["parameter_counts"] = parsed
-    for key, value in data.items():
-        if isinstance(value, float) and not math.isfinite(value):
-            raise ValueError(f"runtime metric {key} must be finite")
+    if set(data) != set(RUNTIME_FIELDS):
+        raise ValueError("runtime_metrics must contain exactly required fields")
+    for key in ("target_training_seconds", "recorded_training_seconds", "end_to_end_training_seconds", "overrun_seconds", "max_unrecorded_seconds", "steps_per_second", "evaluation_seconds"):
+        _number(data[key], key)
+        if data[key] < 0: raise ValueError(f"{key} must be nonnegative")
+    for key in ("restart_count", "start_timestep", "end_timestep", "selected_checkpoint_timestep"):
+        _integer(data[key], key)
+    peak = data["peak_cuda_memory_bytes"]
+    if peak is not None: _integer(peak, "peak_cuda_memory_bytes")
+    counts = data["parameter_counts"]
+    if not isinstance(counts, Mapping) or set(counts) != {"total", "feature_extractor", "policy", "value"}:
+        raise ValueError("parameter_counts must contain exactly total, feature_extractor, policy, value")
+    parsed = {key: _integer(value, f"parameter_counts.{key}") for key, value in counts.items()}
+    if parsed["total"] != parsed["feature_extractor"] + parsed["policy"] + parsed["value"]:
+        raise ValueError("disjoint parameter counts do not reconcile")
+    identity = data["checkpoint_identity"]
+    if not isinstance(identity, Mapping) or set(identity) != {"filename", "sha256"} or not isinstance(identity["filename"], str) or not identity["filename"]:
+        raise ValueError("checkpoint_identity is invalid")
+    _sha(identity["sha256"], "checkpoint_identity.sha256")
+    count = _integer(data["selection_count"], "selection_count")
+    tuple_value = data["selection_tuple"]
+    if count == 0:
+        if tuple_value is not None: raise ValueError("fallback selection_tuple must be null")
+    else:
+        if not isinstance(tuple_value, list) or len(tuple_value) != 3: raise ValueError("selection_tuple must contain three numbers")
+        for value in tuple_value: _number(value, "selection_tuple")
+    data = dict(data); data["parameter_counts"] = parsed
     return data
+
+
+def _environment(root: Path) -> dict[str, Any]:
+    env = _read_json(root / "environment.json")
+    if set(env) != set(REQUIRED_ENVIRONMENT_KEYS): raise ValueError("environment has incomplete schema")
+    for key in ("baseline_sha256",):
+        if not isinstance(env[key], str) or _SHA1.fullmatch(env[key]) is None: raise ValueError(f"environment {key} invalid")
+    for key in ("config_sha256", "scenario_sha256", "split_sha256", "lock_sha256"): _sha(env[key], f"environment {key}")
+    if not isinstance(env["comparison_git_sha"], str) or _SHA1.fullmatch(env["comparison_git_sha"]) is None: raise ValueError("environment comparison_git_sha invalid")
+    if not isinstance(env["comparison_git_dirty"], bool) or not isinstance(env["command"], list) or not isinstance(env["pip_freeze"], list): raise ValueError("environment type invalid")
+    for key in ("captured_at_utc", "python_version", "platform", "vm_boot_id", "torch_version", "resolved_device"):
+        if not isinstance(env[key], str) or not env[key]: raise ValueError(f"environment {key} invalid")
+    cpu = env["resolved_device"] == "cpu"
+    for key in ("gpu_name", "gpu_uuid", "gpu_total_memory_bytes"):
+        if cpu:
+            if env[key] is not None: raise ValueError("CPU environment GPU fields must be null")
+        elif env[key] is None: raise ValueError("GPU environment fields are required")
+    for key in ("cpu_count", "process_id"):
+        _integer(env[key], f"environment {key}")
+    if env["gpu_total_memory_bytes"] is not None: _integer(env["gpu_total_memory_bytes"], "environment gpu_total_memory_bytes")
+    return env
+
+
+def _manifest(root: Path) -> dict[str, Any]:
+    manifest = _read_json(root / "manifest.json")
+    if set(manifest) != {"schema_version", "checkpoints"} or manifest["schema_version"] != 1 or not isinstance(manifest["checkpoints"], Mapping) or set(manifest["checkpoints"]) != set(ARMS):
+        raise ValueError("manifest has incomplete schema")
+    labels = {"selected": {"best_model", "fallback_final"}, "final": {"final"}, "common": {"common_step"}}
+    for arm in ARMS:
+        refs = manifest["checkpoints"][arm]
+        if not isinstance(refs, Mapping) or set(refs) != set(labels): raise ValueError("manifest checkpoint refs incomplete")
+        for kind, allowed in labels.items():
+            ref = refs[kind]
+            if not isinstance(ref, Mapping) or set(ref) != {"path", "label", "sha256", "timestep"} or not isinstance(ref["path"], str) or not ref["path"].startswith(f"{arm}/") or ".." in Path(ref["path"]).parts or ref["label"] not in allowed:
+                raise ValueError("manifest checkpoint ref invalid")
+            _sha(ref["sha256"], "manifest checkpoint sha256"); _integer(ref["timestep"], "manifest checkpoint timestep")
+    return manifest
 
 
 def _means(rows: list[dict[str, Any]]) -> dict[str, float]:
@@ -156,31 +243,54 @@ def _common_summary(root: Path) -> dict[str, Any]:
         arm = row.get("arm")
         if set(row) != set(EVALUATION_COLUMNS) or arm not in grouped or row.get("checkpoint") != "common_step":
             raise ValueError("common-step CSV has invalid arm/checkpoint")
-        normalized = dict(row); normalized["seed"] = int(row["seed"])
+        if not row["seed"].isdigit() or not row["checkpoint_timestep"].isdigit() or row["source"] != "holdout_fixed20" or row["policy"] != arm:
+            raise ValueError("common-step CSV has invalid scalar fields")
+        normalized = dict(row); normalized["seed"] = int(row["seed"]); normalized["checkpoint_timestep"] = int(row["checkpoint_timestep"]); normalized["checkpoint_sha256"] = _sha(row["checkpoint_sha256"], "common checkpoint_sha256")
         if normalized["evaluation_partition"] != ("selection" if normalized["seed"] in SELECTION_SEEDS else "primary_test"):
             raise ValueError("common-step CSV has invalid partition")
         for column in HEADLINE_COLUMNS:
-            normalized[column] = _number(row[column], column)
+            normalized[column] = _csv_number(row[column], column)
         grouped[arm].append(normalized)
     if any(tuple(sorted(row["seed"] for row in values)) != tuple(range(1000, 1020)) for values in grouped.values()):
         raise ValueError("common-step CSV must have exact unique seeds for both arms")
+    provenance = {arm: {(row["checkpoint"], row["checkpoint_timestep"], row["checkpoint_sha256"]) for row in values} for arm, values in grouped.items()}
+    if any(len(value) != 1 for value in provenance.values()): raise ValueError("common-step CSV has inconsistent provenance")
     timesteps = {row["checkpoint_timestep"] for values in grouped.values() for row in values}
     if len(timesteps) != 1:
         raise ValueError("common-step rows must share one timestep")
-    return {"timestep": int(next(iter(timesteps))), **{arm: {"primary_test": _means([row for row in rows if row["seed"] in PRIMARY_TEST_SEEDS]), "all_holdout": _means(rows)} for arm, rows in grouped.items()}}
+    return {"timestep": int(next(iter(timesteps))), "provenance": {arm: next(iter(value)) for arm, value in provenance.items()}, **{arm: {"primary_test": _means([row for row in rows if row["seed"] in PRIMARY_TEST_SEEDS]), "all_holdout": _means(rows)} for arm, rows in grouped.items()}}
+
+
+def _reconcile(arms: Mapping[str, dict[str, Any]], manifest: Mapping[str, Any], common: Mapping[str, Any]) -> None:
+    for arm, data in arms.items():
+        selected = manifest["checkpoints"][arm]["selected"]
+        runtime = data["runtime"]
+        evidence = data["all_rows"][0]
+        expected = (selected["label"], selected["timestep"], selected["sha256"])
+        actual = (evidence["checkpoint"], evidence["checkpoint_timestep"], evidence["checkpoint_sha256"])
+        if actual != expected or runtime["selected_checkpoint_timestep"] != selected["timestep"] or runtime["checkpoint_identity"]["sha256"] != selected["sha256"] or runtime["checkpoint_identity"]["filename"] != Path(selected["path"]).name:
+            raise ValueError("selected checkpoint reconciliation failed")
+        if (runtime["selection_count"] > 0) != (selected["label"] == "best_model"):
+            raise ValueError("selection_count semantics do not match selected checkpoint")
+        common_ref = manifest["checkpoints"][arm]["common"]
+        label, timestep, digest = common["provenance"][arm]
+        if (label, timestep, digest) != (common_ref["label"], common_ref["timestep"], common_ref["sha256"]):
+            raise ValueError("common checkpoint reconciliation failed")
 
 
 def build_comparison_summary(root: str | Path) -> dict[str, Any]:
     """Read only canonical artifacts and return a JSON-safe, finite comparison summary."""
     base = Path(root)
     arms = {arm: _load_arm(base, arm) for arm in ARMS}
+    environment = _environment(base); manifest = _manifest(base); common = _common_summary(base)
+    _reconcile(arms, manifest, common)
     result: dict[str, Any] = {
         "schema_version": 1,
         "primary_test_definition": {"seeds": list(PRIMARY_TEST_SEEDS), "training_runs": 1, "seed": 0},
         "selection_definition": {"seeds": list(SELECTION_SEEDS), "role": "checkpoint_selection_only"},
-        "environment": _read_json(base / "environment.json"),
-        "manifest": _read_json(base / "manifest.json"),
-        "common_step": _common_summary(base),
+        "environment": environment,
+        "manifest": manifest,
+        "common_step": common,
     }
     for arm, data in arms.items():
         result[arm] = {"selection": _means(data["selection_rows"]), "primary_test": _means(data["primary_rows"]), "all_holdout": _means(data["all_rows"]), "runtime_metrics": data["runtime"]}
@@ -211,13 +321,13 @@ def _learning_plot(root: Path, output: Path) -> None:
             with path.open(encoding="utf-8", newline="") as stream:
                 rows = list(csv.DictReader(stream))
             if rows and {"timestep", "terminal_score"} <= set(rows[0]):
-                axes[0].plot([_number(row["timestep"], "timestep") for row in rows], [_number(row["terminal_score"], "terminal_score") for row in rows], label=label)
+                axes[0].plot([_csv_number(row["timestep"], "timestep") for row in rows], [_csv_number(row["terminal_score"], "terminal_score") for row in rows], label=label)
         progress = root / arm / "progress_timing.csv"
         if progress.is_file():
             with progress.open(encoding="utf-8", newline="") as stream:
                 rows = list(csv.DictReader(stream))
             if rows and {"recorded_training_seconds", "timestep"} <= set(rows[0]):
-                axes[1].plot([_number(row["recorded_training_seconds"], "recorded_training_seconds") for row in rows], [_number(row["timestep"], "timestep") for row in rows], label=label)
+                axes[1].plot([_csv_number(row["recorded_training_seconds"], "recorded_training_seconds") for row in rows], [_csv_number(row["timestep"], "timestep") for row in rows], label=label)
     axes[0].set(title="Episode terminal score", xlabel="timestep", ylabel="score")
     axes[1].set(title="Checkpoint progress", xlabel="recorded subprocess seconds", ylabel="timestep")
     for axis in axes:
@@ -241,10 +351,9 @@ def _report_text(summary: Mapping[str, Any], pairs: list[dict]) -> str:
     raw, cnn = summary["raw_direct"], summary["candidate_cnn"]
     def budget(arm: Mapping[str, Any]) -> str:
         runtime = arm["runtime_metrics"]; count = runtime.get("selection_count")
-        if count is None: return MISSING
         if int(count) > 0:
-            return f"validation-selected checkpoint: timestep {_cell(runtime.get('selected_checkpoint_timestep'))}, selection count {count}, tuple {_cell(runtime.get('selection_tuple'))}"
-        return f"fallback_final: selection count 0 (fallback reason: periodic selection evidence unavailable)"
+            return f"label=best_model, timestep {_cell(runtime.get('selected_checkpoint_timestep'))}, SHA={_cell(runtime.get('checkpoint_identity', {}).get('sha256'))}, selection count {count}, tuple {_cell(runtime.get('selection_tuple'))}"
+        return f"label=fallback_final, timestep {_cell(runtime.get('selected_checkpoint_timestep'))}, SHA={_cell(runtime.get('checkpoint_identity', {}).get('sha256'))}, selection count 0, fallback 사유: 자료 없음"
     pair_mean = {key: sum(row[key] for row in pairs) / len(pairs) for key in PAIR_COLUMNS[1:]}
     return f"""# Raw-direct vs Candidate-CNN 예비 결과
 
@@ -258,7 +367,7 @@ def _report_text(summary: Mapping[str, Any], pairs: list[dict]) -> str:
 
 ## 3시간 budget 및 주 비교
 
-각 arm의 target은 10,800 recorded training-subprocess seconds이다. raw-direct: {budget(raw)}. candidate-CNN: {budget(cnn)}. 주 성능은 checkpoint 선택에 쓰지 않은 primary_test seed 1005..1019의 15개 scenario 평균이며, 이는 15개의 독립 학습 실행이 아니라 하나의 seed 0 실행에서 짝지은 평가다. raw terminal score={raw['primary_test']['mean_terminal_score']:.6g}, CNN terminal score={cnn['primary_test']['mean_terminal_score']:.6g}; 이 수치만으로 우열 또는 통계적 유의성을 결론내리지 않는다.
+raw-direct: target={_cell(raw['runtime_metrics']['target_training_seconds'])}, recorded={_cell(raw['runtime_metrics']['recorded_training_seconds'])}, end-to-end={_cell(raw['runtime_metrics']['end_to_end_training_seconds'])}, overrun={_cell(raw['runtime_metrics']['overrun_seconds'])}, restarts={_cell(raw['runtime_metrics']['restart_count'])}, max-unrecorded={_cell(raw['runtime_metrics']['max_unrecorded_seconds'])}, timestep={_cell(raw['runtime_metrics']['start_timestep'])}->{_cell(raw['runtime_metrics']['end_timestep'])}, evaluation seconds={_cell(raw['runtime_metrics']['evaluation_seconds'])}; {budget(raw)}. candidate-CNN: target={_cell(cnn['runtime_metrics']['target_training_seconds'])}, recorded={_cell(cnn['runtime_metrics']['recorded_training_seconds'])}, end-to-end={_cell(cnn['runtime_metrics']['end_to_end_training_seconds'])}, overrun={_cell(cnn['runtime_metrics']['overrun_seconds'])}, restarts={_cell(cnn['runtime_metrics']['restart_count'])}, max-unrecorded={_cell(cnn['runtime_metrics']['max_unrecorded_seconds'])}, timestep={_cell(cnn['runtime_metrics']['start_timestep'])}->{_cell(cnn['runtime_metrics']['end_timestep'])}, evaluation seconds={_cell(cnn['runtime_metrics']['evaluation_seconds'])}; {budget(cnn)}. 주 성능은 checkpoint 선택에 쓰지 않은 primary_test seed 1005..1019의 15개 scenario 평균이며, 이는 15개의 독립 학습 실행이 아니라 하나의 seed 0 실행에서 짝지은 평가다. raw terminal score={raw['primary_test']['mean_terminal_score']:.6g}, CNN terminal score={cnn['primary_test']['mean_terminal_score']:.6g}; 이 수치만으로 우열 또는 통계적 유의성을 결론내리지 않는다.
 
 ## 공통 timestep과 효율
 
@@ -288,7 +397,9 @@ def write_complete_report(root: str | Path) -> Path:
 
 def write_partial_report(root: str | Path, failure: str) -> Path:
     """Document a failed stage without fabricating report data or COMPLETE.json."""
+    if "\ufffd" in failure: raise ValueError("failure text contains replacement character")
     base = Path(root); raw_ok = (base / "raw_direct" / "runtime_metrics.json").is_file(); cnn_ok = (base / "candidate_cnn" / "runtime_metrics.json").is_file()
-    text = f"# 부분 비교 보고서\n\n실패 원인: {failure}\n\n사용 가능 단계: raw-direct runtime={'있음' if raw_ok else '없음'}, candidate-CNN runtime={'있음' if cnn_ok else '없음'}.\n\n누락 단계는 재개 후 canonical 평가 CSV와 runtime metadata를 생성해야 한다. 후보 CNN 결과가 없어 우열을 결론내리지 않음. 누락 수치는 {MISSING}이며 0 또는 추정값으로 대체하지 않는다.\n"
+    state = "후보 CNN 결과가 없어 우열을 결론내리지 않음" if raw_ok and not cnn_ok else ("raw-direct 결과가 없어 비교를 결론내리지 않음" if cnn_ok and not raw_ok else ("두 arm 모두 없어서 비교를 결론내리지 않음" if not raw_ok and not cnn_ok else "두 arm 자료는 있으나 무결성 또는 보고 단계가 불완전하여 결론내리지 않음"))
+    text = f"# 부분 비교 보고서\n\n실패 원인: {html.escape(failure)}\n\n사용 가능 단계: raw-direct runtime={'있음' if raw_ok else '없음'}, candidate-CNN runtime={'있음' if cnn_ok else '없음'}.\n\n{state}. 누락 수치는 {MISSING}이며 0 또는 추정값으로 대체하지 않는다. 같은 output_root로 같은 experiment runner/notebook을 다시 실행하여 검증 완료 stage를 건너뛰고 재개한다.\n"
     path = base / "comparison" / "PARTIAL_REPORT.md"; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(text, encoding="utf-8", newline="\n")
     return path
