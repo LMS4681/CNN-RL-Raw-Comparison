@@ -390,3 +390,23 @@ def test_public_harness_refreshes_lease_while_smoke_action_blocks(tmp_path: Path
         time.sleep(.01)
     release.set(); worker.join(2)
     assert len(seen) >= 2 and not worker.is_alive() and json.loads((tmp_path / "lease.json").read_text())["status"] == "released"
+
+
+def test_blocked_owner_cannot_overwrite_or_delete_stolen_lease(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, LeaseError, run_overnight_experiment
+    calls, actions, hashers = _public_harness(); entered = threading.Event(); release = threading.Event(); errors = []
+    def block():
+        entered.set(); assert release.wait(2)
+    actions["smoke_raw_direct"] = block
+    def invoke():
+        try: run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=.01)
+        except BaseException as error: errors.append(error)
+    worker = threading.Thread(target=invoke, daemon=True); worker.start(); assert entered.wait(1)
+    old = json.loads((tmp_path / "lease.json").read_text()); replacement = dict(old); replacement["token"] = "new-token"
+    from comparison.experiment_runner import atomic_write_json
+    atomic_write_json(tmp_path / "lease.json", replacement); (tmp_path / ".lease.acquire").write_text("new-token\n", encoding="utf-8")
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline and not errors: time.sleep(.01)
+    release.set(); worker.join(2)
+    assert errors and isinstance(errors[0], LeaseError) and not (tmp_path / "COMPLETE.json").exists()
+    assert json.loads((tmp_path / "lease.json").read_text())["token"] == "new-token" and (tmp_path / ".lease.acquire").read_text(encoding="utf-8").strip() == "new-token"
