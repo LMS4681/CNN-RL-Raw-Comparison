@@ -260,3 +260,43 @@ def test_valid_stage_journal_and_no_replacement_source():
     assert _stage_journal({"preflight": {"status":"complete", "input_sha256":"a" * 64, "output_sha256":"b" * 64, "started_at_utc":"2026-01-01T00:00:00+00:00", "completed_at_utc":"2026-01-01T00:01:00+00:00", "error":None}}).startswith("completed: preflight")
     root = Path(__file__).resolve().parents[1]
     assert all("\ufffd" not in path.read_text(encoding="utf-8") for path in (root / "AllocRL" / "comparison").glob("*.py"))
+
+
+@pytest.mark.parametrize("field,value", [("selection_tuple", [float("nan"), 0.0, 0.0]), ("parameter_counts.policy", True), ("parameter_counts.policy", 1.5), ("selected_checkpoint_timestep", 99)])
+def test_runtime_integrity_matrix(tmp_path, field, value):
+    from comparison.report_builder import build_comparison_summary
+    write_complete_fixture(tmp_path); path = tmp_path / "raw_direct" / "runtime_metrics.json"; payload = json.loads(path.read_text("utf-8"))
+    if "." in field: outer, inner = field.split("."); payload[outer][inner] = value
+    else: payload[field] = value
+    _json(path, payload)
+    with pytest.raises(ValueError): build_comparison_summary(tmp_path)
+
+
+@pytest.mark.parametrize("field,value", [("checkpoint", "fallback_final"), ("checkpoint_timestep", "49999"), ("checkpoint_sha256", "0" * 64), ("mean_reward", "9.9")])
+def test_primary_all_provenance_and_metric_matrix(tmp_path, field, value):
+    from comparison.report_builder import build_comparison_summary
+    write_complete_fixture(tmp_path); path = tmp_path / "raw_direct" / "evaluation_primary_test.csv"
+    with path.open(encoding="utf-8", newline="") as stream: rows = list(csv.DictReader(stream))
+    rows[0][field] = value; _write_csv(path, rows)
+    with pytest.raises(ValueError): build_comparison_summary(tmp_path)
+
+
+@pytest.mark.parametrize("arm,kind,field,value", [(arm, kind, field, value) for arm in ("raw_direct", "candidate_cnn") for kind in ("selected", "final", "common") for field, value in (("label", "wrong"), ("timestep", "x"), ("sha256", "x"), ("path", 1))])
+def test_manifest_ref_matrix(tmp_path, arm, kind, field, value):
+    from comparison.report_builder import build_comparison_summary
+    write_complete_fixture(tmp_path); path = tmp_path / "manifest.json"; payload = json.loads(path.read_text("utf-8")); payload["checkpoints"][arm][kind][field] = value; _json(path, payload)
+    with pytest.raises(ValueError): build_comparison_summary(tmp_path)
+
+
+@pytest.mark.parametrize("key,value", [("baseline_sha256", "x"), ("config_sha256", "x"), ("scenario_sha256", "x"), ("split_sha256", "x"), ("lock_sha256", "x"), ("resolved_device", 3), ("command", "x"), ("pip_freeze", "x")])
+def test_environment_integrity_matrix(tmp_path, key, value):
+    from comparison.report_builder import build_comparison_summary
+    write_complete_fixture(tmp_path); path = tmp_path / "environment.json"; payload = json.loads(path.read_text("utf-8")); payload[key] = value; _json(path, payload)
+    with pytest.raises(ValueError): build_comparison_summary(tmp_path)
+
+
+@pytest.mark.parametrize("arm,kind", [(arm, kind) for arm in ("raw_direct", "candidate_cnn") for kind in ("selected", "final", "common")])
+def test_manifest_missing_ref_matrix(tmp_path, arm, kind):
+    from comparison.report_builder import build_comparison_summary
+    write_complete_fixture(tmp_path); path = tmp_path / "manifest.json"; payload = json.loads(path.read_text("utf-8")); del payload["checkpoints"][arm][kind]; _json(path, payload)
+    with pytest.raises(ValueError): build_comparison_summary(tmp_path)
