@@ -7,6 +7,7 @@ import math
 import hashlib
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -128,14 +129,158 @@ def test_semantic_preflight_hash_ignores_later_checkpoint_manifest_updates(tmp_p
         atomic_write_json(tmp_path / "environment.json", {key: None for key in REQUIRED_ENVIRONMENT_KEYS})
         atomic_write_json(tmp_path / "manifest.json", {
             "schema_version": 1, "baseline_sha256": "b", "config_sha256": "c",
-            "scenario_sha256": "s", "split_sha256": "p", "lock_sha256": "l", "checkpoints": {},
+            "scenario_sha256": "s", "split_sha256": "p", "lock_sha256": "l",
+            "comparison_git_sha": "a" * 40, "comparison_git_dirty": False,
+            "checkpoints": {},
         })
     runner.run_stage("preflight", preflight_output)
+    before = runner.output_hash("preflight")
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
     manifest["checkpoints"] = {"raw_direct": {"selected": {"path": "raw_direct/x.sb3"}}}
     atomic_write_json(tmp_path / "manifest.json", manifest)
     runner.run_stage("preflight", lambda: pytest.fail("preflight must remain complete"))
-    assert calls == ["preflight"]
+    assert calls == ["preflight"] and runner.output_hash("preflight") == before
+    manifest["comparison_git_sha"] = "b" * 40
+    atomic_write_json(tmp_path / "manifest.json", manifest)
+    assert runner.output_hash("preflight") != before
+
+
+def _scenario_document(seeds=range(1000, 1020)):
+    return {
+        "schema_version": 3,
+        "metadata": {},
+        "scenarios": [
+            {"seed": seed, "source": "test", "blocks": [], "workspaces": []}
+            for seed in seeds
+        ],
+    }
+
+
+def _preflight_runner(tmp_path: Path, monkeypatch, *, scenario_payload=None):
+    from comparison import experiment_runner as runner_module
+    from comparison.artifact_manifest import sha256_file
+    from comparison.experiment_runner import ExperimentConfig, _Runner
+
+    base = tmp_path / "allocrl"
+    data = base / "data"
+    data.mkdir(parents=True)
+    scenario = data / "fixed_eval_scenarios.json"
+    scenario.write_text(json.dumps(_scenario_document() if scenario_payload is None else scenario_payload), encoding="utf-8")
+    split = data / "data_split_manifest.json"
+    split.write_text("split", encoding="utf-8")
+    lock = base / "requirements-comparison.txt"
+    lock.write_text("lock", encoding="utf-8")
+    config = replace(
+        ExperimentConfig.for_test(),
+        fixed_scenarios_sha256=sha256_file(scenario),
+        split_manifest_sha256=sha256_file(split),
+    )
+    monkeypatch.setattr(runner_module, "_allocrl_dir", lambda: base)
+    return runner_module, _Runner(
+        config, tmp_path / "output", subprocess_runner=lambda *args, **kwargs: None,
+        clock=lambda: 0.0, python_executable=None, archive_timestep_reader=None,
+        runner_command=["C:/Program Files/Python/python.exe", "runner.py", "--output-root", "C:/Drive Folder/output root"],
+    )
+
+
+def _valid_root_environment(provenance, *, command=None):
+    from comparison.artifact_manifest import REQUIRED_ENVIRONMENT_KEYS
+
+    environment = {key: None for key in REQUIRED_ENVIRONMENT_KEYS}
+    environment.update({
+        "captured_at_utc": "2026-07-21T00:00:00Z",
+        "command": list(command or ["python", "runner.py"]),
+        "python_version": "3.12",
+        "platform": "test-platform",
+        "comparison_git_sha": "a" * 40,
+        "comparison_git_dirty": False,
+        "vm_boot_id": "boot-id",
+        "torch_version": "2.0",
+        "cuda_version": None,
+        "cudnn_version": None,
+        "resolved_device": "cpu",
+        "gpu_name": None,
+        "gpu_uuid": None,
+        "gpu_total_memory_bytes": None,
+        "cpu_count": 1,
+        "process_id": 1,
+        "pip_freeze": [],
+    })
+    environment.update(provenance)
+    return environment
+
+
+@pytest.mark.parametrize("case", ["missing", "hash_mismatch", "malformed", "nineteen", "duplicate", "out_of_order"])
+def test_preflight_rejects_invalid_fixed_scenarios_before_environment_capture(tmp_path: Path, monkeypatch, case: str):
+    from comparison.experiment_runner import ExperimentIntegrityError
+    from comparison.artifact_manifest import sha256_file
+
+    payloads = {
+        "malformed": "{not JSON",
+        "nineteen": _scenario_document(range(1000, 1019)),
+        "duplicate": _scenario_document([*range(1000, 1019), 1018]),
+        "out_of_order": _scenario_document([1001, 1000, *range(1002, 1020)]),
+    }
+    runner_module, runner = _preflight_runner(tmp_path, monkeypatch, scenario_payload=payloads.get(case))
+    scenario = runner_module._allocrl_dir() / "data" / "fixed_eval_scenarios.json"
+    if case == "missing":
+        scenario.unlink()
+    elif case == "hash_mismatch":
+        runner.config = replace(runner.config, fixed_scenarios_sha256="f" * 64)
+    elif case == "malformed":
+        runner.config = replace(runner.config, fixed_scenarios_sha256=sha256_file(scenario))
+    monkeypatch.setattr(runner_module, "collect_environment", lambda *args, **kwargs: pytest.fail("environment capture must follow scenario validation"))
+    with pytest.raises(ExperimentIntegrityError):
+        runner.preflight()
+
+
+def test_preflight_records_actual_runner_command_and_strict_manifest_provenance(tmp_path: Path, monkeypatch):
+    runner_module, runner = _preflight_runner(tmp_path, monkeypatch)
+    provenance = runner.provenance()
+    seen = []
+    monkeypatch.setattr(runner_module, "collect_environment", lambda command, supplied: (seen.append((command, supplied)), _valid_root_environment(supplied, command=command))[1])
+
+    runner.preflight()
+
+    environment = json.loads((runner.root / "environment.json").read_text(encoding="utf-8"))
+    manifest = json.loads((runner.root / "manifest.json").read_text(encoding="utf-8"))
+    assert seen == [(runner.runner_command, provenance)]
+    assert environment["command"] == ["C:/Program Files/Python/python.exe", "runner.py", "--output-root", "C:/Drive Folder/output root"]
+    assert manifest == {
+        "schema_version": 1, **provenance, "comparison_git_sha": "a" * 40,
+        "comparison_git_dirty": False, "checkpoints": {},
+    }
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda environment: environment.pop("command"),
+    lambda environment: environment.update(comparison_git_sha="A" * 40),
+    lambda environment: environment.update(comparison_git_dirty=True),
+    lambda environment: environment.update(baseline_sha256="b" * 40),
+    lambda environment: environment.update(command="python runner.py"),
+    lambda environment: environment.update(resolved_device="cuda:0", gpu_name=None, gpu_uuid="GPU-a", gpu_total_memory_bytes=1),
+])
+def test_preflight_rejects_root_environment_schema_types_and_provenance(tmp_path: Path, monkeypatch, mutation):
+    from comparison.experiment_runner import ExperimentIntegrityError
+
+    runner_module, runner = _preflight_runner(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner_module, "collect_environment", lambda command, provenance: (mutation(environment := _valid_root_environment(provenance, command=command)), environment)[1])
+    with pytest.raises(ExperimentIntegrityError):
+        runner.preflight()
+
+
+@pytest.mark.parametrize("environment", [
+    {"resolved_device": "cpu", "gpu_name": None, "gpu_uuid": None, "gpu_total_memory_bytes": None},
+    {"resolved_device": "cuda:0", "gpu_name": "GPU", "gpu_uuid": None, "gpu_total_memory_bytes": 1},
+])
+def test_production_preflight_requires_real_cuda_identity(tmp_path: Path, monkeypatch, environment):
+    from comparison.experiment_runner import ExperimentIntegrityError
+
+    runner_module, runner = _preflight_runner(tmp_path, monkeypatch)
+    runner.config = replace(runner.config, production_loaded=True)
+    monkeypatch.setattr(runner_module, "collect_environment", lambda command, provenance: _valid_root_environment(provenance, command=command) | environment)
+    with pytest.raises(ExperimentIntegrityError, match="production preflight requires CUDA"):
+        runner.preflight()
 
 
 def test_malformed_completed_journal_is_rejected_before_it_is_trusted(tmp_path: Path):

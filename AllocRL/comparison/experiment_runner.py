@@ -32,6 +32,8 @@ from comparison.artifact_manifest import (
 from comparison.checkpoint_evaluator import evaluate_comparison_artifacts
 from comparison.report_builder import JOURNAL_STAGES, JOURNAL_STATUSES, write_complete_report, write_partial_report
 from comparison.wall_clock_callback import atomic_write_json, read_wall_clock_state, resolve_state_checkpoint
+from evaluation_scenarios import read_scenarios
+from holdout_model_selection import validate_fixed_holdout_scenarios
 
 
 PRODUCTION_CONFIG = {
@@ -50,6 +52,7 @@ PRODUCTION_CONFIG = {
 _OPERATING_OVERRIDES = frozenset({"target_training_seconds_per_arm", "timesteps_ceiling", "checkpoint_freq", "checkpoint_heartbeat_seconds", "holdout_eval_freq", "smoke_timesteps"})
 _SHA256 = __import__("re").compile(r"[0-9a-f]{64}\Z")
 _SHA1 = __import__("re").compile(r"[0-9a-f]{40}\Z")
+_CUDA_DEVICE = __import__("re").compile(r"cuda:[0-9]+\Z")
 REQUIRED_COMPLETE_STAGES = list(JOURNAL_STAGES)
 
 
@@ -77,6 +80,78 @@ def _json(path: Path) -> dict[str, Any]:
 
 def _valid_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_root_environment(
+    environment: Mapping[str, Any],
+    provenance: Mapping[str, str],
+    *,
+    production_loaded: bool,
+) -> None:
+    """Reject a root capture that cannot prove its checkout and hardware facts."""
+    if set(environment) != set(REQUIRED_ENVIRONMENT_KEYS):
+        raise ExperimentIntegrityError("root environment schema differs")
+    command = environment["command"]
+    if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
+        raise ExperimentIntegrityError("root environment command must be a list of strings")
+    if not isinstance(environment["comparison_git_sha"], str) or _SHA1.fullmatch(environment["comparison_git_sha"]) is None:
+        raise ExperimentIntegrityError("comparison_git_sha must be a lowercase commit SHA")
+    if environment["comparison_git_dirty"] is not False:
+        raise ExperimentIntegrityError("comparison checkout must identify a clean commit")
+    for key, pattern in (
+        ("baseline_sha256", _SHA1),
+        ("config_sha256", _SHA256),
+        ("scenario_sha256", _SHA256),
+        ("split_sha256", _SHA256),
+        ("lock_sha256", _SHA256),
+    ):
+        value = environment[key]
+        if not isinstance(value, str) or pattern.fullmatch(value) is None or value != provenance.get(key):
+            raise ExperimentIntegrityError(f"root environment provenance mismatch: {key}")
+    for key in ("captured_at_utc", "python_version", "platform", "vm_boot_id", "torch_version"):
+        if not _nonempty_string(environment[key]):
+            raise ExperimentIntegrityError(f"root environment type mismatch: {key}")
+    if environment["cuda_version"] is not None and not _nonempty_string(environment["cuda_version"]):
+        raise ExperimentIntegrityError("root environment type mismatch: cuda_version")
+    if environment["cudnn_version"] is not None and not isinstance(environment["cudnn_version"], (str, int)):
+        raise ExperimentIntegrityError("root environment type mismatch: cudnn_version")
+    if not isinstance(environment["pip_freeze"], list) or not all(isinstance(item, str) for item in environment["pip_freeze"]):
+        raise ExperimentIntegrityError("root environment type mismatch: pip_freeze")
+    if (not isinstance(environment["cpu_count"], int) or isinstance(environment["cpu_count"], bool) or environment["cpu_count"] <= 0
+            or not isinstance(environment["process_id"], int) or isinstance(environment["process_id"], bool) or environment["process_id"] <= 0):
+        raise ExperimentIntegrityError("root environment type mismatch: process metadata")
+    device = environment["resolved_device"]
+    is_cuda = isinstance(device, str) and _CUDA_DEVICE.fullmatch(device) is not None
+    gpu_values = (environment["gpu_name"], environment["gpu_uuid"], environment["gpu_total_memory_bytes"])
+    has_gpu_identity = (_nonempty_string(gpu_values[0]) and _nonempty_string(gpu_values[1])
+                        and isinstance(gpu_values[2], int) and not isinstance(gpu_values[2], bool) and gpu_values[2] > 0)
+    if production_loaded and (not is_cuda or not has_gpu_identity):
+        raise ExperimentIntegrityError("production preflight requires CUDA resolved device with GPU identity")
+    if device == "cpu":
+        if gpu_values != (None, None, None):
+            raise ExperimentIntegrityError("CPU environment must not claim GPU metadata")
+    elif not is_cuda or not has_gpu_identity:
+        raise ExperimentIntegrityError("CUDA environment metadata is incoherent")
+
+
+def _validate_root_manifest(
+    manifest: Mapping[str, Any],
+    provenance: Mapping[str, str],
+    environment: Mapping[str, Any],
+) -> None:
+    if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 1:
+        raise ExperimentIntegrityError("root manifest schema differs")
+    for key, value in provenance.items():
+        if manifest.get(key) != value:
+            raise ExperimentIntegrityError(f"root manifest provenance mismatch: {key}")
+    if manifest.get("comparison_git_sha") != environment["comparison_git_sha"] or manifest.get("comparison_git_dirty") is not False:
+        raise ExperimentIntegrityError("root manifest comparison checkout mismatch")
+    if not isinstance(manifest.get("checkpoints"), dict):
+        raise ExperimentIntegrityError("root manifest checkpoints must be an object")
 
 
 @dataclass(frozen=True)
@@ -215,8 +290,11 @@ def _boot_id() -> str:
 
 
 class _Runner:
-    def __init__(self, config: ExperimentConfig, root: Path, *, subprocess_runner: Callable[..., Any], clock: Callable[[], float], python_executable: str | None, archive_timestep_reader: Callable[[Path], int | None] | None, output_hasher: Callable[[str], str] | None = None) -> None:
-        self.config=config; self.root=root.resolve(); self.subprocess_runner=subprocess_runner; self.clock=clock; self.python=python_executable or sys.executable; self.archive_reader=archive_timestep_reader; self.journal_path=self.root/"stage_journal.json"; self.lock_sha=""; self._injected_output_hasher=output_hasher
+    def __init__(self, config: ExperimentConfig, root: Path, *, subprocess_runner: Callable[..., Any], clock: Callable[[], float], python_executable: str | None, archive_timestep_reader: Callable[[Path], int | None] | None, output_hasher: Callable[[str], str] | None = None, runner_command: Sequence[str] | None = None) -> None:
+        command = list(sys.argv if runner_command is None else runner_command)
+        if not all(isinstance(part, str) for part in command):
+            raise ValueError("runner_command must contain only strings")
+        self.config=config; self.root=root.resolve(); self.subprocess_runner=subprocess_runner; self.clock=clock; self.python=python_executable or sys.executable; self.archive_reader=archive_timestep_reader; self.journal_path=self.root/"stage_journal.json"; self.lock_sha=""; self._injected_output_hasher=output_hasher; self.runner_command=command
     def journal(self) -> dict[str, dict[str, Any]]:
         if not self.journal_path.exists(): return {name:_journal_entry() for name in JOURNAL_STAGES}
         data=_json(self.journal_path)
@@ -246,7 +324,7 @@ class _Runner:
         if name == "preflight":
             manifest = _json(self.root / "manifest.json")
             environment = _json(self.root / "environment.json")
-            stable_manifest = {key: manifest.get(key) for key in ("schema_version", "baseline_sha256", "config_sha256", "scenario_sha256", "split_sha256", "lock_sha256")}
+            stable_manifest = {key: manifest.get(key) for key in ("schema_version", "baseline_sha256", "config_sha256", "scenario_sha256", "split_sha256", "lock_sha256", "comparison_git_sha", "comparison_git_dirty")}
             return canonical_json_sha256({"manifest": stable_manifest, "environment": environment})
         if name.startswith("smoke_"):
             return sha256_file(self.stage_path(name))
@@ -303,13 +381,22 @@ class _Runner:
             if not path.is_file(): raise ExperimentIntegrityError(f"required {key} input is absent: {path}")
         scenario,split,lock=(sha256_file(paths[key]) for key in ("scenario","split","lock"))
         if scenario!=self.config.fixed_scenarios_sha256 or split!=self.config.split_manifest_sha256: raise ExperimentIntegrityError("immutable input hash mismatch")
+        try:
+            scenarios = read_scenarios(paths["scenario"])
+            if any(type(item["seed"]) is not int for item in scenarios):
+                raise ValueError("fixed holdout seeds must be JSON integers")
+            validate_fixed_holdout_scenarios(scenarios)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, KeyError) as error:
+            raise ExperimentIntegrityError("fixed scenario bundle is malformed or violates the exact holdout seed protocol") from error
         self.lock_sha=lock
         return {"baseline_sha256":self.config.baseline_commit,"config_sha256":self.config.config_sha256,"scenario_sha256":scenario,"split_sha256":split,"lock_sha256":lock}
     def preflight(self) -> None:
-        provenance=self.provenance(); environment=collect_environment([], provenance)
-        if set(environment)!=set(REQUIRED_ENVIRONMENT_KEYS): raise ExperimentIntegrityError("root environment schema differs")
+        provenance=self.provenance(); environment=collect_environment(self.runner_command, provenance)
+        _validate_root_environment(environment, provenance, production_loaded=self.config.production_loaded)
+        manifest={"schema_version":1, **provenance, "comparison_git_sha":environment["comparison_git_sha"], "comparison_git_dirty":environment["comparison_git_dirty"], "checkpoints":{}}
+        _validate_root_manifest(manifest, provenance, environment)
         atomic_write_json(self.root/"environment.json",environment)
-        atomic_write_json(self.root/"manifest.json",{"schema_version":1, **provenance, "checkpoints":{}})
+        atomic_write_json(self.root/"manifest.json",manifest)
     def smoke(self, arm: str) -> None:
         self.command(f"smoke_{arm}",build_smoke_command(arm,self.config,output_root=self.root,python_executable=self.python))
         marker=self.root/"smoke"/arm/"runner_verified.json"
@@ -356,7 +443,8 @@ class _Runner:
         evaluate_comparison_artifacts(self.root,self.root/"raw_direct",self.root/"candidate_cnn",records,raw_config,cnn_config)
     def integrity(self) -> None:
         provenance=self.provenance(); manifest=_json(self.root/"manifest.json"); environment=_json(self.root/"environment.json")
-        if any(manifest.get(key)!=value for key,value in provenance.items()) or set(environment)!=set(REQUIRED_ENVIRONMENT_KEYS): raise ExperimentIntegrityError("root provenance mismatch")
+        _validate_root_environment(environment, provenance, production_loaded=self.config.production_loaded)
+        _validate_root_manifest(manifest, provenance, environment)
         for arm in ("raw_direct","candidate_cnn"):
             state=read_wall_clock_state(self.root/arm/"run_state.json")
             if not self._state_complete(self.root/arm,state): raise ExperimentIntegrityError("incomplete arm")
@@ -383,12 +471,12 @@ class _Runner:
         atomic_write_json(self.root/"integrity_verification.json", {"manifest_sha256": sha256_file(self.root / "manifest.json"), "verified_at_utc": _utc()})
 
 
-def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_root: str | Path, *, subprocess_runner: Callable[..., Any] = subprocess.run, clock: Callable[[], float] = time.monotonic, python_executable: str | None = None, archive_timestep_reader: Callable[[Path], int | None] | None = None, stale_takeover: bool = False, lease_interval_seconds: float = 60, lease_stale_seconds: float = 900, stage_actions: Mapping[str, Callable[[], None]] | None = None, stage_output_hashers: Mapping[str, Callable[[], str]] | None = None) -> None:
+def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_root: str | Path, *, subprocess_runner: Callable[..., Any] = subprocess.run, clock: Callable[[], float] = time.monotonic, python_executable: str | None = None, archive_timestep_reader: Callable[[Path], int | None] | None = None, runner_command: Sequence[str] | None = None, stale_takeover: bool = False, lease_interval_seconds: float = 60, lease_stale_seconds: float = 900, stage_actions: Mapping[str, Callable[[], None]] | None = None, stage_output_hashers: Mapping[str, Callable[[], str]] | None = None) -> None:
     if not _valid_number(lease_interval_seconds) or float(lease_interval_seconds) <= 0 or not _valid_number(lease_stale_seconds) or float(lease_stale_seconds) <= 0: raise ValueError("lease intervals must be positive finite numbers")
     if (stage_actions is None) != (stage_output_hashers is None): raise ValueError("stage actions and output hashers must be supplied together")
     if stage_actions is not None and (set(stage_actions) != set(JOURNAL_STAGES) or set(stage_output_hashers or ()) != set(JOURNAL_STAGES) or not all(callable(value) for value in stage_actions.values()) or not all(callable(value) for value in (stage_output_hashers or {}).values())): raise ValueError("test stage mappings must have exact callable journal-stage keys")
     config=config_path if isinstance(config_path,ExperimentConfig) else load_experiment_config(config_path)
-    root=Path(output_root).resolve(); root.mkdir(parents=True,exist_ok=True); runner=_Runner(config,root,subprocess_runner=subprocess_runner,clock=clock,python_executable=python_executable,archive_timestep_reader=archive_timestep_reader,output_hasher=(lambda name: stage_output_hashers[name]()) if stage_output_hashers else None)
+    root=Path(output_root).resolve(); root.mkdir(parents=True,exist_ok=True); runner=_Runner(config,root,subprocess_runner=subprocess_runner,clock=clock,python_executable=python_executable,archive_timestep_reader=archive_timestep_reader,output_hasher=(lambda name: stage_output_hashers[name]()) if stage_output_hashers else None,runner_command=runner_command)
     lease = _Lease(root,stale_takeover=stale_takeover,clock=clock,interval=lease_interval_seconds,stale_after=lease_stale_seconds)
     runner.lease = lease
     try:
