@@ -302,6 +302,7 @@ def evaluate_comparison_artifacts(
         "candidate_cnn": readable_checkpoint_inventory(cnn_dir, regular_interval, model_loader=model_loader),
     }
     refs: dict[str, dict[str, CheckpointRef]] = {}
+    manifest_updates: dict[str, dict[str, CheckpointRef]] = {}
     configs = {"raw_direct": raw_config, "candidate_cnn": cnn_config}
     directories = {"raw_direct": Path(raw_dir), "candidate_cnn": Path(cnn_dir)}
     common_rows: list[dict] = []
@@ -320,6 +321,11 @@ def evaluate_comparison_artifacts(
             name: CheckpointRef(ref.path.relative_to(root), ref.label, ref.timestep, ref.sha256)
             for name, ref in refs[arm].items()
         }
-        update_checkpoint_manifest(manifest_path, arm, relative_refs)
+        manifest_updates[arm] = relative_refs
     write_common_step_evaluation(root, common_rows)
+    import json
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for arm in ARMS:
+        manifest = merge_checkpoint_manifest(manifest, arm, manifest_updates[arm])
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return refs

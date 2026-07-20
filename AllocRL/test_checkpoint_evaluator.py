@@ -256,3 +256,52 @@ def test_common_selection_passes_custom_loader_to_inventory(tmp_path, monkeypatc
     monkeypatch.setattr(evaluator, "_archive_timestep", reader)
     assert evaluator.select_common_timestep(raw, cnn, model_loader=marker) == 10_000
     assert seen == [marker, marker]
+
+
+def test_evaluate_checkpoint_hash_race_is_partial_result(tmp_path, monkeypatch):
+    from comparison import checkpoint_evaluator as evaluator
+    model = tmp_path / "model.sb3"; model.write_bytes(b"x")
+    config = {"observation_scales": {"max_length": 1., "max_breadth": 1., "max_duration": 1, "base_date": "2020-01-01", "date_span_workdays": 1, "max_workspace_area": 1., "total_workspace_area": 1., "max_workspace_length": 1., "max_workspace_breadth": 1., "dropout_threshold": 1}, "active_workspace_codes": ["PE001"], "state_context": "full"}
+    (tmp_path / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setattr(evaluator, "sha256_file", lambda _: (_ for _ in ()).throw(FileNotFoundError()))
+    with pytest.raises(evaluator.PartialResultError):
+        evaluator.evaluate_checkpoint(model, config, [{"seed": s} for s in range(1000, 1020)], "common_step", "raw_direct", model_loader=lambda *_args, **_kwargs: SimpleNamespace(num_timesteps=10_000))
+
+
+def test_validated_rows_accepts_different_mapping_insertion_order(tmp_path):
+    from comparison import checkpoint_evaluator as evaluator
+    rows = []
+    for seed in range(1000, 1020):
+        values = {"source":"x","policy":"raw_direct","seed":seed,"mean_reward":1.,"mean_terminal_score":1.,"mean_dropout_rate":0.,"mean_delay_days":0.,"mean_delayed_count":0.,"mean_retained_choice_ratio":1.,"arm":"raw_direct","checkpoint":"best_model","checkpoint_timestep":1,"checkpoint_sha256":"a"*64,"evaluation_partition":"selection" if seed < 1005 else "primary_test"}
+        rows.append({key: values[key] for key in reversed(evaluator.EVALUATION_COLUMNS)})
+    all_path, _ = evaluator.write_arm_evaluations(tmp_path, "raw_direct", list(reversed(rows)))
+    loaded = list(csv.DictReader(all_path.open(encoding="utf-8")))
+    assert list(loaded[0]) == list(evaluator.EVALUATION_COLUMNS)
+    assert [int(row["seed"]) for row in loaded] == list(range(1000, 1020))
+
+
+def test_evaluate_comparison_artifacts_writes_complete_paired_outputs_and_manifest(tmp_path, monkeypatch):
+    from comparison import checkpoint_evaluator as evaluator
+    root = tmp_path; (root / "manifest.json").write_text('{"sentinel":true}', encoding="utf-8")
+    refs = {arm: {name: evaluator.CheckpointRef(root / arm / f"{name}.sb3", "final" if name == "final" else ("common_step" if name == "common" else "best_model"), 10_000, arm[0]*64) for name in ("selected","final","common")} for arm in evaluator.ARMS}
+    monkeypatch.setattr(evaluator, "select_common_timestep", lambda *a, **k: 10_000)
+    monkeypatch.setattr(evaluator, "readable_checkpoint_inventory", lambda directory, *a, **k: {10_000: Path(directory) / "common.sb3"})
+    monkeypatch.setattr(evaluator, "resolve_final_checkpoint", lambda d, **k: refs["raw_direct" if "raw" in str(d) else "candidate_cnn"]["final"])
+    monkeypatch.setattr(evaluator, "resolve_selected_or_fallback", lambda d, **k: refs["raw_direct" if "raw" in str(d) else "candidate_cnn"]["selected"])
+    monkeypatch.setattr(evaluator, "_verified_ref", lambda p, *a, **k: refs["raw_direct" if "raw" in str(p) else "candidate_cnn"]["common"])
+    def fake_eval(_path, _cfg, scenarios, label, arm, _loader):
+        return [{key: value for key, value in zip(evaluator.EVALUATION_COLUMNS, ("x",arm,s,1.,1.,0.,0.,0.,1.,arm,label,10_000,arm[0]*64,"selection" if s<1005 else "primary_test"))} for s in range(1000,1020)]
+    monkeypatch.setattr(evaluator, "evaluate_checkpoint", fake_eval)
+    evaluator.evaluate_comparison_artifacts(root, root / "raw_direct", root / "candidate_cnn", [{"seed":s} for s in range(1000,1020)], {}, {}, model_loader=object())
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8")); assert manifest["sentinel"] is True
+    assert set(manifest["checkpoints"]) == set(evaluator.ARMS)
+    assert len(list(csv.DictReader((root / "comparison" / "common_step_evaluation.csv").open(encoding="utf-8")))) == 40
+
+
+def test_evaluate_comparison_artifacts_failure_does_not_partially_update_manifest(tmp_path, monkeypatch):
+    from comparison import checkpoint_evaluator as evaluator
+    original = b'{"sentinel":true}'; (tmp_path / "manifest.json").write_bytes(original)
+    monkeypatch.setattr(evaluator, "select_common_timestep", lambda *a, **k: (_ for _ in ()).throw(evaluator.PartialResultError("fail")))
+    with pytest.raises(evaluator.PartialResultError):
+        evaluator.evaluate_comparison_artifacts(tmp_path, tmp_path / "raw_direct", tmp_path / "candidate_cnn", [], {}, {})
+    assert (tmp_path / "manifest.json").read_bytes() == original
