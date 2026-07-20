@@ -459,11 +459,38 @@ def _journal_entry(status: str = "pending", *, input_sha256: str | None = None, 
 
 
 class _Lease(AbstractContextManager["_Lease"]):
-    def __init__(self, root: Path, *, stale_takeover: bool, clock: Callable[[], float], interval: float = 60, stale_after: float = 900) -> None:
-        self.path=root/"lease.json"; self.sentinel=root/".lease.acquire"; self.stale_takeover=stale_takeover; self.clock=clock; self.interval=interval; self.stale_after=stale_after; self.token=uuid.uuid4().hex; self.stop=threading.Event(); self.thread: threading.Thread | None=None; self.acquired=False; self.failure: BaseException | None=None
+    """Same-mount best-effort lease; it does not claim Drive crash atomicity."""
+    _KEYS = frozenset({"token", "pid", "boot_id", "heartbeat_utc", "heartbeat_monotonic", "status"})
+    def __init__(self, root: Path, *, stale_takeover: bool, clock: Callable[[], float], wall_time: Callable[[], float] = time.time, interval: float = 60, stale_after: float = 900) -> None:
+        self.path=root/"lease.json"; self.sentinel=root/".lease.acquire"; self.stale_takeover=stale_takeover; self.clock=clock; self.wall_time=wall_time; self.interval=interval; self.stale_after=stale_after; self.token=uuid.uuid4().hex; self.stop=threading.Event(); self.thread: threading.Thread | None=None; self.acquired=False; self.failure: BaseException | None=None
     def _payload(self, status: str) -> dict[str, Any]: return {"token": self.token, "pid": os.getpid(), "boot_id": _boot_id(), "heartbeat_utc": _utc(), "heartbeat_monotonic": self.clock(), "status": status}
+    def _read_prior(self) -> dict[str, Any]:
+        try: payload = _strict_json_line(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error: raise LeaseError("invalid lease.json") from error
+        if set(payload) != self._KEYS or not _nonempty_string(payload["token"]) or not isinstance(payload["pid"], int) or isinstance(payload["pid"], bool) or payload["pid"] <= 0 or not _nonempty_string(payload["boot_id"]) or not isinstance(payload["status"], str) or payload["status"] not in {"active", "released"} or not _valid_number(payload["heartbeat_monotonic"]) or float(payload["heartbeat_monotonic"]) < 0 or float(payload["heartbeat_monotonic"]) > self.clock():
+            raise LeaseError("invalid lease.json")
+        try: valid_time = isinstance(payload["heartbeat_utc"], str) and datetime.fromisoformat(payload["heartbeat_utc"].replace("Z", "+00:00")).tzinfo is not None
+        except ValueError: valid_time = False
+        if not valid_time: raise LeaseError("invalid lease.json")
+        return payload
+    def _snapshot_sentinel(self) -> tuple[bytes, int, int]:
+        try:
+            first = self.sentinel.stat(); content = self.sentinel.read_bytes(); second = self.sentinel.stat()
+        except OSError as error: raise LeaseError("lease sentinel disappeared during observation") from error
+        if (first.st_mtime_ns, first.st_size) != (second.st_mtime_ns, second.st_size): raise LeaseError("lease sentinel changed during observation")
+        if not content.strip(): raise LeaseError("invalid orphan lease sentinel")
+        return content, second.st_mtime_ns, second.st_size
+    def _unlink_sentinel_if_unchanged(self, snapshot: tuple[bytes, int, int]) -> None:
+        current = self._snapshot_sentinel()
+        if current != snapshot: raise LeaseError("lease sentinel changed before takeover")
+        try: self.sentinel.unlink()
+        except OSError as error: raise LeaseError("lease sentinel could not be removed") from error
+    @staticmethod
+    def _sentinel_token(snapshot: tuple[bytes, int, int]) -> str:
+        try: return snapshot[0].decode("utf-8", errors="strict").strip()
+        except UnicodeDecodeError as error: raise LeaseError("invalid lease sentinel") from error
     def _write(self, status: str) -> None:
-        if self.path.exists() and _json(self.path).get("token") != self.token:
+        if self.path.exists() and self._read_prior().get("token") != self.token:
             raise LeaseError("lease ownership token changed")
         atomic_write_json(self.path, self._payload(status))
     def _claim_sentinel(self) -> None:
@@ -475,18 +502,25 @@ class _Lease(AbstractContextManager["_Lease"]):
             stream.write(self.token + "\n"); stream.flush(); os.fsync(stream.fileno())
     def __enter__(self):
         if self.path.exists():
-            prior=_json(self.path); status=prior.get("status"); age=self.clock()-float(prior.get("heartbeat_monotonic", float("-inf"))); foreign_boot=prior.get("boot_id") != _boot_id()
-            if status != "released" and not foreign_boot and age < self.stale_after:
+            prior=self._read_prior(); status=prior["status"]; age=self.clock()-float(prior["heartbeat_monotonic"]); foreign_boot=prior["boot_id"] != _boot_id()
+            if status == "active" and not foreign_boot and age < self.stale_after:
                 raise LeaseError("another live comparison runner owns this output root")
-            if status != "released" and not self.stale_takeover:
+            if status == "active" and not self.stale_takeover:
                 raise LeaseError("stale lease requires explicit --take-over-stale-lease")
             if self.sentinel.exists():
-                # Recheck the payload before stealing a stale sentinel so a live
-                # owner cannot be overwritten between the first observation and unlink.
-                current=_json(self.path)
-                if current.get("token") != prior.get("token"):
-                    raise LeaseError("lease changed while attempting stale takeover")
-                self.sentinel.unlink()
+                snapshot = self._snapshot_sentinel()
+                if self._sentinel_token(snapshot) != prior["token"]:
+                    raise LeaseError("lease sentinel token changed while attempting takeover")
+                if status == "active":
+                    current = self._read_prior()
+                    if current["token"] != prior["token"]: raise LeaseError("lease changed while attempting stale takeover")
+                self._unlink_sentinel_if_unchanged(snapshot)
+        elif self.sentinel.exists():
+            snapshot = self._snapshot_sentinel()
+            age = self.wall_time() - (snapshot[1] / 1_000_000_000)
+            if age < self.stale_after: raise LeaseError("fresh orphan lease sentinel refuses takeover")
+            if not self.stale_takeover: raise LeaseError("stale orphan lease requires explicit --take-over-stale-lease")
+            self._unlink_sentinel_if_unchanged(snapshot)
         self._claim_sentinel(); self.acquired=True
         atomic_write_json(self.path, self._payload("active"))
         def refresh() -> None:
@@ -501,7 +535,7 @@ class _Lease(AbstractContextManager["_Lease"]):
         finally:
             try:
                 if self.sentinel.exists() and self.sentinel.read_text(encoding="utf-8").strip() == self.token: self.sentinel.unlink()
-            except OSError: pass
+            except (OSError, UnicodeDecodeError): pass
         if self.failure is not None and exc[0] is None: raise self.failure
 
 
@@ -728,13 +762,13 @@ class _Runner:
         }
 
 
-def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_root: str | Path, *, subprocess_runner: Callable[..., Any] = subprocess.run, clock: Callable[[], float] = time.monotonic, python_executable: str | None = None, archive_timestep_reader: Callable[[Path], int | None] | None = None, runner_command: Sequence[str] | None = None, stale_takeover: bool = False, lease_interval_seconds: float = 60, lease_stale_seconds: float = 900, stage_actions: Mapping[str, Callable[[], None]] | None = None, stage_output_hashers: Mapping[str, Callable[[], str]] | None = None) -> None:
+def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_root: str | Path, *, subprocess_runner: Callable[..., Any] = subprocess.run, clock: Callable[[], float] = time.monotonic, lease_wall_time: Callable[[], float] = time.time, python_executable: str | None = None, archive_timestep_reader: Callable[[Path], int | None] | None = None, runner_command: Sequence[str] | None = None, stale_takeover: bool = False, lease_interval_seconds: float = 60, lease_stale_seconds: float = 900, stage_actions: Mapping[str, Callable[[], None]] | None = None, stage_output_hashers: Mapping[str, Callable[[], str]] | None = None) -> None:
     if not _valid_number(lease_interval_seconds) or float(lease_interval_seconds) <= 0 or not _valid_number(lease_stale_seconds) or float(lease_stale_seconds) <= 0: raise ValueError("lease intervals must be positive finite numbers")
     if (stage_actions is None) != (stage_output_hashers is None): raise ValueError("stage actions and output hashers must be supplied together")
     if stage_actions is not None and (set(stage_actions) != set(JOURNAL_STAGES) or set(stage_output_hashers or ()) != set(JOURNAL_STAGES) or not all(callable(value) for value in stage_actions.values()) or not all(callable(value) for value in (stage_output_hashers or {}).values())): raise ValueError("test stage mappings must have exact callable journal-stage keys")
     config=config_path if isinstance(config_path,ExperimentConfig) else load_experiment_config(config_path)
     root=Path(output_root).resolve(); root.mkdir(parents=True,exist_ok=True); runner=_Runner(config,root,subprocess_runner=subprocess_runner,clock=clock,python_executable=python_executable,archive_timestep_reader=archive_timestep_reader,output_hasher=(lambda name: stage_output_hashers[name]()) if stage_output_hashers else None,runner_command=runner_command)
-    lease = _Lease(root,stale_takeover=stale_takeover,clock=clock,interval=lease_interval_seconds,stale_after=lease_stale_seconds)
+    lease = _Lease(root,stale_takeover=stale_takeover,clock=clock,wall_time=lease_wall_time,interval=lease_interval_seconds,stale_after=lease_stale_seconds)
     runner.lease = lease
     complete_path = root / "COMPLETE.json"
     try:

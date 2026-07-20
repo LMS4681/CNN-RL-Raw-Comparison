@@ -101,7 +101,7 @@ def test_lease_stale_takeover_requires_flag_and_old_token_cannot_release(tmp_pat
     from comparison.experiment_runner import LeaseError, _Lease, atomic_write_json
 
     atomic_write_json(tmp_path / "lease.json", {
-        "token": "old", "pid": 1, "boot_id": "same", "heartbeat_utc": "x",
+        "token": "old", "pid": 1, "boot_id": "same", "heartbeat_utc": "2026-01-01T00:00:00Z",
         "heartbeat_monotonic": 0.0, "status": "active",
     })
     (tmp_path / ".lease.acquire").write_text("old\n", encoding="utf-8")
@@ -115,6 +115,90 @@ def test_lease_stale_takeover_requires_flag_and_old_token_cannot_release(tmp_pat
         with pytest.raises(LeaseError, match="token"):
             old._write("released")
         assert json.loads((tmp_path / "lease.json").read_text(encoding="utf-8"))["token"] == new.token
+
+
+def test_fresh_orphan_sentinel_refuses_even_explicit_takeover_without_mutation(tmp_path: Path):
+    from comparison.experiment_runner import LeaseError, _Lease
+
+    sentinel = tmp_path / ".lease.acquire"; sentinel.write_text("orphan\n", encoding="utf-8")
+    before = sentinel.read_bytes()
+    with pytest.raises(LeaseError, match="orphan"):
+        with _Lease(tmp_path, stale_takeover=True, clock=lambda: 0.0, wall_time=lambda: 100.0, stale_after=10, interval=999):
+            pass
+    assert sentinel.read_bytes() == before and not (tmp_path / "lease.json").exists()
+
+
+def test_stale_orphan_requires_explicit_takeover_then_leaves_released_audit(tmp_path: Path):
+    from comparison.experiment_runner import LeaseError, _Lease
+
+    sentinel = tmp_path / ".lease.acquire"; sentinel.write_text("orphan\n", encoding="utf-8")
+    import os
+    os.utime(sentinel, (0, 0))
+    with pytest.raises(LeaseError, match="stale"):
+        with _Lease(tmp_path, stale_takeover=False, clock=lambda: 0.0, wall_time=lambda: 100.0, stale_after=10, interval=999):
+            pass
+    with _Lease(tmp_path, stale_takeover=True, clock=lambda: 0.0, wall_time=lambda: 100.0, stale_after=10, interval=999):
+        assert (tmp_path / "lease.json").is_file()
+    released = json.loads((tmp_path / "lease.json").read_text(encoding="utf-8"))
+    assert released["status"] == "released" and not sentinel.exists()
+
+
+def test_stale_orphan_toctou_change_refuses_without_deleting_new_sentinel(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import LeaseError, _Lease
+
+    sentinel = tmp_path / ".lease.acquire"; sentinel.write_text("old\n", encoding="utf-8")
+    import os
+    os.utime(sentinel, (0, 0))
+    lease = _Lease(tmp_path, stale_takeover=True, clock=lambda: 0.0, wall_time=lambda: 100.0, stale_after=10, interval=999)
+    original = lease._snapshot_sentinel; calls = [0]
+    def changed_snapshot():
+        calls[0] += 1
+        if calls[0] == 2:
+            sentinel.write_text("new-owner\n", encoding="utf-8")
+            os.utime(sentinel, (1, 1))
+        return original()
+    monkeypatch.setattr(lease, "_snapshot_sentinel", changed_snapshot)
+    with pytest.raises(LeaseError, match="changed"):
+        with lease: pass
+    assert sentinel.read_text(encoding="utf-8") == "new-owner\n" and not (tmp_path / "lease.json").exists()
+
+
+@pytest.mark.parametrize("payload", [
+    "[]", "{\"token\":\"x\",\"token\":\"y\"}", "{}",
+    '{"token":"","pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":0,"status":"active"}',
+    '{"token":true,"pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":0,"status":"active"}',
+    '{"token":"x","pid":true,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":0,"status":"active"}',
+    '{"token":"x","pid":"1","boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":0,"status":"active"}',
+    '{"token":"x","pid":1,"boot_id":"","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":0,"status":"active"}',
+    '{"token":"x","pid":1,"boot_id":1,"heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":0,"status":"active"}',
+    '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":"bad","heartbeat_monotonic":0,"status":"active"}',
+    '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":0,"heartbeat_monotonic":0,"status":"active"}',
+    '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":"0","status":"active"}',
+    '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":-1,"status":"active"}',
+    '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":99,"status":"active"}',
+    '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":0,"status":"unknown"}',
+    '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":0,"status":true}',
+])
+def test_malformed_lease_json_fails_closed_without_root_mutation(tmp_path: Path, payload: str):
+    from comparison.experiment_runner import LeaseError, _Lease
+
+    path = tmp_path / "lease.json"; path.write_text(payload, encoding="utf-8"); before = path.read_bytes()
+    with pytest.raises(LeaseError, match="lease"):
+        with _Lease(tmp_path, stale_takeover=True, clock=lambda: 10.0, wall_time=lambda: 10.0, interval=999):
+            pass
+    assert path.read_bytes() == before and not (tmp_path / ".lease.acquire").exists()
+
+
+def test_valid_released_lease_reacquires_immediately_and_active_foreign_boot_needs_takeover(tmp_path: Path):
+    from comparison.experiment_runner import LeaseError, _Lease, atomic_write_json
+
+    payload = {"token": "released-token", "pid": 1, "boot_id": "other-boot", "heartbeat_utc": "2026-01-01T00:00:00Z", "heartbeat_monotonic": 0.0, "status": "released"}
+    atomic_write_json(tmp_path / "lease.json", payload); (tmp_path / ".lease.acquire").write_text("released-token\n", encoding="utf-8")
+    with _Lease(tmp_path, stale_takeover=False, clock=lambda: 0.0, wall_time=lambda: 0.0, interval=999) as lease:
+        assert lease.acquired
+    payload["status"] = "active"; atomic_write_json(tmp_path / "lease.json", payload); (tmp_path / ".lease.acquire").write_text("released-token\n", encoding="utf-8")
+    with pytest.raises(LeaseError, match="stale"):
+        with _Lease(tmp_path, stale_takeover=False, clock=lambda: 1000.0, wall_time=lambda: 1000.0, interval=999): pass
 
 
 def test_semantic_preflight_hash_ignores_later_checkpoint_manifest_updates(tmp_path: Path):
@@ -642,6 +726,16 @@ def test_public_harness_live_lease_refusal_does_not_mutate_root(tmp_path: Path):
     calls, actions, hashers = _public_harness()
     with pytest.raises(LeaseError): run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
     assert calls == [] and {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+def test_public_harness_uses_injected_wall_clock_for_fresh_orphan_refusal(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, LeaseError, run_overnight_experiment
+
+    sentinel = tmp_path / ".lease.acquire"; sentinel.write_text("orphan\n", encoding="utf-8"); before = sentinel.read_bytes()
+    calls, actions, hashers = _public_harness()
+    with pytest.raises(LeaseError, match="fresh orphan"):
+        run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, clock=lambda: 0.0, lease_wall_time=lambda: 0.0, lease_stale_seconds=10, lease_interval_seconds=999)
+    assert calls == [] and sentinel.read_bytes() == before and not (tmp_path / "lease.json").exists()
 
 
 @pytest.mark.parametrize("kwargs", [{"lease_interval_seconds": 0}, {"lease_stale_seconds": float("nan")}])
