@@ -91,17 +91,36 @@ detail row per policy and scenario.
 
 ## Training And Verification
 
-Run the 15 screening jobs, then the 25 final jobs after reviewing screening:
+Run the five 20,000-timestep smoke jobs first:
 
 ```powershell
-python -B run_ablation.py --mode screening --dry-run
-python -B run_ablation.py --mode screening
-python -B run_ablation.py --mode final --dry-run
-python -B run_ablation.py --mode final
+py -B run_ablation.py --stage smoke
 ```
 
-Each run writes to `output_ablation/<mode>/<ID>/seed_<seed>`. SB3 models and
-checkpoints use the `.sb3` extension.
+Run the complete 300,000-timestep screening matrix. This creates 60 jobs: five
+A-E rows, seeds `0..2`, and all four `(gae_lambda, n_steps)` pairs from
+`{0.98, 0.995} x {512, 960}`.
+
+```powershell
+py -B run_ablation.py --stage screening
+```
+
+After screening selection, run the 25 one-million-timestep final jobs with
+exactly one selected pair:
+
+```powershell
+py -B run_ablation.py --stage final --selected-gae-lambda 0.995 --selected-n-steps 960
+```
+
+The final values `0.995` and `960` are illustrative. Replace both with the
+winning screening pair recorded in `screening_selection.json`.
+
+Use `--dry-run` on any invocation to print commands without executing them.
+Every run uses the fixed holdout bundle, automatic resume, 50,000-timestep
+checkpoints and holdout selection, and no ONNX export. Final runs additionally
+produce the final holdout report. Outputs are isolated at
+`output_ablation/<stage>/<ID>/lambda_<value>/nsteps_<value>/seed_<seed>`; SB3
+models and checkpoints use the `.sb3` extension.
 
 Verify all three schema-3 extractor workflows with temporary output:
 
