@@ -384,6 +384,7 @@ class _Runner:
 
 
 def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_root: str | Path, *, subprocess_runner: Callable[..., Any] = subprocess.run, clock: Callable[[], float] = time.monotonic, python_executable: str | None = None, archive_timestep_reader: Callable[[Path], int | None] | None = None, stale_takeover: bool = False, lease_interval_seconds: float = 60, lease_stale_seconds: float = 900, stage_actions: Mapping[str, Callable[[], None]] | None = None, stage_output_hashers: Mapping[str, Callable[[], str]] | None = None) -> None:
+    if not _valid_number(lease_interval_seconds) or float(lease_interval_seconds) <= 0 or not _valid_number(lease_stale_seconds) or float(lease_stale_seconds) <= 0: raise ValueError("lease intervals must be positive finite numbers")
     if (stage_actions is None) != (stage_output_hashers is None): raise ValueError("stage actions and output hashers must be supplied together")
     if stage_actions is not None and (set(stage_actions) != set(JOURNAL_STAGES) or set(stage_output_hashers or ()) != set(JOURNAL_STAGES) or not all(callable(value) for value in stage_actions.values()) or not all(callable(value) for value in (stage_output_hashers or {}).values())): raise ValueError("test stage mappings must have exact callable journal-stage keys")
     config=config_path if isinstance(config_path,ExperimentConfig) else load_experiment_config(config_path)
@@ -394,7 +395,10 @@ def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_
         with lease:
             actions = stage_actions or {"preflight":runner.preflight,"smoke_raw_direct":lambda: runner.smoke("raw_direct"),"smoke_candidate_cnn":lambda: runner.smoke("candidate_cnn"),"train_raw_direct":lambda: runner.train("raw_direct"),"evaluate_raw_direct":lambda: runner.evaluate_arm("raw_direct"),"train_candidate_cnn":lambda: runner.train("candidate_cnn"),"evaluate_candidate_cnn":lambda: runner.evaluate_arm("candidate_cnn"),"evaluate_common_step":runner.common_evaluation,"build_report":lambda: write_complete_report(root),"integrity_verification":runner.integrity}
             for stage in JOURNAL_STAGES: runner.run_stage(stage, actions[stage])
-            atomic_write_json(root/"COMPLETE.json",{"status":"complete","stages":REQUIRED_COMPLETE_STAGES})
+        # A refresh error raised by __exit__ prevents publication.  The marker
+        # is deliberately outside the lease context so it never claims a run
+        # complete while its ownership heartbeat is uncertain.
+        atomic_write_json(root/"COMPLETE.json",{"status":"complete","stages":REQUIRED_COMPLETE_STAGES})
     except BaseException as error:
         if lease.acquired:
             try: write_partial_report(root,f"{type(error).__name__}: {error}")

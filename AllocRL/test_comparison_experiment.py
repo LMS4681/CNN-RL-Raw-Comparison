@@ -362,3 +362,10 @@ def test_public_harness_live_lease_refusal_does_not_mutate_root(tmp_path: Path):
     calls, actions, hashers = _public_harness()
     with pytest.raises(LeaseError): run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
     assert calls == [] and {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+@pytest.mark.parametrize("kwargs", [{"lease_interval_seconds": 0}, {"lease_stale_seconds": float("nan")}])
+def test_public_runner_rejects_invalid_lease_timing(tmp_path: Path, kwargs: dict):
+    from comparison.experiment_runner import ExperimentConfig, run_overnight_experiment
+    with pytest.raises(ValueError, match="positive finite"):
+        run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, **kwargs)
