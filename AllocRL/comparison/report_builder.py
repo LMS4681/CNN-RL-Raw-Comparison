@@ -147,9 +147,12 @@ def _runtime(path: Path) -> dict[str, Any]:
     data = _read_json(path)
     if set(data) != set(RUNTIME_FIELDS):
         raise ValueError("runtime_metrics must contain exactly required fields")
-    for key in ("target_training_seconds", "recorded_training_seconds", "end_to_end_training_seconds", "overrun_seconds", "max_unrecorded_seconds", "steps_per_second", "evaluation_seconds"):
+    for key in ("target_training_seconds", "recorded_training_seconds", "end_to_end_training_seconds", "overrun_seconds", "max_unrecorded_seconds", "evaluation_seconds"):
         _number(data[key], key)
         if data[key] < 0: raise ValueError(f"{key} must be nonnegative")
+    if data["steps_per_second"] is not None:
+        _number(data["steps_per_second"], "steps_per_second")
+        if data["steps_per_second"] < 0: raise ValueError("steps_per_second must be nonnegative")
     for key in ("restart_count", "start_timestep", "end_timestep", "selected_checkpoint_timestep"):
         _integer(data[key], key)
     peak = data["peak_cuda_memory_bytes"]
@@ -198,7 +201,7 @@ def _environment(root: Path) -> dict[str, Any]:
 
 def _manifest(root: Path) -> dict[str, Any]:
     manifest = _read_json(root / "manifest.json")
-    if set(manifest) != {"schema_version", "checkpoints"} or manifest["schema_version"] != 1 or not isinstance(manifest["checkpoints"], Mapping) or set(manifest["checkpoints"]) != set(ARMS):
+    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("checkpoints"), Mapping) or set(manifest["checkpoints"]) != set(ARMS):
         raise ValueError("manifest has incomplete schema")
     labels = {"selected": {"best_model", "fallback_final"}, "final": {"final"}, "common": {"common_step"}}
     for arm in ARMS:
@@ -256,7 +259,7 @@ def _common_summary(root: Path) -> dict[str, Any]:
         normalized = dict(row); normalized["seed"] = int(row["seed"]); normalized["checkpoint_timestep"] = int(row["checkpoint_timestep"]); normalized["checkpoint_sha256"] = _sha(row["checkpoint_sha256"], "common checkpoint_sha256")
         if normalized["evaluation_partition"] != ("selection" if normalized["seed"] in SELECTION_SEEDS else "primary_test"):
             raise ValueError("common-step CSV has invalid partition")
-        for column in HEADLINE_COLUMNS:
+        for column in ("mean_reward", *HEADLINE_COLUMNS, "mean_retained_choice_ratio"):
             normalized[column] = _csv_number(row[column], column)
         grouped[arm].append(normalized)
     if any(tuple(sorted(row["seed"] for row in values)) != tuple(range(1000, 1020)) for values in grouped.values()):
@@ -327,7 +330,7 @@ def _curve_rows(path: Path, columns: tuple[str, ...], name: str) -> list[dict[st
         reader = csv.DictReader(stream)
         if tuple(reader.fieldnames or ()) != columns: raise ValueError(f"{name} has incompatible header")
         rows = list(reader)
-    prior = -1
+    prior = -1; prior_generation = -1; prior_seconds = -1.0
     for row in rows:
         if set(row) != set(columns): raise ValueError(f"{name} has malformed row")
         if not row["timestep"].isdigit() or int(row["timestep"]) < prior: raise ValueError(f"{name} timestep is invalid")
@@ -336,6 +339,10 @@ def _curve_rows(path: Path, columns: tuple[str, ...], name: str) -> list[dict[st
             if key in {"updated_at_utc", "status", "checkpoint_file"} or value == "": continue
             _csv_number(value, f"{name}.{key}")
         if name == "progress_timing" and (not row["generation"].isdigit() or row["status"] not in {"running", "complete"}): raise ValueError("progress_timing row is invalid")
+        if name == "progress_timing":
+            generation = int(row["generation"]); seconds = _csv_number(row["recorded_training_seconds"], "progress_timing.recorded_training_seconds")
+            if generation < prior_generation or seconds < prior_seconds or seconds < 0: raise ValueError("progress_timing regresses")
+            prior_generation, prior_seconds = generation, seconds
     return rows
 
 
@@ -383,12 +390,13 @@ def _learning_plot(root: Path, output: Path) -> None:
 
 def _holdout_plot(summary: Mapping[str, Any], pairs: list[dict], output: Path) -> None:
     figure, axes = plt.subplots(1, 2, figsize=(12, 4))
-    metric = "mean_terminal_score"
-    axes[0].bar(["raw-direct", "candidate-CNN"], [summary[arm]["primary_test"][metric] for arm in ARMS])
-    axes[0].set(title="Primary test terminal score (15 paired scenarios)", ylabel="score")
-    axes[1].bar([str(row["seed"]) for row in pairs], [row["terminal_score_delta_cnn_minus_raw"] for row in pairs])
-    axes[1].axhline(0, color="black", linewidth=.8); axes[1].set(title="CNN minus raw paired terminal-score difference", xlabel="scenario seed", ylabel="delta")
-    try: figure.tight_layout(); figure.savefig(output, dpi=150)
+    try:
+        metric = "mean_terminal_score"
+        axes[0].bar(["raw-direct", "candidate-CNN"], [summary[arm]["primary_test"][metric] for arm in ARMS])
+        axes[0].set(title="Primary test terminal score (15 paired scenarios)", ylabel="score")
+        axes[1].bar([str(row["seed"]) for row in pairs], [row["terminal_score_delta_cnn_minus_raw"] for row in pairs])
+        axes[1].axhline(0, color="black", linewidth=.8); axes[1].set(title="CNN minus raw paired terminal-score difference", xlabel="scenario seed", ylabel="delta")
+        figure.tight_layout(); figure.savefig(output, dpi=150)
     finally: plt.close(figure)
 
 
@@ -462,6 +470,7 @@ def write_partial_report(root: str | Path, failure: str) -> Path:
         except ValueError:
             journal_text = "stage metadata: invalid metadata"
     state = "후보 CNN 결과가 없어 우열을 결론내리지 않음" if raw_ok and not cnn_ok else ("raw-direct 결과가 없어 비교를 결론내리지 않음" if cnn_ok and not raw_ok else ("두 arm 모두 없어서 비교를 결론내리지 않음" if not raw_ok and not cnn_ok else "두 arm 자료는 있으나 무결성 또는 보고 단계가 불완전하여 결론내리지 않음"))
-    text = f"# 부분 비교 보고서\n\n실패 원인: {html.escape(failure)}\n\n사용 가능 단계: raw-direct runtime={'있음' if raw_ok else '없음'}, candidate-CNN runtime={'있음' if cnn_ok else '없음'}.\n{journal_text}\n\n{state}. 누락 수치는 {MISSING}이며 0 또는 추정값으로 대체하지 않는다. 같은 output_root로 같은 experiment runner/notebook을 다시 실행하여 검증 완료 stage를 건너뛰고 재개한다.\n"
+    safe_failure = html.escape(failure).replace("`", "&#96;")
+    text = f"# 부분 비교 보고서\n\n실패 원인:\n<pre><code>{safe_failure}</code></pre>\n\n사용 가능 단계: raw-direct runtime={'있음' if raw_ok else '없음'}, candidate-CNN runtime={'있음' if cnn_ok else '없음'}.\n{journal_text}\n\n{state}. 누락 수치는 {MISSING}이며 0 또는 추정값으로 대체하지 않는다. 같은 output_root로 같은 experiment runner/notebook을 다시 실행하여 검증 완료 stage를 건너뛰고 재개한다.\n"
     path = base / "comparison" / "PARTIAL_REPORT.md"; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(text, encoding="utf-8", newline="\n")
     return path

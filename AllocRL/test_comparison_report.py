@@ -330,3 +330,22 @@ def test_report_renders_all_actual_runtime_and_selection_fields(tmp_path):
     for value in ("11.0","11.1","11.2","11.3","11.4","11.5","11.6","22.0","22.1","22.2","22.3","22.4","22.5","22.6","1100","1101","2200","2201","11000","22000","selection count 5","selection count 0","[1.1, 2.2, 3.3]","best_model","fallback_final","fallback 사유: 자료 없음"):
         assert value in text
     assert "10,800" not in text
+
+
+def test_zero_recorded_runtime_allows_null_steps_per_second_and_extra_manifest_metadata(tmp_path):
+    from comparison.report_builder import build_comparison_summary, write_complete_report
+    write_complete_fixture(tmp_path)
+    for arm in ("raw_direct", "candidate_cnn"):
+        path=tmp_path/arm/"runtime_metrics.json"; payload=json.loads(path.read_text("utf-8")); payload.update({"recorded_training_seconds":0.0,"start_timestep":7,"end_timestep":7,"steps_per_second":None}); _json(path,payload)
+    manifest=tmp_path/"manifest.json"; payload=json.loads(manifest.read_text("utf-8")); payload["provenance"]={"run":"x"}; _json(manifest,payload)
+    summary=build_comparison_summary(tmp_path); assert summary["raw_direct"]["runtime_metrics"]["steps_per_second"] is None and summary["manifest"]["provenance"] == {"run":"x"}
+    assert "자료 없음" in write_complete_report(tmp_path).read_text("utf-8")
+
+
+@pytest.mark.parametrize("field,value", [("mean_reward", "NaN"), ("mean_terminal_score", "inf"), ("mean_dropout_rate", "no"), ("mean_delay_days", "NaN"), ("mean_delayed_count", "inf"), ("mean_retained_choice_ratio", "no")])
+def test_common_numeric_fields_are_finite(tmp_path, field, value):
+    from comparison.report_builder import build_comparison_summary
+    write_complete_fixture(tmp_path); path=tmp_path/"comparison"/"common_step_evaluation.csv"
+    with path.open(encoding="utf-8",newline="") as s: rows=list(csv.DictReader(s))
+    rows[0][field]=value; _write_csv(path,rows)
+    with pytest.raises(ValueError): build_comparison_summary(tmp_path)
