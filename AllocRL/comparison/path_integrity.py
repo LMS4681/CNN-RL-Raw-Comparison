@@ -37,3 +37,28 @@ def resolve_direct_regular_file(
     except (OSError, RuntimeError) as error:
         raise ValueError(f"{label} must be a direct regular file") from error
     return resolved
+
+
+def resolve_direct_directory(
+    root: str | Path,
+    candidate: str | Path,
+    *,
+    label: str,
+) -> Path:
+    """Resolve one immediate child directory while rejecting links/junctions."""
+    directory = Path(root)
+    path = Path(candidate)
+    try:
+        if _is_link_or_junction(directory) or _is_link_or_junction(path):
+            raise ValueError(f"{label} must be a direct directory")
+        resolved_directory = directory.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        if not resolved_directory.is_dir() or resolved.parent != resolved_directory:
+            raise ValueError(f"{label} must be a direct directory")
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise ValueError(f"{label} must be a direct directory")
+    except FileNotFoundError:
+        raise
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{label} must be a direct directory") from error
+    return resolved

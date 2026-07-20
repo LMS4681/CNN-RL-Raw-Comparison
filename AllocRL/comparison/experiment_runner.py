@@ -35,8 +35,9 @@ from comparison.artifact_manifest import (
 )
 from comparison.checkpoint_evaluator import (
     evaluate_arm_artifacts,
-    evaluate_comparison_artifacts,
+    evaluate_common_step_artifacts,
     validate_arm_evaluation_stage,
+    validate_common_step_stage,
 )
 from comparison.report_builder import PAIR_COLUMNS, JOURNAL_STAGES, JOURNAL_STATUSES, build_comparison_summary, build_paired_differences, write_complete_report, write_partial_report
 from comparison.wall_clock_callback import atomic_write_json, read_wall_clock_state, resolve_state_checkpoint
@@ -664,7 +665,7 @@ class _Runner:
         self.save_journal(result); return result
     def save_journal(self, data: Mapping[str, Any]) -> None: atomic_write_json(self.journal_path, dict(data))
     def stage_path(self, name: str) -> Path:
-        return {"preflight":self.root/"manifest.json", "smoke_raw_direct":self.root/"smoke"/"raw_direct"/"runner_verified.json", "smoke_candidate_cnn":self.root/"smoke"/"candidate_cnn"/"runner_verified.json", "train_raw_direct":self.root/"raw_direct"/"training_completion.json", "evaluate_raw_direct":self.root/"raw_direct"/"evaluation_stage.json", "train_candidate_cnn":self.root/"candidate_cnn"/"training_completion.json", "evaluate_candidate_cnn":self.root/"candidate_cnn"/"evaluation_stage.json", "evaluate_common_step":self.root/"comparison"/"common_step_evaluation.csv", "build_report":self.root/"comparison"/"preliminary_comparison_ko.md", "integrity_verification":self.root/"integrity_verification.json"}[name]
+        return {"preflight":self.root/"manifest.json", "smoke_raw_direct":self.root/"smoke"/"raw_direct"/"runner_verified.json", "smoke_candidate_cnn":self.root/"smoke"/"candidate_cnn"/"runner_verified.json", "train_raw_direct":self.root/"raw_direct"/"training_completion.json", "evaluate_raw_direct":self.root/"raw_direct"/"evaluation_stage.json", "train_candidate_cnn":self.root/"candidate_cnn"/"training_completion.json", "evaluate_candidate_cnn":self.root/"candidate_cnn"/"evaluation_stage.json", "evaluate_common_step":self.root/"comparison"/"common_step_stage.json", "build_report":self.root/"comparison"/"preliminary_comparison_ko.md", "integrity_verification":self.root/"integrity_verification.json"}[name]
     def output_hash(self, name: str) -> str:
         """Hash only artifacts owned by this stage, never mutable descendants."""
         if self._injected_output_hasher is not None: return self._injected_output_hasher(name)
@@ -694,8 +695,16 @@ class _Runner:
             )
             return sha256_file(self.stage_path(name))
         if name == "evaluate_common_step":
-            manifest = _json(self.root / "manifest.json")
-            return canonical_json_sha256({"common_csv": sha256_file(self.stage_path(name)), "checkpoints": manifest.get("checkpoints")})
+            from train import model_num_timesteps
+            validate_common_step_stage(
+                self.root,
+                expected_config_sha256=self.config.config_sha256,
+                expected_scenario_sha256=self.config.fixed_scenarios_sha256,
+                archive_timestep_reader=(
+                    self.archive_reader or model_num_timesteps
+                ),
+            )
+            return sha256_file(self.stage_path(name))
         if name == "build_report":
             base = self.root / "comparison"
             required = ("summary.json", "scenario_paired_differences.csv", "learning_curves.png", "holdout_comparison.png", "preliminary_comparison_ko.md")
@@ -876,11 +885,20 @@ class _Runner:
         if timestep != state.last_checkpoint_timestep: raise ExperimentIntegrityError("state checkpoint stored timestep mismatch")
         return True
     def common_evaluation(self) -> None:
-        scenarios=_json(_allocrl_dir()/self.config.scenario_path)
-        records=scenarios.get("scenarios",scenarios) if isinstance(scenarios,dict) else scenarios
-        if not isinstance(records,list): raise ExperimentIntegrityError("fixed scenarios must be a list")
-        raw_config=_json(self.root/"raw_direct"/"run_config.json"); cnn_config=_json(self.root/"candidate_cnn"/"run_config.json")
-        evaluate_comparison_artifacts(self.root,self.root/"raw_direct",self.root/"candidate_cnn",records,raw_config,cnn_config,regular_interval=self.config.checkpoint_freq)
+        provenance = self.provenance()
+        records = read_scenarios(_allocrl_dir() / self.config.scenario_path)
+        configs = {
+            arm: _json(self.root / arm / "run_config.json")
+            for arm in ("raw_direct", "candidate_cnn")
+        }
+        evaluate_common_step_artifacts(
+            self.root,
+            records,
+            configs,
+            config_sha256=provenance["config_sha256"],
+            scenario_sha256=provenance["scenario_sha256"],
+            regular_interval=self.config.checkpoint_freq,
+        )
     def _validate_integrity(self, *, write_record: bool) -> dict[str, Any]:
         provenance=self.provenance(); manifest=_json(self.root/"manifest.json"); environment=_json(self.root/"environment.json")
         _validate_root_environment(environment, provenance, production_loaded=self.config.production_loaded)

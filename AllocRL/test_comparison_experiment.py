@@ -603,11 +603,12 @@ def test_common_evaluation_uses_configured_checkpoint_interval(tmp_path: Path, m
         directory.mkdir()
         (directory / "run_config.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(runner_module, "_allocrl_dir", lambda: tmp_path)
+    monkeypatch.setattr(runner_module, "read_scenarios", lambda _path: records)
     captured = {}
     def evaluate(*args, **kwargs):
         captured["args"] = args
         captured["kwargs"] = kwargs
-    monkeypatch.setattr(runner_module, "evaluate_comparison_artifacts", evaluate)
+    monkeypatch.setattr(runner_module, "evaluate_common_step_artifacts", evaluate)
     runner = runner_module._Runner(
         config,
         tmp_path,
@@ -616,14 +617,62 @@ def test_common_evaluation_uses_configured_checkpoint_interval(tmp_path: Path, m
         python_executable="python",
         archive_timestep_reader=None,
     )
-    runner.common_evaluation()
-    assert captured["args"][:3] == (
-        tmp_path,
-        tmp_path / "raw_direct",
-        tmp_path / "candidate_cnn",
+    monkeypatch.setattr(
+        runner,
+        "provenance",
+        lambda: {
+            "config_sha256": config.config_sha256,
+            "scenario_sha256": "c" * 64,
+        },
     )
-    assert captured["args"][3] == records
+    runner.common_evaluation()
+    assert captured["args"] == (
+        tmp_path,
+        records,
+        {"raw_direct": {}, "candidate_cnn": {}},
+    )
     assert captured["kwargs"]["regular_interval"] == config.checkpoint_freq
+    assert captured["kwargs"]["config_sha256"] == config.config_sha256
+    assert captured["kwargs"]["scenario_sha256"] == "c" * 64
+
+
+def test_common_output_hash_validates_only_common_stage_marker(
+    tmp_path: Path, monkeypatch
+):
+    from comparison import experiment_runner as runner_module
+
+    config = runner_module.ExperimentConfig.for_test()
+    runner = runner_module._Runner(
+        config,
+        tmp_path,
+        subprocess_runner=lambda *_args, **_kwargs: None,
+        clock=lambda: 0,
+        python_executable="python",
+        archive_timestep_reader=lambda _path: 10_000,
+    )
+    marker = tmp_path / "comparison" / "common_step_stage.json"
+    marker.parent.mkdir()
+    marker.write_bytes(b"common-marker")
+    seen = []
+    monkeypatch.setattr(
+        runner_module,
+        "validate_common_step_stage",
+        lambda root, **kwargs: seen.append((root, kwargs)),
+    )
+
+    digest = runner.output_hash("evaluate_common_step")
+
+    assert digest == hashlib.sha256(b"common-marker").hexdigest()
+    assert seen == [
+        (
+            tmp_path,
+            {
+                "expected_config_sha256": config.config_sha256,
+                "expected_scenario_sha256": config.fixed_scenarios_sha256,
+                "archive_timestep_reader": runner.archive_reader,
+            },
+        )
+    ]
 
 
 def test_evaluate_arm_runs_selected_checkpoint_evaluation_with_locked_inputs(

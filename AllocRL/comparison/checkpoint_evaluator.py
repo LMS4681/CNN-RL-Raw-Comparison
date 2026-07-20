@@ -11,7 +11,7 @@ import re
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal
 
 from sb3_contrib import MaskablePPO
@@ -25,7 +25,10 @@ from comparison.artifact_manifest import (
     read_runtime_metrics,
     sha256_file,
 )
-from comparison.path_integrity import resolve_direct_regular_file
+from comparison.path_integrity import (
+    resolve_direct_directory,
+    resolve_direct_regular_file,
+)
 from comparison.training_completion import read_training_completion
 from comparison.wall_clock_callback import atomic_write_json, read_wall_clock_state, resolve_state_checkpoint
 from evaluation_runner import ModelActionPolicy
@@ -64,6 +67,32 @@ _ARM_EVALUATION_ARTIFACTS = (
     "evaluation_primary_test.csv",
     "training_completion.json",
     "runtime_metrics.json",
+)
+_COMMON_CACHE_NAMES = {
+    arm: f"common_step_{arm}.cache.json" for arm in ARMS
+}
+_COMMON_COMBINED_NAME = "common_step_evaluation.csv"
+_COMMON_MARKER_NAME = "common_step_stage.json"
+_COMMON_CACHE_KEYS = frozenset(
+    {
+        "schema_version",
+        "arm",
+        "config_sha256",
+        "scenario_sha256",
+        "checkpoint",
+        "rows",
+    }
+)
+_COMMON_MARKER_KEYS = frozenset(
+    {
+        "schema_version",
+        "config_sha256",
+        "scenario_sha256",
+        "common_timestep",
+        "checkpoints",
+        "artifacts",
+        "evaluation_seed_count_per_arm",
+    }
 )
 
 
@@ -108,8 +137,29 @@ def _archive_timestep(path: Path, loader=MaskablePPO.load) -> int | None:
 
 
 def _archive_candidates(output_dir: Path) -> list[Path]:
-    root = output_dir / "checkpoints"
-    return sorted(root.glob("*.sb3"), key=lambda path: path.as_posix()) if root.is_dir() else []
+    try:
+        root = resolve_direct_directory(
+            output_dir,
+            output_dir / "checkpoints",
+            label="checkpoint inventory directory",
+        )
+    except (FileNotFoundError, ValueError):
+        return []
+    candidates: list[Path] = []
+    try:
+        paths = list(root.glob("*.sb3"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            candidates.append(
+                resolve_direct_regular_file(
+                    root, path, label="checkpoint inventory candidate"
+                )
+            )
+        except (FileNotFoundError, ValueError):
+            continue
+    return sorted(candidates, key=lambda path: path.as_posix())
 
 
 def readable_checkpoint_inventory(
@@ -127,7 +177,10 @@ def readable_checkpoint_inventory(
         try:
             timestep = _archive_timestep(path, model_loader)
             digest = sha256_file(path)
-            mtime = path.stat().st_mtime_ns
+            # The candidate was already lstat-verified as a direct regular
+            # file.  Do not restat a prior duplicate through Path.stat: it may
+            # disappear independently while another candidate remains valid.
+            mtime = os.lstat(path).st_mtime_ns
         except (OSError, FileNotFoundError):
             continue
         if timestep is None or timestep < 0 or timestep % regular_interval:
@@ -206,10 +259,13 @@ def _selected_timestep(selection_path: Path) -> int | None:
 
 def _verified_ref(path: Path, label: Literal["best_model", "fallback_final", "final", "common_step"], timestep: int, loader=MaskablePPO.load) -> CheckpointRef | None:
     try:
-        if not path.is_file() or _archive_timestep(path, loader) != timestep:
+        verified_path = resolve_direct_regular_file(
+            path.parent, path, label=f"{label} checkpoint"
+        )
+        if _archive_timestep(verified_path, loader) != timestep:
             return None
-        return CheckpointRef(path=path, label=label, timestep=timestep, sha256=sha256_file(path))
-    except (OSError, FileNotFoundError):
+        return CheckpointRef(path=verified_path, label=label, timestep=timestep, sha256=sha256_file(verified_path))
+    except (OSError, FileNotFoundError, ValueError):
         return None
 
 
@@ -481,7 +537,7 @@ def _reference_path_within_arm(reference: CheckpointRef, arm_root: Path) -> Path
         directory = arm_root
         if reference.path.name != "best_model.sb3":
             raise PartialResultError("best checkpoint is not the direct canonical file")
-    elif reference.label in {"final", "fallback_final"}:
+    elif reference.label in {"final", "fallback_final", "common_step"}:
         directory = arm_root / "checkpoints"
         is_junction = getattr(directory, "is_junction", None)
         if directory.is_symlink() or (
@@ -828,6 +884,336 @@ def validate_arm_evaluation_stage(
     return marker
 
 
+def _validate_common_reference(value: Any, arm: str) -> dict[str, Any]:
+    """Validate the exact, direct checkpoint reference owned by this stage."""
+    if not isinstance(value, Mapping) or set(value) != {
+        "path",
+        "label",
+        "sha256",
+        "timestep",
+    }:
+        raise ValueError("common checkpoint reference has invalid schema")
+    reference = dict(value)
+    path = reference["path"]
+    parts = PurePosixPath(path).parts if isinstance(path, str) else ()
+    if (
+        not isinstance(path, str)
+        or not path
+        or "\\" in path
+        or PurePosixPath(path).is_absolute()
+        or parts[:2] != (arm, "checkpoints")
+        or len(parts) != 3
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise ValueError("common checkpoint path is invalid")
+    if reference["label"] != "common_step":
+        raise ValueError("common checkpoint label is invalid")
+    _sha256_text(reference["sha256"], "common checkpoint sha256")
+    _exact_nonnegative_int(reference["timestep"], "common checkpoint timestep")
+    return reference
+
+
+def _normalized_common_rows(
+    rows: Sequence[Mapping[str, Any]],
+    arm: str,
+    checkpoint: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        validated = _validated_rows(rows, arm=arm)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("common cache rows are invalid") from error
+    if len(validated) != len(EXPECTED_HOLDOUT_SEEDS):
+        raise ValueError("common cache must contain exact fixed holdout rows")
+    normalized: list[dict[str, Any]] = []
+    for row in validated:
+        if (
+            row["source"] != "holdout_fixed20"
+            or row["policy"] != arm
+            or row["checkpoint"] != "common_step"
+        ):
+            raise ValueError("common cache row identity is invalid")
+        try:
+            seed = int(row["seed"])
+            timestep = int(row["checkpoint_timestep"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("common cache integer field is invalid") from error
+        if isinstance(row["seed"], bool) or isinstance(
+            row["checkpoint_timestep"], bool
+        ):
+            raise ValueError("common cache integer field is invalid")
+        converted = dict(row)
+        converted["seed"] = seed
+        converted["checkpoint_timestep"] = timestep
+        for column in (
+            "mean_reward",
+            "mean_terminal_score",
+            "mean_dropout_rate",
+            "mean_delay_days",
+            "mean_delayed_count",
+            "mean_retained_choice_ratio",
+        ):
+            try:
+                number = float(row[column])
+            except (TypeError, ValueError) as error:
+                raise ValueError("common cache numeric field is invalid") from error
+            if not math.isfinite(number):
+                raise ValueError("common cache numeric field is invalid")
+            converted[column] = number
+        normalized.append(
+            {field: converted[field] for field in EVALUATION_COLUMNS}
+        )
+    expected_provenance = {
+        (
+            "common_step",
+            checkpoint["timestep"],
+            checkpoint["sha256"],
+        )
+    }
+    provenance = {
+        (
+            row["checkpoint"],
+            row["checkpoint_timestep"],
+            row["checkpoint_sha256"],
+        )
+        for row in normalized
+    }
+    if provenance != expected_provenance:
+        raise ValueError("common cache checkpoint provenance mismatch")
+    return sorted(normalized, key=lambda row: row["seed"])
+
+
+def _common_cache_payload(
+    arm: str,
+    *,
+    config_sha256: str,
+    scenario_sha256: str,
+    checkpoint: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "arm": arm,
+        "config_sha256": config_sha256,
+        "scenario_sha256": scenario_sha256,
+        "checkpoint": dict(checkpoint),
+        "rows": _normalized_common_rows(rows, arm, checkpoint),
+    }
+
+
+def _read_common_cache(
+    comparison_root: Path,
+    arm: str,
+    *,
+    config_sha256: str,
+    scenario_sha256: str,
+    checkpoint: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    name = _COMMON_CACHE_NAMES[arm]
+    try:
+        path = resolve_direct_regular_file(
+            comparison_root,
+            comparison_root / name,
+            label=f"{arm} common cache",
+        )
+        payload = read_json_object(path)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise ValueError(f"{arm} common cache is invalid") from error
+    if set(payload) != _COMMON_CACHE_KEYS:
+        raise ValueError(f"{arm} common cache schema is invalid")
+    if (
+        payload["schema_version"] != 1
+        or payload["arm"] != arm
+        or payload["config_sha256"] != config_sha256
+        or payload["scenario_sha256"] != scenario_sha256
+        or payload["checkpoint"] != dict(checkpoint)
+        or not isinstance(payload["rows"], list)
+    ):
+        raise ValueError(f"{arm} common cache identity is invalid")
+    _sha256_text(payload["config_sha256"], "common cache config hash")
+    _sha256_text(payload["scenario_sha256"], "common cache scenario hash")
+    return payload, _normalized_common_rows(
+        payload["rows"], arm, checkpoint
+    )
+
+
+def _read_combined_common_rows(
+    comparison_root: Path,
+    checkpoints: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    try:
+        path = resolve_direct_regular_file(
+            comparison_root,
+            comparison_root / _COMMON_COMBINED_NAME,
+            label="combined common evaluation",
+        )
+        with path.open(encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if tuple(reader.fieldnames or ()) != EVALUATION_COLUMNS:
+                raise ValueError("combined common CSV header is invalid")
+            rows = list(reader)
+    except (OSError, UnicodeDecodeError, csv.Error) as error:
+        raise ValueError("combined common CSV is invalid") from error
+    expected_order = [
+        (arm, seed) for arm in ARMS for seed in EXPECTED_HOLDOUT_SEEDS
+    ]
+    try:
+        observed_order = [(row["arm"], int(row["seed"])) for row in rows]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("combined common CSV order is invalid") from error
+    if observed_order != expected_order:
+        raise ValueError("combined common CSV order is invalid")
+    normalized: list[dict[str, Any]] = []
+    for arm in ARMS:
+        normalized.extend(
+            _normalized_common_rows(
+                [row for row in rows if row.get("arm") == arm],
+                arm,
+                checkpoints[arm],
+            )
+        )
+    return normalized
+
+
+def validate_common_step_stage(
+    root: str | Path,
+    *,
+    expected_config_sha256: str | None = None,
+    expected_scenario_sha256: str | None = None,
+    archive_timestep_reader: Callable[[Path], int | None] | None = None,
+) -> dict[str, Any]:
+    """Validate only artifacts and manifest refs owned by common evaluation."""
+    root_path = Path(root)
+    root_is_junction = getattr(root_path, "is_junction", None)
+    if root_path.is_symlink() or (
+        root_is_junction is not None and root_is_junction()
+    ):
+        raise ValueError("comparison root must be a regular directory")
+    try:
+        base = root_path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("comparison root is invalid") from error
+    if not base.is_dir():
+        raise ValueError("comparison root must be a regular directory")
+    comparison_root = resolve_direct_directory(
+        base, base / "comparison", label="common comparison directory"
+    )
+    arm_roots = {
+        arm: resolve_direct_directory(
+            base, base / arm, label=f"{arm} comparison directory"
+        )
+        for arm in ARMS
+    }
+    marker_path = resolve_direct_regular_file(
+        comparison_root,
+        comparison_root / _COMMON_MARKER_NAME,
+        label="common stage marker",
+    )
+    try:
+        marker = read_json_object(marker_path)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise ValueError("common stage marker is invalid") from error
+    if set(marker) != _COMMON_MARKER_KEYS or marker["schema_version"] != 1:
+        raise ValueError("common stage marker schema is invalid")
+    config_sha = _sha256_text(marker["config_sha256"], "common config hash")
+    scenario_sha = _sha256_text(marker["scenario_sha256"], "common scenario hash")
+    if expected_config_sha256 is not None and config_sha != expected_config_sha256:
+        raise ValueError("common config hash mismatch")
+    if expected_scenario_sha256 is not None and scenario_sha != expected_scenario_sha256:
+        raise ValueError("common scenario hash mismatch")
+    common_timestep = _exact_nonnegative_int(
+        marker["common_timestep"], "common timestep"
+    )
+    if marker["evaluation_seed_count_per_arm"] != len(EXPECTED_HOLDOUT_SEEDS):
+        raise ValueError("common evaluation seed count is invalid")
+    checkpoints = marker["checkpoints"]
+    if not isinstance(checkpoints, Mapping) or set(checkpoints) != set(ARMS):
+        raise ValueError("common checkpoint schema is invalid")
+    normalized_checkpoints = {
+        arm: _validate_common_reference(checkpoints[arm], arm) for arm in ARMS
+    }
+    if {ref["timestep"] for ref in normalized_checkpoints.values()} != {
+        common_timestep
+    }:
+        raise ValueError("common checkpoint timesteps differ")
+    expected_artifacts = {
+        *(_COMMON_CACHE_NAMES[arm] for arm in ARMS),
+        _COMMON_COMBINED_NAME,
+    }
+    artifacts = marker["artifacts"]
+    if not isinstance(artifacts, Mapping) or set(artifacts) != expected_artifacts:
+        raise ValueError("common artifact schema is invalid")
+    for name in expected_artifacts:
+        expected_digest = _sha256_text(
+            artifacts[name], f"{name} common artifact hash"
+        )
+        try:
+            artifact = resolve_direct_regular_file(
+                comparison_root,
+                comparison_root / name,
+                label=f"common artifact {name}",
+            )
+        except (OSError, ValueError) as error:
+            raise ValueError("common artifact is not direct regular") from error
+        if sha256_file(artifact) != expected_digest:
+            raise ValueError("common artifact hash mismatch")
+    cache_rows: dict[str, list[dict[str, Any]]] = {}
+    for arm in ARMS:
+        _payload, cache_rows[arm] = _read_common_cache(
+            comparison_root,
+            arm,
+            config_sha256=config_sha,
+            scenario_sha256=scenario_sha,
+            checkpoint=normalized_checkpoints[arm],
+        )
+    combined_rows = _read_combined_common_rows(
+        comparison_root, normalized_checkpoints
+    )
+    expected_rows = [row for arm in ARMS for row in cache_rows[arm]]
+    if combined_rows != expected_rows:
+        raise ValueError("combined common CSV differs from per-arm caches")
+    try:
+        manifest_path = resolve_direct_regular_file(
+            base, base / "manifest.json", label="root manifest"
+        )
+        manifest = read_json_object(manifest_path)
+        manifest_checkpoints = manifest["checkpoints"]
+    except (OSError, UnicodeDecodeError, KeyError, TypeError, ValueError) as error:
+        raise ValueError("common checkpoint manifest is invalid") from error
+    if manifest.get("config_sha256") != config_sha:
+        raise ValueError("common config differs from root manifest")
+    if manifest.get("scenario_sha256") != scenario_sha:
+        raise ValueError("common scenario differs from root manifest")
+    for arm in ARMS:
+        try:
+            current_common = manifest_checkpoints[arm]["common"]
+        except (KeyError, TypeError) as error:
+            raise ValueError("common checkpoint manifest is invalid") from error
+        if current_common != normalized_checkpoints[arm]:
+            raise ValueError("common checkpoint manifest mismatch")
+        reference = CheckpointRef(
+            base / normalized_checkpoints[arm]["path"],
+            "common_step",
+            normalized_checkpoints[arm]["timestep"],
+            normalized_checkpoints[arm]["sha256"],
+        )
+        try:
+            checkpoint_path = _reference_path_within_arm(
+                reference, arm_roots[arm]
+            )
+        except PartialResultError as error:
+            raise ValueError("common checkpoint is not direct regular") from error
+        if sha256_file(checkpoint_path) != reference.sha256:
+            raise ValueError("common checkpoint hash mismatch")
+        if archive_timestep_reader is not None:
+            try:
+                stored_timestep = archive_timestep_reader(checkpoint_path)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise ValueError("common checkpoint is unreadable") from error
+            if stored_timestep != reference.timestep:
+                raise ValueError("common checkpoint stored timestep mismatch")
+    return marker
+
+
 def _pretty_json_bytes(payload: Mapping[str, Any]) -> bytes:
     return (
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
@@ -1000,50 +1386,235 @@ def evaluate_arm_artifacts(
     return validated_marker
 
 
-def evaluate_comparison_artifacts(
-    root: Path, raw_dir: Path, cnn_dir: Path, scenarios: Sequence[dict],
-    raw_config: Mapping[str, Any], cnn_config: Mapping[str, Any], *,
-    regular_interval: int = REGULAR_INTERVAL, model_loader=MaskablePPO.load,
-) -> dict[str, dict[str, CheckpointRef]]:
-    """Evaluate both arms only when an existing root manifest is present."""
-    root = Path(root).resolve()
-    raw_dir, cnn_dir = Path(raw_dir).resolve(), Path(cnn_dir).resolve()
-    for expected, directory in (("raw_direct", raw_dir), ("candidate_cnn", cnn_dir)):
-        if directory.parent != root or directory.name != expected:
-            raise PartialResultError("comparison arm directory escapes root")
-    manifest_path = root / "manifest.json"
-    if not manifest_path.is_file():
-        raise PartialResultError("root manifest.json must already exist")
-    common_step = select_common_timestep(raw_dir, cnn_dir, regular_interval, model_loader=model_loader)
+def evaluate_common_step_artifacts(
+    root: str | Path,
+    scenarios: Sequence[dict],
+    arm_configs: Mapping[str, Mapping[str, Any]],
+    *,
+    config_sha256: str,
+    scenario_sha256: str,
+    regular_interval: int = REGULAR_INTERVAL,
+    model_loader=MaskablePPO.load,
+) -> dict[str, Any]:
+    """Evaluate only the shared regular checkpoint and commit marker-last.
+
+    Each arm cache is its own durable commit.  A restart can therefore reuse a
+    completed arm after the other arm crashed, while the combined CSV and stage
+    marker are published only after both exact caches have been validated.
+    """
+    _sha256_text(config_sha256, "common evaluation config hash")
+    _sha256_text(scenario_sha256, "common evaluation scenario hash")
+    if regular_interval <= 0:
+        raise ValueError("regular_interval must be positive")
+    if not isinstance(arm_configs, Mapping) or set(arm_configs) != set(ARMS):
+        raise ValueError("common evaluation requires exact arm configs")
+    if any(not isinstance(arm_configs[arm], Mapping) for arm in ARMS):
+        raise ValueError("common evaluation arm config must be a mapping")
+    try:
+        split_holdout_records(scenarios)
+    except (KeyError, TypeError, ValueError) as error:
+        raise PartialResultError(
+            "common evaluation requires the exact fixed holdout scenarios"
+        ) from error
+
+    root_path = Path(root)
+    root_is_junction = getattr(root_path, "is_junction", None)
+    if root_path.is_symlink() or (
+        root_is_junction is not None and root_is_junction()
+    ):
+        raise PartialResultError("comparison root must be a regular directory")
+    try:
+        base = root_path.resolve(strict=True)
+        if not base.is_dir():
+            raise ValueError("comparison root is not a directory")
+        arm_roots = {
+            arm: resolve_direct_directory(
+                base, base / arm, label=f"{arm} comparison directory"
+            )
+            for arm in ARMS
+        }
+        comparison_candidate = base / "comparison"
+        comparison_is_junction = getattr(
+            comparison_candidate, "is_junction", None
+        )
+        if comparison_candidate.is_symlink() or (
+            comparison_is_junction is not None and comparison_is_junction()
+        ):
+            raise ValueError("comparison artifact directory is linked")
+        if not comparison_candidate.exists():
+            comparison_candidate.mkdir()
+        comparison_root = resolve_direct_directory(
+            base,
+            comparison_candidate,
+            label="common comparison directory",
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise PartialResultError("comparison directory layout is invalid") from error
+
+    archive_timestep_reader = lambda path: _archive_timestep(path, model_loader)
+    try:
+        return validate_common_step_stage(
+            base,
+            expected_config_sha256=config_sha256,
+            expected_scenario_sha256=scenario_sha256,
+            archive_timestep_reader=archive_timestep_reader,
+        )
+    except (OSError, ValueError):
+        pass
+
+    marker_path = comparison_root / _COMMON_MARKER_NAME
+    try:
+        if marker_path.exists() or marker_path.is_symlink():
+            marker_path.unlink()
+    except OSError as error:
+        raise PartialResultError("invalid common stage marker cannot be removed") from error
+
+    manifest_path = base / "manifest.json"
+    try:
+        manifest_file = resolve_direct_regular_file(
+            base, manifest_path, label="root manifest"
+        )
+        manifest = read_json_object(manifest_file)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise PartialResultError("root manifest.json must already be valid") from error
+    if manifest.get("config_sha256") != config_sha256:
+        raise PartialResultError("root manifest config hash mismatch")
+    if manifest.get("scenario_sha256") != scenario_sha256:
+        raise PartialResultError("root manifest scenario hash mismatch")
+
     inventories = {
-        "raw_direct": readable_checkpoint_inventory(raw_dir, regular_interval, model_loader=model_loader),
-        "candidate_cnn": readable_checkpoint_inventory(cnn_dir, regular_interval, model_loader=model_loader),
+        arm: readable_checkpoint_inventory(
+            arm_roots[arm],
+            regular_interval,
+            model_loader=model_loader,
+        )
+        for arm in ARMS
     }
-    refs: dict[str, dict[str, CheckpointRef]] = {}
-    manifest_updates: dict[str, dict[str, CheckpointRef]] = {}
-    configs = {"raw_direct": raw_config, "candidate_cnn": cnn_config}
-    directories = {"raw_direct": raw_dir, "candidate_cnn": cnn_dir}
-    common_rows: list[dict] = []
+    shared_steps = set(inventories[ARMS[0]]) & set(inventories[ARMS[1]])
+    if not shared_steps:
+        raise PartialResultError("no common readable regular checkpoint timestep")
+    common_step = max(shared_steps)
+
+    absolute_refs: dict[str, CheckpointRef] = {}
+    relative_refs: dict[str, CheckpointRef] = {}
+    checkpoint_payloads: dict[str, dict[str, Any]] = {}
     for arm in ARMS:
-        final = resolve_final_checkpoint(directories[arm], model_loader=model_loader)
-        selected = resolve_selected_or_fallback(directories[arm], model_loader=model_loader)
-        common_path = inventories[arm][common_step]
-        common = _verified_ref(common_path, "common_step", common_step, model_loader)
-        if common is None:
+        reference = _verified_ref(
+            inventories[arm][common_step],
+            "common_step",
+            common_step,
+            model_loader,
+        )
+        if reference is None:
             raise PartialResultError("common checkpoint became unreadable")
-        refs[arm] = {"selected": selected, "final": final, "common": common}
-        selected_rows = evaluate_checkpoint(selected.path, configs[arm], scenarios, selected.label, arm, model_loader)
-        write_arm_evaluations(root, arm, selected_rows)
-        common_rows.extend(evaluate_checkpoint(common.path, configs[arm], scenarios, "common_step", arm, model_loader))
-        try:
-            relative_refs = {name: CheckpointRef(ref.path.resolve().relative_to(root), ref.label, ref.timestep, ref.sha256) for name, ref in refs[arm].items()}
-        except ValueError as error:
-            raise PartialResultError("checkpoint reference escapes root") from error
-        manifest_updates[arm] = relative_refs
-    write_common_step_evaluation(root, common_rows)
-    try: manifest = read_json_object(manifest_path)
-    except (OSError, UnicodeDecodeError, ValueError) as error: raise PartialResultError("root manifest.json is invalid") from error
+        _reference_path_within_arm(reference, arm_roots[arm])
+        relative = _root_relative_reference(base, arm_roots[arm], reference)
+        absolute_refs[arm] = reference
+        relative_refs[arm] = relative
+        checkpoint_payloads[arm] = _reference_payload(relative)
+
+    cached_rows: dict[str, list[dict[str, Any]]] = {}
     for arm in ARMS:
-        manifest = merge_checkpoint_manifest(manifest, arm, manifest_updates[arm])
-    atomic_write_json(manifest_path, manifest)
-    return refs
+        try:
+            _payload, rows = _read_common_cache(
+                comparison_root,
+                arm,
+                config_sha256=config_sha256,
+                scenario_sha256=scenario_sha256,
+                checkpoint=checkpoint_payloads[arm],
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            rows = evaluate_checkpoint(
+                absolute_refs[arm].path,
+                arm_configs[arm],
+                scenarios,
+                "common_step",
+                arm,
+                model_loader,
+            )
+            _stable_checkpoint_reference(
+                absolute_refs[arm],
+                arm_roots[arm],
+                model_loader=model_loader,
+            )
+            cache = _common_cache_payload(
+                arm,
+                config_sha256=config_sha256,
+                scenario_sha256=scenario_sha256,
+                checkpoint=checkpoint_payloads[arm],
+                rows=rows,
+            )
+            atomic_write_json(
+                comparison_root / _COMMON_CACHE_NAMES[arm], cache
+            )
+            _payload, rows = _read_common_cache(
+                comparison_root,
+                arm,
+                config_sha256=config_sha256,
+                scenario_sha256=scenario_sha256,
+                checkpoint=checkpoint_payloads[arm],
+            )
+        cached_rows[arm] = rows
+
+    for arm in ARMS:
+        _stable_checkpoint_reference(
+            absolute_refs[arm],
+            arm_roots[arm],
+            model_loader=model_loader,
+        )
+
+    combined_rows = [row for arm in ARMS for row in cached_rows[arm]]
+    combined_path = write_common_step_evaluation(base, combined_rows)
+
+    try:
+        current_manifest = read_json_object(
+            resolve_direct_regular_file(
+                base, manifest_path, label="root manifest"
+            )
+        )
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise PartialResultError("root manifest.json became invalid") from error
+    if current_manifest.get("config_sha256") != config_sha256:
+        raise PartialResultError("root manifest config hash changed")
+    if current_manifest.get("scenario_sha256") != scenario_sha256:
+        raise PartialResultError("root manifest scenario hash changed")
+    try:
+        updated_manifest = current_manifest
+        for arm in ARMS:
+            updated_manifest = merge_checkpoint_manifest(
+                updated_manifest, arm, {"common": relative_refs[arm]}
+            )
+        atomic_write_json(manifest_path, updated_manifest)
+    except (OSError, TypeError, ValueError) as error:
+        raise PartialResultError("common checkpoint manifest publication failed") from error
+
+    marker = {
+        "schema_version": 1,
+        "config_sha256": config_sha256,
+        "scenario_sha256": scenario_sha256,
+        "common_timestep": common_step,
+        "checkpoints": {
+            arm: checkpoint_payloads[arm] for arm in ARMS
+        },
+        "artifacts": {
+            _COMMON_CACHE_NAMES[arm]: sha256_file(
+                comparison_root / _COMMON_CACHE_NAMES[arm]
+            )
+            for arm in ARMS
+        }
+        | {_COMMON_COMBINED_NAME: sha256_file(combined_path)},
+        "evaluation_seed_count_per_arm": len(EXPECTED_HOLDOUT_SEEDS),
+    }
+    expected_marker_bytes = _pretty_json_bytes(marker)
+    try:
+        atomic_write_json(marker_path, marker)
+        validated_marker = validate_common_step_stage(
+            base,
+            expected_config_sha256=config_sha256,
+            expected_scenario_sha256=scenario_sha256,
+            archive_timestep_reader=archive_timestep_reader,
+        )
+    except BaseException:
+        _unlink_if_exact(marker_path, expected_marker_bytes)
+        raise
+    return validated_marker
