@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import gc
 import os
+import pickle
 import sys
 import warnings
 import zipfile
@@ -389,16 +390,6 @@ CONFIG_COMPATIBILITY_KEYS = tuple(sorted({
     "gamma",
     "gae_lambda",
 }))
-# Backward-compatible name consumed by existing safety tooling.
-ARCH_CONFIG_KEYS = CONFIG_COMPATIBILITY_KEYS
-
-
-class _ConfigCompatibilityResult(tuple):
-    def __new__(cls, compatible: bool, bad_key: str | None):
-        return super().__new__(cls, (compatible, bad_key))
-
-    def __bool__(self) -> bool:
-        return bool(self[0])
 
 
 def current_run_config(
@@ -527,8 +518,22 @@ def model_num_timesteps(
         model = loader(str(path), device="cpu")
         value = getattr(model, "num_timesteps", None)
         return int(value) if value is not None else None
-    except (EOFError, OSError, RuntimeError, ValueError, zipfile.BadZipFile):
+    except (
+        EOFError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        pickle.UnpicklingError,
+        zipfile.BadZipFile,
+    ):
         return None
+    except AssertionError as error:
+        if str(error) in {
+            "No data found in the saved file",
+            "No params found in the saved file",
+        }:
+            return None
+        raise
 
 
 def find_resumable_model(
@@ -581,10 +586,8 @@ def config_mismatches(
 def configs_compatible(
     saved: Mapping,
     current: Mapping,
-) -> _ConfigCompatibilityResult:
-    mismatches = config_mismatches(saved, current)
-    bad_key = next(iter(mismatches), None)
-    return _ConfigCompatibilityResult(not mismatches, bad_key)
+) -> bool:
+    return not config_mismatches(saved, current)
 
 
 def require_current_training_data_schema(

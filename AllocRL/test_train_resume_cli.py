@@ -1,6 +1,7 @@
 """CLI regression tests for training resume support."""
 
 import os
+import pickle
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from stable_baselines3.common import save_util
 
 import train as train_module
 from alloc_env.observation_state import ObservationScales
@@ -140,6 +142,42 @@ def touch_model(path: Path) -> Path:
     return path
 
 
+def save_real_model(path: Path, timesteps: int) -> Path:
+    model = train_module.MaskablePPO(
+        "MlpPolicy",
+        "CartPole-v1",
+        n_steps=8,
+        batch_size=4,
+        n_epochs=1,
+        device="cpu",
+        verbose=0,
+    )
+    try:
+        model.num_timesteps = timesteps
+        model.save(path)
+    finally:
+        env = model.get_env()
+        if env is not None:
+            env.close()
+    return path
+
+
+def corrupt_policy_member(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    replaced = False
+    with (
+        zipfile.ZipFile(source, "r") as source_archive,
+        zipfile.ZipFile(destination, "w") as destination_archive,
+    ):
+        for info in source_archive.infolist():
+            content = source_archive.read(info.filename)
+            if info.filename == "policy.pth":
+                content = b"not a torch pickle"
+                replaced = True
+            destination_archive.writestr(info, content)
+    assert replaced
+
+
 def fake_loader(timesteps_by_path, unreadable=()):
     normalized = {
         Path(path).resolve(): value for path, value in timesteps_by_path.items()
@@ -183,7 +221,13 @@ def test_resume_rejects_each_changed_compatibility_value(key):
     current = complete_config()
     current[key] = different_value(current[key])
 
-    assert not train_module.configs_compatible(saved, current)
+    assert train_module.configs_compatible(saved, current) is False
+
+
+def test_configs_compatible_returns_an_explicit_bool():
+    assert train_module.configs_compatible(
+        complete_config(), complete_config()
+    ) is True
 
 
 @pytest.mark.parametrize("missing_key", ["split_seed", "source_sha256"])
@@ -315,6 +359,49 @@ def test_unreadable_high_named_checkpoint_is_ignored(tmp_path):
     assert train_module.find_resumable_model(tmp_path, loader=loader) == valid
 
 
+@pytest.mark.parametrize(
+    ("corruption", "expected_error"),
+    [
+        ("policy", pickle.UnpicklingError),
+        ("empty", AssertionError),
+    ],
+    ids=["corrupt-policy-pth", "empty-zip"],
+)
+def test_real_sb3_corrupt_candidate_is_ignored_without_leaking_handles(
+    tmp_path,
+    monkeypatch,
+    corruption,
+    expected_error,
+):
+    valid = save_real_model(tmp_path / train_module.MODEL_FILENAME, 100_000)
+    corrupt = tmp_path / "checkpoints" / "model_999999_steps.sb3"
+    if corruption == "policy":
+        corrupt_policy_member(valid, corrupt)
+    else:
+        corrupt.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(corrupt, "w"):
+            pass
+
+    opened_files = []
+    original_open_path = save_util.open_path
+
+    def tracking_open_path(*args, **kwargs):
+        file = original_open_path(*args, **kwargs)
+        opened_files.append(file)
+        return file
+
+    monkeypatch.setattr(save_util, "open_path", tracking_open_path)
+    with pytest.raises(expected_error):
+        train_module.MaskablePPO.load(str(corrupt), device="cpu")
+
+    assert train_module.find_resumable_model(tmp_path) == valid
+    assert opened_files
+    assert all(file.closed for file in opened_files)
+
+    corrupt.unlink()
+    valid.unlink()
+
+
 def test_final_model_wins_only_when_stored_timesteps_tie(tmp_path):
     final = touch_model(tmp_path / train_module.MODEL_FILENAME)
     checkpoint = touch_model(
@@ -386,6 +473,22 @@ def test_model_num_timesteps_ignores_supported_archive_errors(
         raise error_type("broken")
 
     assert train_module.model_num_timesteps(model_path, loader=loader) is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [AssertionError("unexpected assertion"), LookupError("unexpected loader")],
+)
+def test_model_num_timesteps_does_not_swallow_unexpected_loader_errors(
+    tmp_path, error
+):
+    model_path = touch_model(tmp_path / "model.sb3")
+
+    def loader(path, *, device):
+        raise error
+
+    with pytest.raises(type(error), match="unexpected"):
+        train_module.model_num_timesteps(model_path, loader=loader)
 
 
 class TrainResumeCliTest(unittest.TestCase):

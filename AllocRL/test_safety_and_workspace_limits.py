@@ -37,18 +37,20 @@ def make_block(name: str, x: float, y: float) -> Block:
 class SafetyAndWorkspaceLimitTests(unittest.TestCase):
     def test_checkpoint_schema_versions_must_match(self):
         saved = {
-            key: None for key in train_module.ARCH_CONFIG_KEYS
+            key: None for key in train_module.CONFIG_COMPATIBILITY_KEYS
         }
         current = dict(saved)
         saved["observation_schema_version"] = 1
         current["observation_schema_version"] = 2
 
-        compatible, bad_key = train_module.configs_compatible(
-            saved, current
+        self.assertIs(
+            False,
+            train_module.configs_compatible(saved, current),
         )
-
-        self.assertFalse(compatible)
-        self.assertEqual("observation_schema_version", bad_key)
+        self.assertEqual(
+            {"observation_schema_version": (1, 2)},
+            train_module.config_mismatches(saved, current),
+        )
 
     def test_blocks_closer_than_safety_distance_intersect(self):
         left = make_block("A001", x=5.0, y=5.0)
