@@ -30,6 +30,7 @@ if sys.platform == "win32" and os.environ.get("PYTHONIOENCODING") is None:
 
 import gymnasium as gym
 import numpy as np
+import torch
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 
@@ -133,11 +134,13 @@ def build_policy_kwargs(
         FixedGridExtractor,
         StructuredExtractor,
     )
+    from comparison.raw_direct_extractor import RawDirectExtractor
 
     extractors = {
         "structured": StructuredExtractor,
         "fixed-grid": FixedGridExtractor,
         "candidate-cnn": CandidateCnnExtractor,
+        "raw-direct": RawDirectExtractor,
     }
     if extractor not in extractors:
         raise ValueError(
@@ -149,7 +152,13 @@ def build_policy_kwargs(
         "features_extractor_class": extractors[extractor],
         "features_extractor_kwargs": {"features_dim": features_dim},
         "share_features_extractor": True,
+        "net_arch": explicit_policy_net_arch(),
+        "activation_fn": torch.nn.ReLU,
     }
+
+
+def explicit_policy_net_arch() -> dict[str, list[int]]:
+    return {"pi": [64, 64], "vf": [64, 64]}
 
 
 def observation_float_count(observation_space: gym.spaces.Dict) -> int:
@@ -375,6 +384,9 @@ CONFIG_COMPATIBILITY_KEYS = tuple(sorted({
     "future_day_windows",
     "observation_scales",
     "features_dim",
+    "extractor_output_dim",
+    "policy_net_arch",
+    "policy_activation",
     "active_workspace_codes",
     "data_split_seed",
     "source_sha256",
@@ -418,6 +430,11 @@ def current_run_config(
         "reward_schema_version": REWARD_SCHEMA_VERSION,
         "extractor": args.extractor,
         "features_dim": args.features_dim,
+        "extractor_output_dim": (
+            2772 if args.extractor == "raw-direct" else args.features_dim
+        ),
+        "policy_net_arch": explicit_policy_net_arch(),
+        "policy_activation": "ReLU",
         "active_workspace_codes": list(active_workspace_codes),
         "state_context": args.state_context,
         "grid_size": GRID_SIZE,
@@ -1383,7 +1400,7 @@ def main():
         "--extractor",
         type=str,
         default="candidate-cnn",
-        choices=["structured", "fixed-grid", "candidate-cnn"],
+        choices=["structured", "fixed-grid", "candidate-cnn", "raw-direct"],
         help="feature extractor ablation mode",
     )
     parser.add_argument(

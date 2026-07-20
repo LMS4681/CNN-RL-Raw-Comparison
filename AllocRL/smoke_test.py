@@ -39,7 +39,7 @@ from train import (
 
 
 BASE_DIR = Path(__file__).resolve().parent
-EXTRACTORS = ("structured", "fixed-grid", "candidate-cnn")
+EXTRACTORS = ("structured", "fixed-grid", "candidate-cnn", "raw-direct")
 SMOKE_ROLLOUT_STEPS = 32
 SCHEMA3_OBSERVATION_SHAPES = {
     "block": (CURRENT_BLOCK_FEATURE_DIM,),
@@ -128,6 +128,7 @@ def train_tiny_model(
     *,
     extractor: str,
     timesteps: int,
+    device: str,
 ):
     """Train one extractor through real MaskablePPO actor/critic losses."""
     if extractor not in EXTRACTORS:
@@ -151,7 +152,7 @@ def train_tiny_model(
         batch_size=n_steps,
         n_epochs=1,
         seed=0,
-        device="cpu",
+        device=device,
         verbose=0,
     )
 
@@ -181,6 +182,7 @@ def run_extractor_smoke(
     output_dir: Path,
     *,
     timesteps: int = 1_024,
+    device: str = "cpu",
 ) -> dict[str, float]:
     """Train, save, load, and complete one evaluation for an extractor."""
     output_dir = Path(output_dir)
@@ -188,6 +190,7 @@ def run_extractor_smoke(
     model, env = train_tiny_model(
         extractor=extractor,
         timesteps=timesteps,
+        device=device,
     )
     path = output_dir / f"{extractor}.sb3"
     try:
@@ -237,6 +240,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=1_024,
     )
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     return parser
 
 
@@ -244,12 +248,14 @@ def _run_selected_extractors(
     extractors: Sequence[str],
     output_dir: Path,
     timesteps: int,
+    device: str,
 ) -> None:
     for extractor in extractors:
         run_extractor_smoke(
             extractor,
             output_dir,
             timesteps=timesteps,
+            device=device,
         )
 
 
@@ -260,11 +266,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.output_dir is not None:
         output_dir = args.output_dir.resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        _run_selected_extractors(extractors, output_dir, args.timesteps)
+        _run_selected_extractors(
+            extractors, output_dir, args.timesteps, args.device
+        )
         return 0
 
     with tempfile.TemporaryDirectory(prefix="allocrl-schema3-smoke-") as tmp:
-        _run_selected_extractors(extractors, Path(tmp), args.timesteps)
+        _run_selected_extractors(
+            extractors, Path(tmp), args.timesteps, args.device
+        )
     return 0
 
 

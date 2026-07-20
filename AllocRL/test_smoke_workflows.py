@@ -37,6 +37,7 @@ def test_smoke_contract_lists_all_extractors_and_schema3_shapes():
         "structured",
         "fixed-grid",
         "candidate-cnn",
+        "raw-direct",
     )
     assert smoke_test.SCHEMA3_OBSERVATION_SHAPES == EXPECTED_SCHEMA3_SHAPES
     smoke_test.validate_schema3_observation_space(build_observation_space())
@@ -63,8 +64,8 @@ def test_run_extractor_smoke_saves_loads_and_evaluates(
     loaded = object()
     calls: dict[str, object] = {}
 
-    def fake_train(*, extractor: str, timesteps: int):
-        calls["train"] = (extractor, timesteps)
+    def fake_train(*, extractor: str, timesteps: int, device: str):
+        calls["train"] = (extractor, timesteps, device)
         return model, environment
 
     def fake_load(path: Path, *, env):
@@ -89,7 +90,7 @@ def test_run_extractor_smoke_saves_loads_and_evaluates(
     )
 
     path = tmp_path / "structured.sb3"
-    assert calls["train"] == ("structured", 1_024)
+    assert calls["train"] == ("structured", 1_024, "cpu")
     assert model.saved_paths == [path]
     assert calls["load"] == (path, environment)
     assert calls["evaluate"] == (loaded, environment, 1, True)
@@ -146,11 +147,13 @@ def test_cnn_diagnostics_require_gradient_and_weight_change(
 def test_all_extractors_cli_uses_temporary_output_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    calls: list[tuple[str, Path, int]] = []
+    calls: list[tuple[str, Path, int, str]] = []
 
-    def fake_run(extractor: str, output_dir: Path, *, timesteps: int):
+    def fake_run(
+        extractor: str, output_dir: Path, *, timesteps: int, device: str
+    ):
         assert output_dir.is_dir()
-        calls.append((extractor, output_dir, timesteps))
+        calls.append((extractor, output_dir, timesteps, device))
         return {"mean_terminal_score": 0.0}
 
     monkeypatch.setattr(smoke_test, "run_extractor_smoke", fake_run)
@@ -159,12 +162,15 @@ def test_all_extractors_cli_uses_temporary_output_by_default(
         ["--all-extractors", "--timesteps", "1024"]
     ) == 0
 
-    assert [extractor for extractor, _path, _steps in calls] == list(
+    assert [extractor for extractor, _path, _steps, _device in calls] == list(
         smoke_test.EXTRACTORS
     )
-    assert all(steps == 1_024 for _extractor, _path, steps in calls)
+    assert all(steps == 1_024 for _extractor, _path, steps, _device in calls)
+    assert all(device == "cpu" for _extractor, _path, _steps, device in calls)
     temporary_path = calls[0][1]
-    assert all(path == temporary_path for _extractor, path, _steps in calls)
+    assert all(
+        path == temporary_path for _extractor, path, _steps, _device in calls
+    )
     assert not temporary_path.exists()
 
 
@@ -172,10 +178,12 @@ def test_single_extractor_cli_preserves_explicit_output_directory(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
-    calls: list[tuple[str, Path, int]] = []
+    calls: list[tuple[str, Path, int, str]] = []
 
-    def fake_run(extractor: str, output_dir: Path, *, timesteps: int):
-        calls.append((extractor, output_dir, timesteps))
+    def fake_run(
+        extractor: str, output_dir: Path, *, timesteps: int, device: str
+    ):
+        calls.append((extractor, output_dir, timesteps, device))
         return {"mean_terminal_score": 0.0}
 
     monkeypatch.setattr(smoke_test, "run_extractor_smoke", fake_run)
@@ -189,5 +197,21 @@ def test_single_extractor_cli_preserves_explicit_output_directory(
         str(tmp_path),
     ]) == 0
 
-    assert calls == [("fixed-grid", tmp_path.resolve(), 12)]
+    assert calls == [("fixed-grid", tmp_path.resolve(), 12, "cpu")]
     assert tmp_path.is_dir()
+
+
+def test_smoke_cli_accepts_explicit_cuda(monkeypatch, tmp_path: Path):
+    captured = {}
+    monkeypatch.setattr(
+        smoke_test,
+        "_run_selected_extractors",
+        lambda extractors, output_dir, timesteps, device: captured.update(
+            extractors=extractors, device=device
+        ),
+    )
+    assert smoke_test.main([
+        "--extractor", "raw-direct", "--timesteps", "1024",
+        "--device", "cuda", "--output-dir", str(tmp_path),
+    ]) == 0
+    assert captured == {"extractors": ("raw-direct",), "device": "cuda"}

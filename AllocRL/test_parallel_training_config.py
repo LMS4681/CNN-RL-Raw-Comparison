@@ -9,6 +9,7 @@ from unittest.mock import patch
 import gymnasium as gym
 import numpy as np
 import cloudpickle
+import torch.nn as nn
 from sb3_contrib.common.maskable.utils import get_action_masks
 
 import train as train_module
@@ -19,6 +20,7 @@ from alloc_env.cnn_extractor import (
     FixedGridExtractor,
     StructuredExtractor,
 )
+from comparison.raw_direct_extractor import RawDirectExtractor
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.observation_state import (
     GRID_SIZE,
@@ -116,6 +118,7 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             "structured": StructuredExtractor,
             "fixed-grid": FixedGridExtractor,
             "candidate-cnn": CandidateCnnExtractor,
+            "raw-direct": RawDirectExtractor,
         }
         for name, expected in expected_extractors.items():
             with self.subTest(extractor=name):
@@ -130,6 +133,10 @@ class ParallelTrainingConfigTests(unittest.TestCase):
                     kwargs["features_extractor_kwargs"],
                 )
                 self.assertTrue(kwargs["share_features_extractor"])
+                self.assertEqual(
+                    {"pi": [64, 64], "vf": [64, 64]}, kwargs["net_arch"]
+                )
+                self.assertIs(nn.ReLU, kwargs["activation_fn"])
 
         with self.assertRaises(ValueError):
             train_module.build_policy_kwargs("block-attn")

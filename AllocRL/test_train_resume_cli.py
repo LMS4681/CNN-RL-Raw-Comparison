@@ -29,6 +29,9 @@ REQUIRED_COMPATIBILITY_KEYS = {
     "reward_schema_version",
     "extractor",
     "features_dim",
+    "extractor_output_dim",
+    "policy_net_arch",
+    "policy_activation",
     "active_workspace_codes",
     "state_context",
     "grid_size",
@@ -76,6 +79,9 @@ def complete_config(observation_schema_version=3):
             "dropout_threshold": 7,
         },
         "features_dim": 256,
+        "extractor_output_dim": 256,
+        "policy_net_arch": {"pi": [64, 64], "vf": [64, 64]},
+        "policy_activation": "ReLU",
         "active_workspace_codes": list(WORKSPACE_CODES),
         "data_split_seed": 20260716,
         "source_sha256": "abc123",
@@ -213,6 +219,20 @@ def test_run_config_contains_every_compatibility_key():
     assert train_module.CONFIG_COMPATIBILITY_KEYS == tuple(
         sorted(REQUIRED_COMPATIBILITY_KEYS)
     )
+
+
+def test_raw_direct_run_config_records_fixed_output_dimension():
+    args = make_args()
+    args.extractor = "raw-direct"
+    config = train_module.current_run_config(
+        args,
+        WORKSPACE_CODES,
+        source_manifest(),
+        ObservationScales.from_dict(complete_config()["observation_scales"]),
+    )
+    assert config["extractor_output_dim"] == 2772
+    assert config["policy_net_arch"] == {"pi": [64, 64], "vf": [64, 64]}
+    assert config["policy_activation"] == "ReLU"
 
 
 @pytest.mark.parametrize("key", sorted(REQUIRED_COMPATIBILITY_KEYS))
@@ -495,6 +515,22 @@ class TrainResumeCliTest(unittest.TestCase):
     @staticmethod
     def _run_config(observation_schema_version=3):
         return complete_config(observation_schema_version)
+
+    def test_raw_direct_extractor_argument_is_accepted(self):
+        captured = {}
+
+        def fake_train(args):
+            captured["extractor"] = args.extractor
+
+        with (
+            patch.object(
+                sys, "argv", ["train.py", "--extractor", "raw-direct"]
+            ),
+            patch.object(train_module, "train", fake_train),
+        ):
+            train_module.main()
+
+        self.assertEqual("raw-direct", captured["extractor"])
 
     def test_primary_model_filename_avoids_security_filtered_zip_suffix(self):
         self.assertEqual(
