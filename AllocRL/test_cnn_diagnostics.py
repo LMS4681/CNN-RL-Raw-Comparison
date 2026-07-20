@@ -102,23 +102,62 @@ def prepared_allocation_callback(
     return callback, policy, logger
 
 
-def diagnostic_copy_calls(array_mock) -> int:
-    return sum(
-        call.kwargs.get("copy") is True
+def diagnostic_copy_calls(array_mock):
+    return [
+        call
         for call in array_mock.call_args_list
+        if call.kwargs == {"copy": True}
+    ]
+
+
+def diagnostic_copy_count(array_mock) -> int:
+    return len(
+        diagnostic_copy_calls(array_mock)
     )
 
 
-EXPECTED_CNN_DIAGNOSTICS = {
-    "cnn_gradient_norm",
-    "cnn_weight_change",
-    "workspace_feature_variance",
-    "candidate_channel_sensitivity",
-}
-EXPECTED_CNN_DIAGNOSTIC_LOGS = {
-    f"diagnostics/{key}"
-    for key in EXPECTED_CNN_DIAGNOSTICS
-}
+class FailingArraySource:
+    def __array__(self, *args, **kwargs):
+        raise RuntimeError("diagnostic array copy failed")
+
+
+def copied_snapshot_matches_sources(
+    latest: dict[str, np.ndarray],
+    snapshot: dict[str, np.ndarray],
+) -> None:
+    expected = {
+        key: value.copy()
+        for key, value in latest.items()
+    }
+    for key, source in latest.items():
+        saved = snapshot[key]
+        assert saved is not source
+        assert not np.shares_memory(saved, source)
+        np.testing.assert_array_equal(saved, expected[key])
+        source.fill(-1.0)
+        np.testing.assert_array_equal(saved, expected[key])
+
+
+def assert_exact_source_copies(
+    array_mock,
+    latest: dict[str, np.ndarray],
+) -> None:
+    assert len(array_mock.call_args_list) == len(latest)
+    assert all(
+        call.kwargs == {"copy": True}
+        for call in array_mock.call_args_list
+    )
+    copy_calls = diagnostic_copy_calls(array_mock)
+    assert len(copy_calls) == len(latest)
+    for source in latest.values():
+        assert sum(
+            call.args[0] is source
+            for call in copy_calls
+        ) == 1
+    assert all(
+        any(call.args[0] is source for source in latest.values())
+        for call in copy_calls
+    )
 
 
 def test_diagnostic_observation_is_not_copied_on_steps(tmp_path):
@@ -133,10 +172,10 @@ def test_diagnostic_observation_is_not_copied_on_steps(tmp_path):
             }
             callback._on_step()
 
-    assert diagnostic_copy_calls(array_mock) == 0
+    assert diagnostic_copy_calls(array_mock) == []
 
 
-def test_diagnostic_observation_is_copied_once_at_rollout_end(tmp_path):
+def test_diagnostic_observation_copies_each_rollout_source_once(tmp_path):
     callback, _, _ = prepared_allocation_callback(tmp_path)
     latest = numpy_observation()
     callback.model._last_obs = latest
@@ -144,7 +183,39 @@ def test_diagnostic_observation_is_copied_once_at_rollout_end(tmp_path):
     with patch.object(np, "array", wraps=np.array) as array_mock:
         callback._on_rollout_end()
 
-    assert diagnostic_copy_calls(array_mock) == len(latest)
+    assert_exact_source_copies(array_mock, latest)
+    assert callback._diagnostic_observation is not None
+    copied_snapshot_matches_sources(latest, callback._diagnostic_observation)
+
+
+@pytest.mark.parametrize("extractor_class", (StructuredExtractor, FixedGridExtractor))
+def test_non_cnn_extractors_do_not_copy_or_retain_diagnostic_observations(
+    tmp_path,
+    extractor_class,
+):
+    callback, _, _ = prepared_allocation_callback(tmp_path, extractor_class)
+    callback._diagnostic_observation = numpy_observation()
+    callback.model._last_obs = numpy_observation()
+
+    with patch.object(np, "array", wraps=np.array) as array_mock:
+        callback._on_rollout_end()
+
+    assert diagnostic_copy_count(array_mock) == 0
+    assert callback._diagnostic_observation is None
+
+
+def test_rollout_end_clears_stale_observation_before_copy_failure(tmp_path):
+    callback, _, _ = prepared_allocation_callback(tmp_path)
+    callback._diagnostic_observation = numpy_observation()
+    callback.model._last_obs = {
+        "block": np.zeros((2, 8), dtype=np.float32),
+        "grids": FailingArraySource(),
+    }
+
+    with pytest.raises(RuntimeError, match="diagnostic array copy failed"):
+        callback._on_rollout_end()
+
+    assert callback._diagnostic_observation is None
 
 
 def test_rollout_start_records_all_cnn_diagnostics_from_rollout_copy(tmp_path):
@@ -157,14 +228,14 @@ def test_rollout_start_records_all_cnn_diagnostics_from_rollout_copy(tmp_path):
 
     callback._on_rollout_start()
 
-    assert EXPECTED_CNN_DIAGNOSTIC_LOGS <= logger.records.keys()
+    assert set(logger.records) == EXPECTED_CNN_DIAGNOSTIC_LOGS
     assert policy.observations is not None
     assert np.any(policy.observations["grids"])
     assert callback._diagnostic_observation is None
 
 
 @pytest.mark.parametrize("extractor_class", (StructuredExtractor, FixedGridExtractor))
-def test_rollout_start_omits_cnn_diagnostics_for_non_cnn_extractors(
+def test_rollout_start_emits_exactly_no_cnn_diagnostics_for_non_cnn_extractors(
     tmp_path,
     extractor_class,
 ):
@@ -175,7 +246,7 @@ def test_rollout_start_omits_cnn_diagnostics_for_non_cnn_extractors(
 
     callback._on_rollout_start()
 
-    assert EXPECTED_CNN_DIAGNOSTIC_LOGS.isdisjoint(logger.records)
+    assert set(logger.records) == set()
 
 
 def test_rollout_end_clears_stale_observation_without_a_dict_last_obs(tmp_path):
@@ -203,6 +274,18 @@ def test_rollout_start_clears_observation_when_feature_measurement_fails(tmp_pat
         callback._on_rollout_start()
 
     assert callback._diagnostic_observation is None
+
+
+EXPECTED_CNN_DIAGNOSTICS = {
+    "cnn_gradient_norm",
+    "cnn_weight_change",
+    "workspace_feature_variance",
+    "candidate_channel_sensitivity",
+}
+EXPECTED_CNN_DIAGNOSTIC_LOGS = {
+    f"diagnostics/{key}"
+    for key in EXPECTED_CNN_DIAGNOSTICS
+}
 
 
 class CnnDiagnosticTrackerTests(unittest.TestCase):

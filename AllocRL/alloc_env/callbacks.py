@@ -357,12 +357,12 @@ class AllocationCallback(BaseCallback):
         return True
 
     def _on_rollout_end(self) -> None:
+        self._diagnostic_observation = None
+        tracker = self._diagnostic_tracker
+        if tracker is None or tracker.module is None:
+            return
         latest_observation = getattr(self.model, "_last_obs", None)
-        if (
-            self._diagnostic_tracker is None
-            or not isinstance(latest_observation, dict)
-        ):
-            self._diagnostic_observation = None
+        if not isinstance(latest_observation, dict):
             return
         self._diagnostic_observation = {
             key: np.array(value, copy=True)
