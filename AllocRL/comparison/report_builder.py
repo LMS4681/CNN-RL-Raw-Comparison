@@ -8,6 +8,7 @@ import json
 import math
 import re
 import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -31,6 +32,8 @@ PAIR_COLUMNS = (
 TRAINING_LOG_COLUMNS = ("episode", "timestep", "resolved_reward", "terminal_residual", "terminal_score", "episode_reward", "delayed_count", "dropout_count", "total_delay_days", "success_rate")
 LOSS_LOG_COLUMNS = ("timestep", "policy_gradient_loss", "value_loss", "entropy_loss", "approx_kl", "clip_fraction", "loss", "explained_variance", "cnn_gradient_norm", "cnn_weight_change", "workspace_feature_variance", "candidate_channel_sensitivity")
 PROGRESS_TIMING_COLUMNS = ("generation", "timestep", "recorded_training_seconds", "updated_at_utc", "status", "checkpoint_file")
+JOURNAL_STAGES = ("preflight", "smoke_raw_direct", "smoke_candidate_cnn", "train_raw_direct", "evaluate_raw_direct", "train_candidate_cnn", "evaluate_candidate_cnn", "evaluate_common_step", "build_report", "integrity_verification")
+JOURNAL_STATUSES = frozenset({"pending", "in_progress", "interrupted", "failed", "complete"})
 MISSING = "자료 없음"
 RUNTIME_FIELDS = (
     "target_training_seconds", "recorded_training_seconds", "end_to_end_training_seconds",
@@ -336,6 +339,27 @@ def _curve_rows(path: Path, columns: tuple[str, ...], name: str) -> list[dict[st
     return rows
 
 
+def _stage_journal(data: Mapping[str, Any]) -> str:
+    """Validate Task 6's direct stage-name-to-entry journal object."""
+    groups = {status: [] for status in JOURNAL_STATUSES}
+    keys = {"status", "input_sha256", "output_sha256", "started_at_utc", "completed_at_utc", "error"}
+    for name, entry in data.items():
+        if name not in JOURNAL_STAGES or not isinstance(entry, Mapping) or set(entry) != keys or entry["status"] not in JOURNAL_STATUSES:
+            raise ValueError("invalid stage journal")
+        for sha_key in ("input_sha256", "output_sha256"):
+            value = entry[sha_key]
+            if value is not None: _sha(value, f"stage {sha_key}")
+        for timestamp in ("started_at_utc", "completed_at_utc"):
+            value = entry[timestamp]
+            if value is not None:
+                if not isinstance(value, str) or datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is None: raise ValueError("invalid stage timestamp")
+        if entry["error"] is not None and (not isinstance(entry["error"], str) or "\ufffd" in entry["error"]): raise ValueError("invalid stage error")
+        if entry["status"] == "complete" and (entry["output_sha256"] is None or entry["completed_at_utc"] is None): raise ValueError("complete stage lacks outputs")
+        if entry["status"] in {"failed", "interrupted"} and entry["completed_at_utc"] is None: raise ValueError("terminal stage lacks completion")
+        groups[entry["status"]].append(name)
+    return "; ".join(f"{label}: {', '.join(sorted(groups[status])) or MISSING}" for status, label in (("complete", "completed"), ("failed", "failed"), ("interrupted", "interrupted"), ("in_progress", "in-progress"), ("pending", "missing")))
+
+
 def _learning_plot(root: Path, output: Path) -> None:
     figure, axes = plt.subplots(1, 3, figsize=(15, 4))
     try:
@@ -434,14 +458,7 @@ def write_partial_report(root: str | Path, failure: str) -> Path:
     journal = base / "stage_journal.json"
     if journal.is_file():
         try:
-            data = _read_json(journal)
-            statuses = {"pending", "in_progress", "interrupted", "failed", "complete"}
-            groups: dict[str, list[str]] = {status: [] for status in statuses}
-            for name, entry in data.items():
-                if not isinstance(name, str) or not isinstance(entry, Mapping) or set(entry) != {"status", "input_sha256", "output_sha256", "started_at_utc", "completed_at_utc", "error"} or entry["status"] not in statuses:
-                    raise ValueError("invalid stage journal")
-                groups[entry["status"]].append(name)
-            journal_text = "; ".join(f"{label}: {', '.join(sorted(groups[status])) or MISSING}" for status, label in (("complete", "completed"), ("failed", "failed"), ("interrupted", "interrupted"), ("in_progress", "in-progress"), ("pending", "missing")))
+            journal_text = _stage_journal(_read_json(journal))
         except ValueError:
             journal_text = "stage metadata: invalid metadata"
     state = "후보 CNN 결과가 없어 우열을 결론내리지 않음" if raw_ok and not cnn_ok else ("raw-direct 결과가 없어 비교를 결론내리지 않음" if cnn_ok and not raw_ok else ("두 arm 모두 없어서 비교를 결론내리지 않음" if not raw_ok and not cnn_ok else "두 arm 자료는 있으나 무결성 또는 보고 단계가 불완전하여 결론내리지 않음"))

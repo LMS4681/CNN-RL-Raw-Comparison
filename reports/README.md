@@ -11,3 +11,5 @@ The headline is the one seed-0 training run evaluated on the 15 unselected prima
 When present, `training_log.csv`, `loss_log.csv`, and `progress_timing.csv` are strict canonical inputs, not best-effort hints. Their headers and finite, monotonic rows are validated; the learning plot shows terminal score, checkpoint wall-time progress, and the recorded PPO loss trace. An absent optional curve is labelled `자료 없음`.
 
 Partial reports validate `stage_journal.json` when present and describe completed, failed, interrupted, in-progress, and missing stages. Arm availability requires valid runtime and paired evaluation artifacts; a partial report never creates or changes `COMPLETE.json`.
+
+Task 6 writes the journal as a direct object mapping the documented canonical stage names to entries with `status`, input/output SHA-256 values, UTC timestamps, and an optional error. Unknown stages, invalid hashes/timestamps, and unsafe error text are treated as invalid metadata.

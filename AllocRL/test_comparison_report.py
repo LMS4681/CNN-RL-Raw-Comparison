@@ -224,10 +224,10 @@ def test_partial_report_uses_valid_artifact_groups_and_stage_journal(tmp_path, p
     write_complete_fixture(tmp_path)
     for arm in {"raw_direct", "candidate_cnn"} - set(present):
         for path in (tmp_path / arm).glob("*"): path.unlink()
-    _json(tmp_path / "stage_journal.json", {"preflight": {"status": "complete", "input_sha256": "a" * 64, "output_sha256": "b" * 64, "started_at_utc": "x", "completed_at_utc": "y", "error": None}, "cnn_train": {"status": "failed", "input_sha256": "a" * 64, "output_sha256": None, "started_at_utc": "x", "completed_at_utc": None, "error": "bad"}})
+    _json(tmp_path / "stage_journal.json", {"preflight": {"status": "complete", "input_sha256": "a" * 64, "output_sha256": "b" * 64, "started_at_utc": "2026-01-01T00:00:00+00:00", "completed_at_utc": "2026-01-01T00:01:00+00:00", "error": None}, "train_candidate_cnn": {"status": "failed", "input_sha256": "a" * 64, "output_sha256": None, "started_at_utc": "2026-01-01T00:00:00+00:00", "completed_at_utc": "2026-01-01T00:01:00+00:00", "error": "bad"}})
     complete = tmp_path / "COMPLETE.json"; complete.write_text("sentinel", encoding="utf-8")
     text = write_partial_report(tmp_path, "<b>bad</b>\n[link]").read_text(encoding="utf-8")
-    assert phrase in text and "completed: preflight" in text and "failed: cnn_train" in text
+    assert phrase in text and "completed: preflight" in text and "failed: train_candidate_cnn" in text
     assert "&lt;b&gt;bad&lt;/b&gt;" in text and complete.read_text(encoding="utf-8") == "sentinel"
 
 
@@ -240,3 +240,23 @@ def test_partial_report_handles_invalid_journal_and_integrity_matrix(tmp_path):
     for value in ("NaN", True, 1.5):
         payload["parameter_counts"]["total"] = value; _json(path, payload)
         with pytest.raises(ValueError): build_comparison_summary(tmp_path)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda e: e.update(input_sha256="bad"), lambda e: e.update(started_at_utc="nope"),
+    lambda e: e.update(error=[]), lambda e: e.update(status="unknown"),
+    lambda e: e.pop("error"), lambda e: e.update(extra=True),
+])
+def test_stage_journal_entry_schema_is_strict(tmp_path, mutate):
+    from comparison.report_builder import write_partial_report
+    entry = {"status":"failed", "input_sha256":"a" * 64, "output_sha256":None, "started_at_utc":"2026-01-01T00:00:00+00:00", "completed_at_utc":"2026-01-01T00:01:00+00:00", "error":"x"}
+    mutate(entry); _json(tmp_path / "stage_journal.json", {"preflight": entry})
+    assert "invalid metadata" in write_partial_report(tmp_path, "failed").read_text(encoding="utf-8")
+
+
+def test_valid_stage_journal_and_no_replacement_source():
+    from comparison.report_builder import _stage_journal
+    from pathlib import Path
+    assert _stage_journal({"preflight": {"status":"complete", "input_sha256":"a" * 64, "output_sha256":"b" * 64, "started_at_utc":"2026-01-01T00:00:00+00:00", "completed_at_utc":"2026-01-01T00:01:00+00:00", "error":None}}).startswith("completed: preflight")
+    root = Path(__file__).resolve().parents[1]
+    assert all("\ufffd" not in path.read_text(encoding="utf-8") for path in (root / "AllocRL" / "comparison").glob("*.py"))
