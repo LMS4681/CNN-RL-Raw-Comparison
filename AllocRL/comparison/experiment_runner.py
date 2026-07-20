@@ -20,7 +20,7 @@ import uuid
 from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Mapping, Sequence
 
 from comparison.artifact_manifest import (
@@ -117,7 +117,8 @@ def _validate_root_environment(
             raise ExperimentIntegrityError(f"root environment type mismatch: {key}")
     if environment["cuda_version"] is not None and not _nonempty_string(environment["cuda_version"]):
         raise ExperimentIntegrityError("root environment type mismatch: cuda_version")
-    if environment["cudnn_version"] is not None and not isinstance(environment["cudnn_version"], (str, int)):
+    if (environment["cudnn_version"] is not None
+            and (not isinstance(environment["cudnn_version"], (str, int)) or isinstance(environment["cudnn_version"], bool))):
         raise ExperimentIntegrityError("root environment type mismatch: cudnn_version")
     if not isinstance(environment["pip_freeze"], list) or not all(isinstance(item, str) for item in environment["pip_freeze"]):
         raise ExperimentIntegrityError("root environment type mismatch: pip_freeze")
@@ -152,6 +153,154 @@ def _validate_root_manifest(
         raise ExperimentIntegrityError("root manifest comparison checkout mismatch")
     if not isinstance(manifest.get("checkpoints"), dict):
         raise ExperimentIntegrityError("root manifest checkpoints must be an object")
+
+
+_COMPARISON_ARMS = ("raw_direct", "candidate_cnn")
+_CHECKPOINT_KINDS = ("selected", "final", "common")
+_CHECKPOINT_REF_KEYS = frozenset({"path", "label", "sha256", "timestep"})
+
+
+def _safe_checkpoint_path(root: Path, arm: str, value: Any) -> Path:
+    if not _nonempty_string(value) or "\\" in value:
+        raise ExperimentIntegrityError("checkpoint path must be a nonempty root-relative POSIX path")
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if posix.is_absolute() or windows.is_absolute() or ".." in posix.parts:
+        raise ExperimentIntegrityError("checkpoint path escapes the output root")
+    raw_path = root / posix
+    try:
+        resolved = raw_path.resolve(strict=True)
+        resolved.relative_to(root)
+        resolved.relative_to((root / arm).resolve())
+    except (OSError, RuntimeError, ValueError, FileNotFoundError) as error:
+        raise ExperimentIntegrityError("checkpoint path escapes or is absent from its arm directory") from error
+    if raw_path.is_symlink() or not resolved.is_file():
+        raise ExperimentIntegrityError("checkpoint reference must name a regular in-root file")
+    return resolved
+
+
+def _validate_checkpoint_manifest(
+    root: Path,
+    manifest: Mapping[str, Any],
+    archive_timestep_reader: Callable[[Path], int | None] | None,
+) -> None:
+    """Verify every manifest reference against the archive and complete state."""
+    checkpoints = manifest.get("checkpoints")
+    if not isinstance(checkpoints, Mapping) or set(checkpoints) != set(_COMPARISON_ARMS):
+        raise ExperimentIntegrityError("missing paired checkpoint manifest")
+    from train import model_num_timesteps
+    reader = archive_timestep_reader or model_num_timesteps
+    root = root.resolve()
+    for arm in _COMPARISON_ARMS:
+        refs = checkpoints[arm]
+        if not isinstance(refs, Mapping) or set(refs) != set(_CHECKPOINT_KINDS):
+            raise ExperimentIntegrityError("checkpoint refs incomplete")
+        verified: dict[str, tuple[dict[str, Any], Path]] = {}
+        for kind in _CHECKPOINT_KINDS:
+            ref = refs[kind]
+            if not isinstance(ref, dict) or set(ref) != _CHECKPOINT_REF_KEYS:
+                raise ExperimentIntegrityError("checkpoint reference has invalid schema")
+            label = ref["label"]
+            allowed_labels = {
+                "selected": {"best_model", "fallback_final"},
+                "final": {"final"},
+                "common": {"common_step"},
+            }[kind]
+            if not isinstance(label, str) or label not in allowed_labels:
+                raise ExperimentIntegrityError("checkpoint reference label is dishonest")
+            timestep = ref["timestep"]
+            if not isinstance(timestep, int) or isinstance(timestep, bool) or timestep < 0:
+                raise ExperimentIntegrityError("checkpoint reference timestep must be a non-negative integer")
+            digest = ref["sha256"]
+            if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
+                raise ExperimentIntegrityError("checkpoint reference SHA256 is invalid")
+            path = _safe_checkpoint_path(root, arm, ref["path"])
+            try:
+                actual_digest = sha256_file(path)
+                actual_timestep = reader(path)
+            except (OSError, ValueError, TypeError) as error:
+                raise ExperimentIntegrityError("checkpoint reference cannot be read") from error
+            if actual_digest != digest:
+                raise ExperimentIntegrityError("tampered checkpoint reference")
+            if not isinstance(actual_timestep, int) or isinstance(actual_timestep, bool) or actual_timestep != timestep:
+                raise ExperimentIntegrityError("checkpoint archive timestep differs from manifest")
+            verified[kind] = (ref, path)
+
+        final_ref, final_path = verified["final"]
+        try:
+            state = read_wall_clock_state(root / arm / "run_state.json")
+            state_path = resolve_state_checkpoint(root / arm, state)
+            state_timestep = reader(state_path)
+        except (OSError, ValueError, TypeError, KeyError, FileNotFoundError) as error:
+            raise ExperimentIntegrityError("final reference lacks a complete verified state checkpoint") from error
+        if (state.status != "complete" or not isinstance(state_timestep, int) or isinstance(state_timestep, bool)
+                or state_timestep != state.last_checkpoint_timestep
+                or final_path != state_path.resolve()
+                or final_ref["sha256"] != state.last_checkpoint_sha256
+                or final_ref["timestep"] != state.last_checkpoint_timestep):
+            raise ExperimentIntegrityError("final reference is not the exact complete state checkpoint")
+
+        selected_ref, selected_path = verified["selected"]
+        if selected_ref["label"] == "fallback_final":
+            if (selected_path != final_path or selected_ref["sha256"] != final_ref["sha256"]
+                    or selected_ref["timestep"] != final_ref["timestep"]):
+                raise ExperimentIntegrityError("fallback selected reference must equal final state checkpoint")
+        elif selected_ref["path"] != f"{arm}/best_model.sb3" or selected_path == final_path:
+            raise ExperimentIntegrityError("best-model selected reference is dishonest")
+
+        common_ref, _ = verified["common"]
+        if not common_ref["path"].startswith(f"{arm}/checkpoints/"):
+            raise ExperimentIntegrityError("common checkpoint must be stored beneath its arm checkpoint directory")
+
+
+def _strict_json_line(line: str) -> dict[str, Any]:
+    def object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+    value = json.loads(line, object_pairs_hook=object_without_duplicate_keys)
+    if not isinstance(value, dict):
+        raise ValueError("environment segment must be a JSON object")
+    return value
+
+
+def _validate_environment_segments(
+    root: Path,
+    environment: Mapping[str, Any],
+    provenance: Mapping[str, str],
+    *,
+    production_loaded: bool,
+) -> None:
+    """Require every persisted arm/restart environment to equal the root facts."""
+    _validate_root_environment(environment, provenance, production_loaded=production_loaded)
+    comparison_keys = (
+        "vm_boot_id", "resolved_device", "gpu_name", "gpu_uuid",
+        "gpu_total_memory_bytes", "torch_version", "cuda_version",
+        "cudnn_version", "lock_sha256", "comparison_git_sha", "comparison_git_dirty",
+    )
+    expected = tuple(environment[key] for key in comparison_keys)
+    for arm in _COMPARISON_ARMS:
+        path = root / arm / "environment_segments.jsonl"
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as error:
+            raise ExperimentIntegrityError(f"missing environment segments for {arm}") from error
+        records: list[dict[str, Any]] = []
+        try:
+            for line in lines:
+                if line.strip():
+                    records.append(_strict_json_line(line))
+        except (json.JSONDecodeError, ValueError, TypeError) as error:
+            raise ExperimentIntegrityError(f"invalid environment segment for {arm}") from error
+        if not records:
+            raise ExperimentIntegrityError(f"empty environment segments for {arm}")
+        for record in records:
+            _validate_root_environment(record, provenance, production_loaded=production_loaded)
+            if tuple(record[key] for key in comparison_keys) != expected:
+                raise ExperimentIntegrityError("arms must use the same Colab VM/GPU/library environment")
 
 
 @dataclass(frozen=True)
@@ -448,24 +597,8 @@ class _Runner:
         for arm in ("raw_direct","candidate_cnn"):
             state=read_wall_clock_state(self.root/arm/"run_state.json")
             if not self._state_complete(self.root/arm,state): raise ExperimentIntegrityError("incomplete arm")
-        segments=[]
-        for arm in ("raw_direct","candidate_cnn"):
-            p=self.root/arm/"environment_segments.jsonl"
-            if not p.is_file(): raise ExperimentIntegrityError("missing environment segments")
-            segments += [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line]
-        keys=("vm_boot_id","gpu_uuid","torch_version","cuda_version","cudnn_version","lock_sha256")
-        if not segments or any(set(item)!=set(REQUIRED_ENVIRONMENT_KEYS) for item in segments) or any(tuple(item.get(key) for key in keys)!=tuple(segments[0].get(key) for key in keys) for item in segments): raise ExperimentIntegrityError("arms must use the same Colab VM/GPU/library environment")
-        if any(environment.get(key) != segments[0].get(key) for key in keys):
-            raise ExperimentIntegrityError("root environment differs from arm environment segments")
-        if not isinstance(environment.get("comparison_git_sha"), str) or environment.get("comparison_git_dirty") is not False:
-            raise ExperimentIntegrityError("comparison checkout must identify a clean commit")
-        checkpoints=manifest.get("checkpoints")
-        if not isinstance(checkpoints,dict) or set(checkpoints)!={"raw_direct","candidate_cnn"}: raise ExperimentIntegrityError("missing paired checkpoint manifest")
-        for arm,refs in checkpoints.items():
-            if set(refs)!={"selected","final","common"}: raise ExperimentIntegrityError("checkpoint refs incomplete")
-            for ref in refs.values():
-                path=(self.root/ref["path"]).resolve()
-                if self.root not in path.parents or not path.is_file() or sha256_file(path)!=ref["sha256"]: raise ExperimentIntegrityError("tampered checkpoint reference")
+        _validate_environment_segments(self.root, environment, provenance, production_loaded=self.config.production_loaded)
+        _validate_checkpoint_manifest(self.root, manifest, self.archive_reader)
         for path in (self.root/"comparison"/"summary.json", self.root/"comparison"/"scenario_paired_differences.csv", self.root/"comparison"/"learning_curves.png", self.root/"comparison"/"holdout_comparison.png", self.root/"comparison"/"preliminary_comparison_ko.md"):
             if not path.is_file() or path.stat().st_size == 0: raise ExperimentIntegrityError(f"missing report artifact: {path.name}")
         atomic_write_json(self.root/"integrity_verification.json", {"manifest_sha256": sha256_file(self.root / "manifest.json"), "verified_at_utc": _utc()})

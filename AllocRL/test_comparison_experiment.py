@@ -283,6 +283,138 @@ def test_production_preflight_requires_real_cuda_identity(tmp_path: Path, monkey
         runner.preflight()
 
 
+def _integrity_fixture(tmp_path: Path, monkeypatch):
+    from comparison.artifact_manifest import sha256_file
+    from comparison.wall_clock_callback import atomic_write_json
+
+    runner_module, runner = _preflight_runner(tmp_path, monkeypatch)
+    root = runner.root
+    root.mkdir(parents=True)
+    provenance = runner.provenance()
+    environment = _valid_root_environment(provenance, command=runner.runner_command)
+    refs = {}
+    timesteps = {}
+    for arm in ("raw_direct", "candidate_cnn"):
+        final = _write_runner_state(root / arm, runner.config)
+        selected = root / arm / "best_model.sb3"
+        selected.write_bytes(f"{arm}-selected".encode())
+        common = root / arm / "checkpoints" / "model_8_g1.sb3"
+        common.write_bytes(f"{arm}-common".encode())
+        refs[arm] = {
+            "selected": {"path": selected.relative_to(root).as_posix(), "label": "best_model", "sha256": sha256_file(selected), "timestep": 9},
+            "final": {"path": final.relative_to(root).as_posix(), "label": "final", "sha256": sha256_file(final), "timestep": 7},
+            "common": {"path": common.relative_to(root).as_posix(), "label": "common_step", "sha256": sha256_file(common), "timestep": 8},
+        }
+        timesteps.update({str(final.resolve()): 7, str(selected.resolve()): 9, str(common.resolve()): 8})
+        (root / arm / "environment_segments.jsonl").write_text(json.dumps(environment) + "\n", encoding="utf-8")
+    manifest = {"schema_version": 1, **provenance, "comparison_git_sha": environment["comparison_git_sha"], "comparison_git_dirty": False, "checkpoints": refs}
+    atomic_write_json(root / "manifest.json", manifest)
+    atomic_write_json(root / "environment.json", environment)
+    runner.archive_reader = lambda path: timesteps.get(str(path.resolve()))
+    return runner_module, runner, manifest, environment
+
+
+def test_checkpoint_manifest_validator_accepts_exact_honest_refs(tmp_path: Path, monkeypatch):
+    runner_module, runner, manifest, _ = _integrity_fixture(tmp_path, monkeypatch)
+    runner_module._validate_checkpoint_manifest(runner.root, manifest, runner.archive_reader)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda manifest, root: manifest["checkpoints"].pop("raw_direct"),
+    lambda manifest, root: manifest["checkpoints"].update(extra_arm={}),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"].pop("selected"),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"].update(extra_ref={}),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"]["selected"].update(extra=True),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"]["selected"].update(label="final"),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"]["selected"].update(path="C:/outside.sb3"),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"]["selected"].update(path="../outside.sb3"),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"]["selected"].update(path="raw_direct/missing.sb3"),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"]["selected"].update(sha256="f" * 64),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"]["selected"].update(timestep=10),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"]["final"].update(path=manifest["checkpoints"]["raw_direct"]["common"]["path"], sha256=manifest["checkpoints"]["raw_direct"]["common"]["sha256"], timestep=8),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"]["selected"].update(timestep=True),
+    lambda manifest, root: manifest["checkpoints"]["raw_direct"]["selected"].update(timestep=9.0),
+])
+def test_checkpoint_manifest_validator_rejects_malformed_or_dishonest_refs(tmp_path: Path, monkeypatch, mutation):
+    from comparison.experiment_runner import ExperimentIntegrityError
+
+    runner_module, runner, manifest, _ = _integrity_fixture(tmp_path, monkeypatch)
+    mutation(manifest, runner.root)
+    with pytest.raises(ExperimentIntegrityError):
+        runner_module._validate_checkpoint_manifest(runner.root, manifest, runner.archive_reader)
+
+
+def test_checkpoint_manifest_validator_rejects_symlink_escape(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import ExperimentIntegrityError
+
+    runner_module, runner, manifest, _ = _integrity_fixture(tmp_path, monkeypatch)
+    outside = tmp_path / "outside.sb3"
+    outside.write_bytes(b"outside")
+    escaped = runner.root / "raw_direct" / "escaped.sb3"
+    try:
+        escaped.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows host")
+    manifest["checkpoints"]["raw_direct"]["selected"].update(
+        path="raw_direct/escaped.sb3", sha256=hashlib.sha256(b"outside").hexdigest(), timestep=9,
+    )
+    with pytest.raises(ExperimentIntegrityError):
+        runner_module._validate_checkpoint_manifest(runner.root, manifest, runner.archive_reader)
+
+
+def test_environment_segment_validator_accepts_every_restart_and_arm(tmp_path: Path, monkeypatch):
+    runner_module, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
+    for arm in ("raw_direct", "candidate_cnn"):
+        path = runner.root / arm / "environment_segments.jsonl"
+        path.write_text(json.dumps(environment) + "\n" + json.dumps(environment) + "\n", encoding="utf-8")
+    runner_module._validate_environment_segments(runner.root, environment, runner.provenance(), production_loaded=False)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("vm_boot_id", "other-vm"), ("torch_version", "other-torch"),
+    ("cuda_version", "12.0"), ("cudnn_version", 9),
+    ("lock_sha256", "f" * 64), ("comparison_git_sha", "b" * 40),
+])
+def test_environment_segment_validator_rejects_cross_arm_vm_library_or_hash_mismatch(tmp_path: Path, monkeypatch, field, value):
+    from comparison.experiment_runner import ExperimentIntegrityError
+
+    runner_module, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
+    changed = dict(environment); changed[field] = value
+    (runner.root / "candidate_cnn" / "environment_segments.jsonl").write_text(json.dumps(changed) + "\n", encoding="utf-8")
+    with pytest.raises(ExperimentIntegrityError):
+        runner_module._validate_environment_segments(runner.root, environment, runner.provenance(), production_loaded=False)
+
+
+@pytest.mark.parametrize("payload", ["{bad json}\n", "{\"command\":[],\"command\":[]}\n", "\n"])
+def test_environment_segment_validator_rejects_malformed_duplicate_or_empty_arm(tmp_path: Path, monkeypatch, payload):
+    from comparison.experiment_runner import ExperimentIntegrityError
+
+    runner_module, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
+    (runner.root / "raw_direct" / "environment_segments.jsonl").write_text(payload, encoding="utf-8")
+    with pytest.raises(ExperimentIntegrityError):
+        runner_module._validate_environment_segments(runner.root, environment, runner.provenance(), production_loaded=False)
+
+
+def test_environment_segment_validator_rejects_missing_arm_segments(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import ExperimentIntegrityError
+
+    runner_module, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
+    (runner.root / "raw_direct" / "environment_segments.jsonl").unlink()
+    with pytest.raises(ExperimentIntegrityError):
+        runner_module._validate_environment_segments(runner.root, environment, runner.provenance(), production_loaded=False)
+
+
+def test_environment_segment_validator_rejects_cross_device_or_gpu_identity(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import ExperimentIntegrityError
+
+    runner_module, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
+    gpu = environment | {"resolved_device": "cuda:0", "gpu_name": "GPU", "gpu_uuid": "GPU-a", "gpu_total_memory_bytes": 1}
+    for arm in ("raw_direct", "candidate_cnn"):
+        (runner.root / arm / "environment_segments.jsonl").write_text(json.dumps(gpu) + "\n", encoding="utf-8")
+    with pytest.raises(ExperimentIntegrityError):
+        runner_module._validate_environment_segments(runner.root, environment, runner.provenance(), production_loaded=False)
+
+
 def test_malformed_completed_journal_is_rejected_before_it_is_trusted(tmp_path: Path):
     from comparison.experiment_runner import ExperimentConfig, ExperimentIntegrityError, JOURNAL_STAGES, _Runner
 
