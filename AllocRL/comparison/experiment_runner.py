@@ -215,8 +215,8 @@ def _boot_id() -> str:
 
 
 class _Runner:
-    def __init__(self, config: ExperimentConfig, root: Path, *, subprocess_runner: Callable[..., Any], clock: Callable[[], float], python_executable: str | None, archive_timestep_reader: Callable[[Path], int | None] | None) -> None:
-        self.config=config; self.root=root.resolve(); self.subprocess_runner=subprocess_runner; self.clock=clock; self.python=python_executable or sys.executable; self.archive_reader=archive_timestep_reader; self.journal_path=self.root/"stage_journal.json"; self.lock_sha=""
+    def __init__(self, config: ExperimentConfig, root: Path, *, subprocess_runner: Callable[..., Any], clock: Callable[[], float], python_executable: str | None, archive_timestep_reader: Callable[[Path], int | None] | None, output_hasher: Callable[[str], str] | None = None) -> None:
+        self.config=config; self.root=root.resolve(); self.subprocess_runner=subprocess_runner; self.clock=clock; self.python=python_executable or sys.executable; self.archive_reader=archive_timestep_reader; self.journal_path=self.root/"stage_journal.json"; self.lock_sha=""; self._injected_output_hasher=output_hasher
     def journal(self) -> dict[str, dict[str, Any]]:
         if not self.journal_path.exists(): return {name:_journal_entry() for name in JOURNAL_STAGES}
         data=_json(self.journal_path)
@@ -241,6 +241,7 @@ class _Runner:
         return {"preflight":self.root/"manifest.json", "smoke_raw_direct":self.root/"smoke"/"raw_direct"/"runner_verified.json", "smoke_candidate_cnn":self.root/"smoke"/"candidate_cnn"/"runner_verified.json", "train_raw_direct":self.root/"raw_direct"/"run_state.json", "evaluate_raw_direct":self.root/"raw_direct"/"evaluation_stage.json", "train_candidate_cnn":self.root/"candidate_cnn"/"run_state.json", "evaluate_candidate_cnn":self.root/"candidate_cnn"/"evaluation_stage.json", "evaluate_common_step":self.root/"comparison"/"common_step_evaluation.csv", "build_report":self.root/"comparison"/"preliminary_comparison_ko.md", "integrity_verification":self.root/"integrity_verification.json"}[name]
     def output_hash(self, name: str) -> str:
         """Hash only artifacts owned by this stage, never mutable descendants."""
+        if self._injected_output_hasher is not None: return self._injected_output_hasher(name)
         if name == "preflight":
             manifest = _json(self.root / "manifest.json")
             environment = _json(self.root / "environment.json")

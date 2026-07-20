@@ -267,3 +267,25 @@ def test_train_resume_uses_only_state_named_checkpoint_not_higher_orphan(tmp_pat
     assert commands[0][commands[0].index("--resume-from") + 1] == str(named)
     assert str(orphan) not in commands[0]
     assert "--auto-resume" not in commands[0] and "--final-holdout-report" not in commands[0]
+
+
+@pytest.mark.parametrize("stage", ["train_raw_direct", "evaluate_raw_direct", "train_candidate_cnn", "evaluate_candidate_cnn", "evaluate_common_step", "build_report", "integrity_verification"])
+def test_run_stage_failed_entry_retries_without_changing_prior_verified_hashes(tmp_path: Path, stage: str, monkeypatch):
+    from comparison.experiment_runner import ExperimentConfig, ExperimentStageError, JOURNAL_STAGES, _Runner, _journal_entry
+    hashes = {name: "a" * 64 for name in JOURNAL_STAGES}
+    runner = _Runner(ExperimentConfig.for_test(), tmp_path, subprocess_runner=lambda *a, **k: None, clock=lambda: 0,
+                     python_executable=None, archive_timestep_reader=None, output_hasher=lambda name: hashes[name])
+    prior = JOURNAL_STAGES[:JOURNAL_STAGES.index(stage)]
+    journal = {name: _journal_entry("complete", input_sha256="b" * 64, output_sha256=hashes[name], started_at_utc="2026-01-01T00:00:00Z", completed_at_utc="2026-01-01T00:00:01Z") if name in prior else _journal_entry() for name in JOURNAL_STAGES}
+    runner.save_journal(journal)
+    monkeypatch.setattr(runner, "input_hash", lambda name, data: "b" * 64)
+    monkeypatch.setattr(runner, "stage_path", lambda name: tmp_path)
+    calls = []
+    def action():
+        calls.append(1)
+        if len(calls) == 1: raise RuntimeError("once")
+    with pytest.raises(ExperimentStageError): runner.run_stage(stage, action)
+    failed = runner.journal(); assert failed[stage]["status"] == "failed"
+    assert all(failed[name]["output_sha256"] == hashes[name] for name in prior)
+    runner.run_stage(stage, action)
+    assert runner.journal()[stage]["status"] == "complete" and len(calls) == 2
