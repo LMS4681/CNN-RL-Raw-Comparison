@@ -61,7 +61,9 @@ def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary:
             "metrics_recorded_at_utc": "2026-07-21T03:01:40+00:00",
             "finalization_mode": "in_process",
             "selected_checkpoint_timestep": 50000, "selection_count": 5,
-            "selection_tuple": [0.9, -0.1, -4.0], "checkpoint_identity": {"filename": "best_model.sb3", "sha256": ("a" if arm == "raw_direct" else "b") * 64},
+            "selection_tuple": [0.9, -0.1, -4.0],
+            "selection_outcome": "best_model", "fallback_reason": None,
+            "checkpoint_identity": {"filename": "best_model.sb3", "sha256": ("a" if arm == "raw_direct" else "b") * 64},
         })
         _json(root / arm / "run_origin.json", {
             "schema_version": 1,
@@ -223,7 +225,7 @@ def test_dynamic_timings_fallback_and_partial_failure_safety(tmp_path):
     write_complete_fixture(tmp_path)
     for arm in ("raw_direct", "candidate_cnn"):
         path = tmp_path / arm / "runtime_metrics.json"; payload = json.loads(path.read_text(encoding="utf-8"))
-        payload.update({"target_training_seconds": 15.0, "recorded_training_seconds": 16.0, "run_wall_span_seconds": 18.0, "metrics_recorded_at_utc": "2026-07-21T00:00:18+00:00", "steps_per_second": 50000 / 16, "overrun_seconds": 1.0, "selection_count": 0, "selection_tuple": None, "checkpoint_identity": {"filename": "fallback.sb3", "sha256": ("a" if arm == "raw_direct" else "b") * 64}})
+        payload.update({"target_training_seconds": 15.0, "recorded_training_seconds": 16.0, "run_wall_span_seconds": 18.0, "metrics_recorded_at_utc": "2026-07-21T00:00:18+00:00", "steps_per_second": 50000 / 16, "overrun_seconds": 1.0, "selection_count": 0, "selection_tuple": None, "selection_outcome": "fallback_final", "fallback_reason": "selection_not_run", "checkpoint_identity": {"filename": "fallback.sb3", "sha256": ("a" if arm == "raw_direct" else "b") * 64}})
         _json(path, payload)
         state_path = tmp_path / arm / "run_state.json"; state = json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds": 15.0, "completed_training_seconds": 16.0}); _json(state_path, state)
         manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8")); manifest["checkpoints"][arm]["selected"].update({"path": f"{arm}/fallback.sb3", "label": "fallback_final"}); _json(tmp_path / "manifest.json", manifest)
@@ -362,7 +364,7 @@ def test_report_renders_all_actual_runtime_and_selection_fields(tmp_path):
     write_complete_fixture(tmp_path)
     for arm, tag, fallback in (("raw_direct", "11", False), ("candidate_cnn", "22", True)):
         path = tmp_path / arm / "runtime_metrics.json"; p = json.loads(path.read_text("utf-8")); digest = ("a" if arm == "raw_direct" else "b") * 64
-        p.update({"target_training_seconds": float(tag), "recorded_training_seconds": float(tag)+.1, "run_wall_span_seconds":float(tag)+.2, "metrics_recorded_at_utc":f"2026-07-21T00:00:{float(tag)+.2:04.1f}+00:00", "overrun_seconds":(float(tag)+.1)-float(tag), "restart_count":int(tag), "max_unrecorded_seconds":float(tag)+.4, "start_timestep":int(tag)*100, "end_timestep":int(tag)*100+1, "steps_per_second":1/(float(tag)+.1), "evaluation_seconds":float(tag)+.6, "parameter_counts":{"total":int(tag)*10,"feature_extractor":int(tag),"policy":int(tag)*2,"value":int(tag)*7}, "peak_cuda_memory_bytes":int(tag)*1000, "selection_count":0 if fallback else 5, "selection_tuple":None if fallback else [1.1,2.2,3.3], "selected_checkpoint_timestep":50000, "checkpoint_identity":{"filename":"fallback.sb3" if fallback else "best_model.sb3","sha256":digest}}); _json(path,p)
+        p.update({"target_training_seconds": float(tag), "recorded_training_seconds": float(tag)+.1, "run_wall_span_seconds":float(tag)+.2, "metrics_recorded_at_utc":f"2026-07-21T00:00:{float(tag)+.2:04.1f}+00:00", "overrun_seconds":(float(tag)+.1)-float(tag), "restart_count":int(tag), "max_unrecorded_seconds":float(tag)+.4, "start_timestep":int(tag)*100, "end_timestep":int(tag)*100+1, "steps_per_second":1/(float(tag)+.1), "evaluation_seconds":float(tag)+.6, "parameter_counts":{"total":int(tag)*10,"feature_extractor":int(tag),"policy":int(tag)*2,"value":int(tag)*7}, "peak_cuda_memory_bytes":int(tag)*1000, "selection_count":0 if fallback else 5, "selection_tuple":None if fallback else [1.1,2.2,3.3], "selection_outcome":"fallback_final" if fallback else "best_model", "fallback_reason":"selection_not_run" if fallback else None, "selected_checkpoint_timestep":50000, "checkpoint_identity":{"filename":"fallback.sb3" if fallback else "best_model.sb3","sha256":digest}}); _json(path,p)
         origin_path=tmp_path/arm/"run_origin.json"; origin=json.loads(origin_path.read_text("utf-8")); origin["initial_timestep"]=int(tag)*100; _json(origin_path,origin)
         state_path=tmp_path/arm/"run_state.json"; state=json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds":float(tag),"completed_training_seconds":float(tag)+.1,"restart_count":int(tag),"max_unrecorded_seconds":float(tag)+.4,"last_checkpoint_timestep":int(tag)*100+1}); _json(state_path,state)
         manifest=json.loads((tmp_path/"manifest.json").read_text("utf-8")); manifest["checkpoints"][arm]["selected"].update({"label":"fallback_final" if fallback else "best_model","path":f"{arm}/{'fallback.sb3' if fallback else 'best_model.sb3'}"}); _json(tmp_path/"manifest.json",manifest)

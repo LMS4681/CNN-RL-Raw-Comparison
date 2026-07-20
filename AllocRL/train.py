@@ -182,6 +182,8 @@ def comparison_runtime_metrics(
                 ),
                 "selection_count": 0,
                 "selection_tuple": None,
+                "selection_outcome": "fallback_final",
+                "fallback_reason": "selection_not_run",
                 "checkpoint_identity": {
                     "filename": wall_clock_state.last_checkpoint_file,
                     "sha256": wall_clock_state.last_checkpoint_sha256,
@@ -224,56 +226,31 @@ def comparison_runtime_provenance(args) -> dict[str, str]:
 def runtime_selected_checkpoint(
     output_dir: str | Path, wall_clock_state, *, selection_count: int = 1
 ) -> dict[str, Any]:
-    """Use a readable selected holdout model, else the verified state archive."""
+    """Return the canonical selected/fallback decision for runtime metadata."""
+    from comparison.checkpoint_evaluator import (
+        CheckpointRef,
+        resolve_selection_decision,
+    )
+
     output = Path(output_dir)
-    selection_path = output / "holdout_selection.csv"
-    best_path = output / "best_model.sb3"
-    if selection_path.is_file() and best_path.is_file():
-        try:
-            with selection_path.open(encoding="utf-8", newline="") as source:
-                reader = csv.DictReader(source)
-                expected_fields = (
-                    "timestep",
-                    "mean_terminal_score",
-                    "mean_dropout_rate",
-                    "mean_delay_days",
-                    "is_best",
-                )
-                if tuple(reader.fieldnames or ()) != expected_fields:
-                    raise ValueError("holdout selection CSV header is incompatible")
-                best_rows = [row for row in reader if row["is_best"] == "1"]
-            if best_rows:
-                row = best_rows[-1]
-                timestep = int(row["timestep"])
-                ranking = [
-                    float(row["mean_terminal_score"]),
-                    -float(row["mean_dropout_rate"]),
-                    -float(row["mean_delay_days"]),
-                ]
-                if model_num_timesteps(best_path) == timestep:
-                    return {
-                        "selected_checkpoint_timestep": timestep,
-                        "selection_count": int(selection_count),
-                        "selection_tuple": ranking,
-                        "checkpoint_identity": {
-                            "filename": best_path.name,
-                            "sha256": sha256_file(best_path),
-                        },
-                    }
-        except (csv.Error, KeyError, TypeError, ValueError):
-            pass
     checkpoint = output / "checkpoints" / wall_clock_state.last_checkpoint_file
     if not checkpoint.is_file() or sha256_file(checkpoint) != wall_clock_state.last_checkpoint_sha256:
         raise ValueError("complete wall-clock state checkpoint is not verifiable")
-    return {
-        "selected_checkpoint_timestep": int(wall_clock_state.last_checkpoint_timestep),
-        "selection_count": 0,
-        "selection_tuple": None,
-        "checkpoint_identity": {
-            "filename": checkpoint.name,
-            "sha256": wall_clock_state.last_checkpoint_sha256,
-        },
-    }
+    final = CheckpointRef(
+        checkpoint,
+        "final",
+        int(wall_clock_state.last_checkpoint_timestep),
+        wall_clock_state.last_checkpoint_sha256,
+    )
+    decision = resolve_selection_decision(
+        output,
+        archive_timestep_reader=model_num_timesteps,
+        final_reference=final,
+    )
+    fields = decision.runtime_fields()
+    if decision.selection_outcome == "best_model":
+        fields["selection_count"] = int(selection_count)
+    return fields
 
 
 def _atomic_save_conventional_model(model, path: Path) -> None:

@@ -22,6 +22,117 @@ def _checkpoint(root: Path, name: str, timestep: int) -> Path:
     return path
 
 
+def _selection_fixture(root: Path, *, final_timestep: int = 60_000) -> Path:
+    final = _checkpoint(root, f"final_{final_timestep}.sb3", final_timestep)
+    (root / "run_state.json").write_text(json.dumps({
+        "schema_version": 1,
+        "target_training_seconds": 10.0,
+        "completed_training_seconds": 10.0,
+        "last_checkpoint_timestep": final_timestep,
+        "last_regular_checkpoint_timestep": 50_000,
+        "last_checkpoint_file": final.name,
+        "last_checkpoint_sha256": _sha256(final),
+        "config_sha256": "a" * 64,
+        "generation": 1,
+        "restart_count": 0,
+        "max_unrecorded_seconds": 1.0,
+        "status": "complete",
+        "started_at_utc": "2026-01-01T00:00:00+00:00",
+        "updated_at_utc": "2026-01-01T00:00:10+00:00",
+        "completed_at_utc": "2026-01-01T00:00:10+00:00",
+    }), encoding="utf-8")
+    return final
+
+
+def _text_timestep(path: Path, *_args) -> int | None:
+    try:
+        return int(path.read_bytes().split(b":")[-1])
+    except (OSError, ValueError):
+        return None
+
+
+def _text_loader(path, **_kwargs):
+    return SimpleNamespace(num_timesteps=_text_timestep(Path(path)))
+
+
+def test_selection_decision_records_verified_best_provenance(tmp_path):
+    from comparison import checkpoint_evaluator as evaluator
+
+    _selection_fixture(tmp_path)
+    best = tmp_path / "best_model.sb3"
+    best.write_bytes(b"checkpoint:50000")
+    (tmp_path / "holdout_selection.csv").write_text(
+        "timestep,mean_terminal_score,mean_dropout_rate,mean_delay_days,is_best\n"
+        "50000,1.25,0.2,3.0,1\n",
+        encoding="utf-8",
+    )
+
+    decision = evaluator.resolve_selection_decision(
+        tmp_path, model_loader=_text_loader
+    )
+
+    assert decision.reference == evaluator.CheckpointRef(
+        best, "best_model", 50_000, _sha256(best)
+    )
+    assert decision.selection_outcome == "best_model"
+    assert decision.fallback_reason is None
+    assert decision.selection_count == 5
+    assert decision.selection_tuple == [1.25, -0.2, -3.0]
+
+
+@pytest.mark.parametrize(
+    "case,expected_reason",
+    [
+        ("not_run", "selection_not_run"),
+        ("no_best", "selection_has_no_best"),
+        ("invalid_metadata", "selection_metadata_invalid"),
+        ("missing_best", "best_model_missing"),
+        ("unreadable_best", "best_model_unreadable"),
+        ("wrong_timestep", "best_model_timestep_mismatch"),
+    ],
+)
+def test_selection_decision_uses_canonical_fallback_reason(
+    tmp_path, case, expected_reason
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    final = _selection_fixture(tmp_path)
+    selection = tmp_path / "holdout_selection.csv"
+    best = tmp_path / "best_model.sb3"
+    if case == "no_best":
+        selection.write_text(
+            "timestep,mean_terminal_score,mean_dropout_rate,mean_delay_days,is_best\n"
+            "50000,1,0.2,3,0\n",
+            encoding="utf-8",
+        )
+    elif case == "invalid_metadata":
+        selection.write_text("timestep,is_best\n50000,1\n", encoding="utf-8")
+    elif case != "not_run":
+        selection.write_text(
+            "timestep,mean_terminal_score,mean_dropout_rate,mean_delay_days,is_best\n"
+            "50000,1,0.2,3,1\n",
+            encoding="utf-8",
+        )
+        if case == "unreadable_best":
+            best.write_bytes(b"not-an-archive")
+        elif case == "wrong_timestep":
+            best.write_bytes(b"checkpoint:49999")
+        elif case != "missing_best":
+            best.write_bytes(b"checkpoint:50000")
+
+    decision = evaluator.resolve_selection_decision(
+        tmp_path, model_loader=_text_loader
+    )
+
+    assert decision.reference == evaluator.CheckpointRef(
+        final, "fallback_final", 60_000, _sha256(final)
+    )
+    assert decision.selection_outcome == "fallback_final"
+    assert decision.fallback_reason == expected_reason
+    assert decision.selection_count == 0
+    assert decision.selection_tuple is None
+
+
 def test_common_step_uses_largest_verified_regular_intersection(tmp_path, monkeypatch):
     from comparison import checkpoint_evaluator as evaluator
 

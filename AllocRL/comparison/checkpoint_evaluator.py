@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +13,11 @@ from sb3_contrib import MaskablePPO
 
 import evaluation_runner
 from alloc_env.observation_state import ObservationScales
-from comparison.artifact_manifest import read_json_object, sha256_file
+from comparison.artifact_manifest import (
+    FALLBACK_REASON_CODES,
+    read_json_object,
+    sha256_file,
+)
 from comparison.wall_clock_callback import atomic_write_json, read_wall_clock_state, resolve_state_checkpoint
 from evaluation_runner import ModelActionPolicy
 
@@ -40,6 +45,28 @@ class CheckpointRef:
     label: Literal["best_model", "fallback_final", "final", "common_step"]
     timestep: int
     sha256: str
+
+
+@dataclass(frozen=True)
+class SelectionDecision:
+    reference: CheckpointRef
+    selection_outcome: Literal["best_model", "fallback_final"]
+    fallback_reason: str | None
+    selection_count: int
+    selection_tuple: list[float] | None
+
+    def runtime_fields(self) -> dict[str, Any]:
+        return {
+            "selected_checkpoint_timestep": self.reference.timestep,
+            "selection_count": self.selection_count,
+            "selection_tuple": self.selection_tuple,
+            "selection_outcome": self.selection_outcome,
+            "fallback_reason": self.fallback_reason,
+            "checkpoint_identity": {
+                "filename": self.reference.path.name,
+                "sha256": self.reference.sha256,
+            },
+        }
 
 
 def _archive_timestep(path: Path, loader=MaskablePPO.load) -> int | None:
@@ -93,20 +120,46 @@ def select_common_timestep(
     return max(shared)
 
 
-def _selected_timestep(selection_path: Path) -> int | None:
+def _selection_best_row(
+    selection_path: Path,
+) -> tuple[tuple[int, list[float]] | None, str | None]:
     required = (
         "timestep", "mean_terminal_score", "mean_dropout_rate",
         "mean_delay_days", "is_best",
     )
     try:
+        if not selection_path.is_file() or selection_path.stat().st_size == 0:
+            return None, "selection_not_run"
+    except OSError:
+        return None, "selection_metadata_invalid"
+    try:
         with selection_path.open(encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream)
             if tuple(reader.fieldnames or ()) != required:
-                return None
-            best = [row for row in reader if row.get("is_best") == "1"]
-        return int(best[-1]["timestep"]) if best else None
-    except (OSError, ValueError, KeyError):
-        return None
+                return None, "selection_metadata_invalid"
+            rows = list(reader)
+        normalized: list[tuple[int, list[float], str]] = []
+        for row in rows:
+            if set(row) != set(required) or row["is_best"] not in {"0", "1"}:
+                return None, "selection_metadata_invalid"
+            timestep = int(row["timestep"])
+            values = [
+                float(row["mean_terminal_score"]),
+                -float(row["mean_dropout_rate"]),
+                -float(row["mean_delay_days"]),
+            ]
+            if timestep < 0 or any(not math.isfinite(value) for value in values):
+                return None, "selection_metadata_invalid"
+            normalized.append((timestep, values, row["is_best"]))
+        best = [(timestep, values) for timestep, values, flag in normalized if flag == "1"]
+        return (best[-1], None) if best else (None, "selection_has_no_best")
+    except (OSError, UnicodeDecodeError, csv.Error, ValueError, KeyError, TypeError):
+        return None, "selection_metadata_invalid"
+
+
+def _selected_timestep(selection_path: Path) -> int | None:
+    best, _reason = _selection_best_row(selection_path)
+    return best[0] if best is not None else None
 
 
 def _verified_ref(path: Path, label: Literal["best_model", "fallback_final", "final", "common_step"], timestep: int, loader=MaskablePPO.load) -> CheckpointRef | None:
@@ -116,22 +169,6 @@ def _verified_ref(path: Path, label: Literal["best_model", "fallback_final", "fi
         return CheckpointRef(path=path, label=label, timestep=timestep, sha256=sha256_file(path))
     except (OSError, FileNotFoundError):
         return None
-
-
-def resolve_selected_or_fallback(
-    output_dir: Path, *, model_loader=MaskablePPO.load
-) -> CheckpointRef:
-    """Use a proven selected model or only the exact complete state checkpoint."""
-    root = Path(output_dir)
-    best = root / "best_model.sb3"
-    selected_timestep = _selected_timestep(root / "holdout_selection.csv")
-    if selected_timestep is not None:
-        selected = _verified_ref(best, "best_model", selected_timestep, model_loader)
-        if selected is not None:
-            return selected
-
-    final = resolve_final_checkpoint(root, model_loader=model_loader)
-    return CheckpointRef(final.path, "fallback_final", final.timestep, final.sha256)
 
 
 def resolve_final_checkpoint(
@@ -150,6 +187,80 @@ def resolve_final_checkpoint(
         return final
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise PartialResultError("no exact complete final checkpoint") from error
+
+
+def resolve_selection_decision(
+    output_dir: Path,
+    *,
+    model_loader=MaskablePPO.load,
+    archive_timestep_reader=None,
+    final_reference: CheckpointRef | None = None,
+) -> SelectionDecision:
+    """Resolve one selected checkpoint and preserve the exact fallback cause."""
+    root = Path(output_dir)
+    final = final_reference or resolve_final_checkpoint(
+        root, model_loader=model_loader
+    )
+    metadata, reason = _selection_best_row(root / "holdout_selection.csv")
+    if metadata is not None:
+        selected_timestep, ranking = metadata
+        best = root / "best_model.sb3"
+        if not best.exists():
+            reason = "best_model_missing"
+        elif best.is_symlink() or not best.is_file():
+            reason = "best_model_unreadable"
+        else:
+            try:
+                actual_timestep = (
+                    archive_timestep_reader(best)
+                    if archive_timestep_reader is not None
+                    else _archive_timestep(best, model_loader)
+                )
+            except (OSError, RuntimeError, ValueError, TypeError):
+                actual_timestep = None
+            if actual_timestep is None:
+                reason = "best_model_unreadable"
+            elif actual_timestep != selected_timestep:
+                reason = "best_model_timestep_mismatch"
+            else:
+                try:
+                    digest = sha256_file(best)
+                except FileNotFoundError:
+                    reason = "best_model_missing"
+                except OSError:
+                    reason = "best_model_unreadable"
+                else:
+                    reference = CheckpointRef(
+                        best, "best_model", selected_timestep, digest
+                    )
+                    return SelectionDecision(
+                        reference=reference,
+                        selection_outcome="best_model",
+                        fallback_reason=None,
+                        selection_count=5,
+                        selection_tuple=ranking,
+                    )
+    if reason not in FALLBACK_REASON_CODES:
+        raise PartialResultError("selection fallback reason is not canonical")
+    fallback = CheckpointRef(
+        final.path, "fallback_final", final.timestep, final.sha256
+    )
+    return SelectionDecision(
+        reference=fallback,
+        selection_outcome="fallback_final",
+        fallback_reason=reason,
+        selection_count=0,
+        selection_tuple=None,
+    )
+
+
+def resolve_selected_or_fallback(
+    output_dir: Path, *, model_loader=MaskablePPO.load
+) -> CheckpointRef:
+    """Compatibility wrapper returning only the canonical selected reference."""
+    return resolve_selection_decision(
+        output_dir, model_loader=model_loader
+    ).reference
 
 
 def split_holdout_records(records: Sequence[Mapping[str, Any]]) -> tuple[list[dict], list[dict]]:

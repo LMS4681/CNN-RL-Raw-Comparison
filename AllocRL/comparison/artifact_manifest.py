@@ -21,6 +21,16 @@ from urllib.parse import urlsplit, urlunsplit
 import torch
 
 
+FALLBACK_REASON_CODES = frozenset({
+    "selection_not_run",
+    "selection_has_no_best",
+    "selection_metadata_invalid",
+    "best_model_missing",
+    "best_model_unreadable",
+    "best_model_timestep_mismatch",
+})
+
+
 REQUIRED_ENVIRONMENT_KEYS = frozenset(
     {
         "captured_at_utc",
@@ -79,6 +89,8 @@ RUNTIME_METRICS_KEYS = frozenset(
         "selected_checkpoint_timestep",
         "selection_count",
         "selection_tuple",
+        "selection_outcome",
+        "fallback_reason",
         "checkpoint_identity",
     }
 )
@@ -315,10 +327,20 @@ def _validate_runtime_metrics_payload(
         raise ValueError("runtime metrics checkpoint_identity is invalid")
     _sha256(identity["sha256"], "runtime checkpoint identity")
     selection_tuple = payload["selection_tuple"]
-    if payload["selection_count"] == 0:
-        if selection_tuple is not None:
-            raise ValueError("fallback selection tuple must be null")
-    elif (
+    outcome = payload["selection_outcome"]
+    fallback_reason = payload["fallback_reason"]
+    if outcome == "fallback_final":
+        if (
+            payload["selection_count"] != 0
+            or selection_tuple is not None
+            or fallback_reason not in FALLBACK_REASON_CODES
+        ):
+            raise ValueError("fallback selection provenance is invalid")
+    elif outcome != "best_model":
+        raise ValueError("runtime metrics selection_outcome is invalid")
+    elif fallback_reason is not None or payload["selection_count"] <= 0:
+        raise ValueError("best-model selection provenance is invalid")
+    if outcome == "best_model" and (
         not isinstance(selection_tuple, list)
         or len(selection_tuple) != 3
         or any(

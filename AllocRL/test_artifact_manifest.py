@@ -193,6 +193,8 @@ def test_runtime_writers_use_real_json_files(tmp_path):
         "selected_checkpoint_timestep": 120,
         "selection_count": 0,
         "selection_tuple": None,
+        "selection_outcome": "fallback_final",
+        "fallback_reason": "selection_not_run",
         "checkpoint_identity": {"filename": "model.sb3", "sha256": "a" * 64},
     }
     write_runtime_metrics(metrics, payload)
@@ -250,6 +252,7 @@ def test_runtime_v2_rejects_impossible_arithmetic_and_peak_scope(
         "metrics_recorded_at_utc": "2026-07-21T00:00:12+00:00",
         "finalization_mode": "in_process", "selected_checkpoint_timestep": 120,
         "selection_count": 0, "selection_tuple": None,
+        "selection_outcome": "fallback_final", "fallback_reason": "selection_not_run",
         "checkpoint_identity": {"filename": "model.sb3", "sha256": "a" * 64},
     }
     payload.update(updates)
@@ -410,6 +413,9 @@ def test_comparison_runtime_metrics_use_wall_clock_state_and_model_counts(
 
 def test_runtime_metrics_uses_verified_holdout_best_checkpoint(tmp_path, tiny_policy, monkeypatch):
     (tmp_path / "best_model.sb3").write_bytes(b"best")
+    state_checkpoint = tmp_path / "checkpoints" / "model_40_g1.sb3"
+    state_checkpoint.parent.mkdir()
+    state_checkpoint.write_bytes(b"state")
     (tmp_path / "holdout_selection.csv").write_text(
         "timestep,mean_terminal_score,mean_dropout_rate,mean_delay_days,is_best\n"
         "50,10.0,0.2,3.0,1\n",
@@ -420,14 +426,16 @@ def test_runtime_metrics_uses_verified_holdout_best_checkpoint(tmp_path, tiny_po
         tmp_path,
         SimpleNamespace(
             last_checkpoint_timestep=40,
-            last_checkpoint_file="model_40_g1.sb3",
-            last_checkpoint_sha256="a" * 64,
+            last_checkpoint_file=state_checkpoint.name,
+            last_checkpoint_sha256=hashlib.sha256(b"state").hexdigest(),
         ),
     )
     assert selected["selected_checkpoint_timestep"] == 50
     assert selected["checkpoint_identity"]["filename"] == "best_model.sb3"
     assert selected["selection_count"] == 1
     assert selected["selection_tuple"] == [10.0, -0.2, -3.0]
+    assert selected["selection_outcome"] == "best_model"
+    assert selected["fallback_reason"] is None
 
 
 def test_runtime_metrics_falls_back_to_verified_complete_state_checkpoint(tmp_path):
@@ -450,6 +458,8 @@ def test_runtime_metrics_falls_back_to_verified_complete_state_checkpoint(tmp_pa
     }
     assert selected["selection_count"] == 0
     assert selected["selection_tuple"] is None
+    assert selected["selection_outcome"] == "fallback_final"
+    assert selected["fallback_reason"] == "selection_not_run"
 
 
 def test_runtime_metrics_ignores_malformed_holdout_selection_and_falls_back(tmp_path):
@@ -470,6 +480,7 @@ def test_runtime_metrics_ignores_malformed_holdout_selection_and_falls_back(tmp_
         ),
     )
     assert selected["selected_checkpoint_timestep"] == 40
+    assert selected["fallback_reason"] == "selection_metadata_invalid"
 
 
 @pytest.mark.parametrize(

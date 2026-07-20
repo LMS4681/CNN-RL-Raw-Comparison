@@ -107,6 +107,8 @@ def _bundle(root: Path) -> None:
         "selected_checkpoint_timestep": 120,
         "selection_count": 0,
         "selection_tuple": None,
+        "selection_outcome": "fallback_final",
+        "fallback_reason": "selection_not_run",
         "checkpoint_identity": {"filename": checkpoint.name, "sha256": state.last_checkpoint_sha256},
     })
 
