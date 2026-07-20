@@ -101,6 +101,16 @@ def test_wall_clock_stops_at_cumulative_budget(tmp_path, fake_clock):
     assert state.config_sha256 == TEST_CONFIG_SHA256
 
 
+def test_read_wall_clock_state_rejects_duplicate_json_fields(tmp_path, fake_clock):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start()
+    model.num_timesteps = 1; callback.persist_checkpoint(status="running")
+    path = tmp_path / "run_state.json"; raw = path.read_text(encoding="utf-8").rstrip()
+    path.write_text(raw[:-1] + ',"generation":999}', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate"):
+        read_wall_clock_state(path)
+
+
 def test_resume_uses_only_remaining_budget(tmp_path, fake_clock):
     first, model = prepared_callback(tmp_path, fake_clock, target_seconds=10_800)
     first._on_training_start()

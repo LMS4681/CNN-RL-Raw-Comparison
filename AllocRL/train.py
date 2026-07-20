@@ -46,6 +46,7 @@ from comparison.artifact_manifest import (
     append_environment_segment,
     collect_environment,
     count_trainable_parameters,
+    read_json_object,
     sha256_file,
     write_runtime_metrics,
 )
@@ -642,10 +643,9 @@ def load_run_config(path: str | Path) -> dict:
     if not config_path.is_file():
         raise FileNotFoundError(f"Run configuration not found: {config_path}")
 
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(config, dict):
-        raise ValueError(f"Run configuration must be a JSON object: {config_path}")
-    return config
+    try: return read_json_object(config_path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
+        raise ValueError(f"Run configuration must be a JSON object: {config_path}") from error
 
 
 def load_model_run_config(model_path: str | Path) -> dict:

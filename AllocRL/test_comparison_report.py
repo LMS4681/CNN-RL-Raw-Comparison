@@ -147,6 +147,16 @@ def test_missing_runtime_value_is_json_null_not_a_guessed_zero(tmp_path):
         build_comparison_summary(tmp_path)
 
 
+def test_report_summary_rejects_duplicate_runtime_metrics_field(tmp_path):
+    from comparison.report_builder import build_comparison_summary
+
+    write_complete_fixture(tmp_path)
+    path = tmp_path / "raw_direct" / "runtime_metrics.json"; raw = path.read_text(encoding="utf-8").rstrip()
+    path.write_text(raw[:-1] + ',"restart_count":999}', encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid JSON"):
+        build_comparison_summary(tmp_path)
+
+
 def test_rejects_coercive_runtime_values_and_reconciles_selected_provenance(tmp_path):
     from comparison.report_builder import build_comparison_summary
     write_complete_fixture(tmp_path)

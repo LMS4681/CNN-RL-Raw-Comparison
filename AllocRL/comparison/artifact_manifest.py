@@ -66,6 +66,24 @@ def canonical_json_sha256(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def parse_json_object(text: str) -> dict[str, Any]:
+    """Parse one JSON object while rejecting duplicate keys at every depth."""
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result: raise ValueError(f"duplicate JSON object key: {key}")
+            result[key] = value
+        return result
+
+    value = json.loads(text, object_pairs_hook=reject_duplicate_keys)
+    if not isinstance(value, dict): raise ValueError("JSON object required")
+    return value
+
+
+def read_json_object(path: str | Path) -> dict[str, Any]:
+    return parse_json_object(Path(path).read_text(encoding="utf-8"))
+
+
 def sha256_file(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:

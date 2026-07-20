@@ -175,7 +175,6 @@ def test_stale_orphan_toctou_change_refuses_without_deleting_new_sentinel(tmp_pa
     '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":0,"heartbeat_monotonic":0,"status":"active"}',
     '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":"0","status":"active"}',
     '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":-1,"status":"active"}',
-    '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":99,"status":"active"}',
     '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":0,"status":"unknown"}',
     '{"token":"x","pid":1,"boot_id":"boot","heartbeat_utc":"2026-01-01T00:00:00Z","heartbeat_monotonic":0,"status":true}',
 ])
@@ -969,6 +968,118 @@ def test_active_foreign_windows_fallback_lease_needs_proven_stale_wall_heartbeat
             pass
 
 
+def test_rebooted_foreign_monotonic_clock_can_take_over_only_after_stale_utc(tmp_path: Path):
+    from comparison.experiment_runner import _Lease, atomic_write_json
+
+    payload = {"token": "owner", "pid": 2, "boot_id": "other-boot", "heartbeat_utc": "1970-01-01T00:00:00Z", "heartbeat_monotonic": 10_000.0, "status": "active"}
+    atomic_write_json(tmp_path / "lease.json", payload); (tmp_path / ".lease.acquire").write_text("owner\n", encoding="utf-8")
+    with _Lease(tmp_path, stale_takeover=True, clock=lambda: 10.0, wall_time=lambda: 1_000.0, stale_after=20, interval=999) as lease:
+        assert lease.acquired
+
+
+def test_foreign_reboot_record_with_fresh_utc_refuses_takeover_even_if_monotonic_is_larger(tmp_path: Path):
+    from comparison.experiment_runner import LeaseError, _Lease, atomic_write_json
+
+    payload = {"token": "owner", "pid": 2, "boot_id": "other-boot", "heartbeat_utc": "1970-01-01T00:16:39Z", "heartbeat_monotonic": 10_000.0, "status": "active"}
+    atomic_write_json(tmp_path / "lease.json", payload); (tmp_path / ".lease.acquire").write_text("owner\n", encoding="utf-8")
+    with pytest.raises(LeaseError, match="live"):
+        with _Lease(tmp_path, stale_takeover=True, clock=lambda: 10.0, wall_time=lambda: 1_000.0, stale_after=20, interval=999):
+            pass
+
+
+def test_same_boot_future_monotonic_heartbeat_fails_closed(tmp_path: Path, monkeypatch):
+    from comparison import experiment_runner as runner_module
+
+    monkeypatch.setattr(runner_module, "_boot_id", lambda: "same-boot")
+    payload = {"token": "owner", "pid": 2, "boot_id": "same-boot", "heartbeat_utc": "1970-01-01T00:00:00Z", "heartbeat_monotonic": 10_000.0, "status": "active"}
+    runner_module.atomic_write_json(tmp_path / "lease.json", payload); (tmp_path / ".lease.acquire").write_text("owner\n", encoding="utf-8")
+    with pytest.raises(runner_module.LeaseError, match="live"):
+        with runner_module._Lease(tmp_path, stale_takeover=True, clock=lambda: 10.0, wall_time=lambda: 1_000.0, stale_after=20, interval=999):
+            pass
+
+
+def test_release_write_failure_keeps_owned_sentinel_unavailable(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import LeaseError, _Lease
+
+    lease = _Lease(tmp_path, stale_takeover=False, clock=lambda: 0.0, wall_time=lambda: 0.0, interval=999)
+    original = lease._write
+    def fail_release(status):
+        if status == "released": raise LeaseError("release write failed")
+        return original(status)
+    monkeypatch.setattr(lease, "_write", fail_release)
+    with pytest.raises(LeaseError, match="release write failed"):
+        with lease: pass
+    assert (tmp_path / ".lease.acquire").read_text(encoding="utf-8").strip() == lease.token
+
+
+def test_release_failure_after_marker_removes_only_its_owned_marker(tmp_path: Path, monkeypatch):
+    from comparison import experiment_runner as runner_module
+
+    original = runner_module._Lease._write
+    def fail_release(self, status):
+        if status == "released": raise runner_module.LeaseError("release write failed")
+        return original(self, status)
+    monkeypatch.setattr(runner_module._Lease, "_write", fail_release)
+    calls, actions, hashers = _public_harness()
+    with pytest.raises(runner_module.LeaseError, match="release write failed"):
+        runner_module.run_overnight_experiment(runner_module.ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    assert not (tmp_path / "COMPLETE.json").exists() and (tmp_path / ".lease.acquire").exists()
+
+
+def test_release_failure_cleanup_never_deletes_replaced_marker(tmp_path: Path, monkeypatch):
+    from comparison import experiment_runner as runner_module
+
+    original = runner_module._Lease._write
+    def replace_then_fail(self, status):
+        if status == "released":
+            runner_module.atomic_write_json(tmp_path / "COMPLETE.json", {"lease_token": "new-owner"})
+            raise runner_module.LeaseError("release write failed")
+        return original(self, status)
+    monkeypatch.setattr(runner_module._Lease, "_write", replace_then_fail)
+    calls, actions, hashers = _public_harness()
+    with pytest.raises(runner_module.LeaseError, match="release write failed"):
+        runner_module.run_overnight_experiment(runner_module.ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    assert json.loads((tmp_path / "COMPLETE.json").read_text(encoding="utf-8"))["lease_token"] == "new-owner"
+
+
+def test_lease_write_retries_transient_windows_permission_denial(tmp_path: Path, monkeypatch):
+    from comparison import experiment_runner as runner_module
+
+    lease = runner_module._Lease(tmp_path, stale_takeover=False, clock=lambda: 0.0, wall_time=lambda: 0.0, interval=999)
+    original, calls = runner_module.atomic_write_json, [0]
+    def fail_once(path, payload):
+        if Path(path) == lease.path and calls[0] == 0:
+            calls[0] += 1
+            raise PermissionError("sharing violation")
+        return original(path, payload)
+    with lease:
+        monkeypatch.setattr(runner_module, "atomic_write_json", fail_once)
+        lease._write("active")
+    assert calls == [1]
+
+
+def test_task6_train_and_integrity_reject_duplicate_run_state(tmp_path: Path, monkeypatch):
+    from comparison import experiment_runner as runner_module
+
+    _, runner, _, _ = _integrity_fixture(tmp_path, monkeypatch)
+    path = runner.root / "raw_direct" / "run_state.json"; raw = path.read_text(encoding="utf-8").rstrip()
+    path.write_text(raw[:-1] + ',"generation":999}', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate"):
+        runner.train("raw_direct")
+    with pytest.raises(ValueError, match="duplicate"):
+        runner.integrity()
+
+
+def test_task6_marker_validation_rejects_duplicate_runtime_metrics(tmp_path: Path):
+    from comparison import experiment_runner as runner_module
+
+    _report_integrity_fixture(tmp_path)
+    path = tmp_path / "raw_direct" / "runtime_metrics.json"; raw = path.read_text(encoding="utf-8").rstrip()
+    path.write_text(raw[:-1] + ',"restart_count":999}', encoding="utf-8")
+    with pytest.raises(runner_module.ExperimentIntegrityError):
+        runner_module._validate_report_artifacts(tmp_path)
+
+
 def test_public_marker_is_published_while_first_runner_still_owns_lease(tmp_path: Path, monkeypatch):
     from comparison import experiment_runner as runner_module
 
@@ -1050,6 +1161,14 @@ def test_json_loader_rejects_duplicate_keys_for_every_root_artifact(tmp_path: Pa
     path = tmp_path / relative; path.write_text('{"key":1,"key":2}', encoding="utf-8")
     with pytest.raises(ValueError, match="invalid JSON"):
         _json(path)
+
+
+def test_train_load_run_config_rejects_duplicate_keys(tmp_path: Path):
+    from train import load_run_config
+
+    path = tmp_path / "run_config.json"; path.write_text('{"seed":0,"seed":1}', encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON object"):
+        load_run_config(path)
 
 
 def test_root_manifest_rejects_extra_key_but_accepts_task4_atomic_format(tmp_path: Path, monkeypatch):

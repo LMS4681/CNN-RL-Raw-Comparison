@@ -28,6 +28,7 @@ from comparison.artifact_manifest import (
     REQUIRED_ENVIRONMENT_KEYS,
     canonical_json_sha256,
     collect_environment,
+    read_json_object,
     sha256_file,
 )
 from comparison.checkpoint_evaluator import evaluate_comparison_artifacts
@@ -71,14 +72,8 @@ def _canonical(payload: Mapping[str, Any]) -> bytes:
 
 
 def _json(path: Path) -> dict[str, Any]:
-    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result: raise ValueError("duplicate JSON object key")
-            result[key] = value
-        return result
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicate_keys)
+        value = read_json_object(path)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
         raise ValueError(f"invalid JSON: {path}") from error
     if not isinstance(value, dict): raise ValueError(f"JSON object required: {path}")
@@ -494,7 +489,7 @@ class _Lease(AbstractContextManager["_Lease"]):
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as caught:
                 raise LeaseError("invalid lease.json") from caught
         else: raise LeaseError("invalid lease.json") from error
-        if set(payload) != self._KEYS or not _nonempty_string(payload["token"]) or not isinstance(payload["pid"], int) or isinstance(payload["pid"], bool) or payload["pid"] <= 0 or not _nonempty_string(payload["boot_id"]) or not isinstance(payload["status"], str) or payload["status"] not in {"active", "released"} or not _valid_number(payload["heartbeat_monotonic"]) or float(payload["heartbeat_monotonic"]) < 0 or float(payload["heartbeat_monotonic"]) > self.clock():
+        if set(payload) != self._KEYS or not _nonempty_string(payload["token"]) or not isinstance(payload["pid"], int) or isinstance(payload["pid"], bool) or payload["pid"] <= 0 or not _nonempty_string(payload["boot_id"]) or not isinstance(payload["status"], str) or payload["status"] not in {"active", "released"} or not _valid_number(payload["heartbeat_monotonic"]) or float(payload["heartbeat_monotonic"]) < 0:
             raise LeaseError("invalid lease.json")
         if _utc_datetime(payload["heartbeat_utc"]) is None: raise LeaseError("invalid lease.json")
         return payload
@@ -517,13 +512,23 @@ class _Lease(AbstractContextManager["_Lease"]):
     def _write(self, status: str) -> None:
         if self.path.exists() and self._read_prior().get("token") != self.token:
             raise LeaseError("lease ownership token changed")
-        atomic_write_json(self.path, self._payload(status))
+        for attempt in range(3):
+            try:
+                atomic_write_json(self.path, self._payload(status)); return
+            except PermissionError as error:
+                if attempt == 2: raise LeaseError("lease write failed") from error
+                self.assert_owned(); time.sleep(.001)
     def assert_owned(self) -> None:
         if self.failure is not None: raise LeaseError(f"lease heartbeat failed: {self.failure}")
         if not self.acquired or not self.path.exists(): raise LeaseError("lease ownership is absent")
         if self._read_prior()["token"] != self.token: raise LeaseError("lease ownership token changed")
         if not self.sentinel.exists() or self._sentinel_token(self._snapshot_sentinel()) != self.token:
             raise LeaseError("lease sentinel ownership changed")
+    def quiesce(self) -> None:
+        self.stop.set()
+        if self.thread and self.thread is not threading.current_thread(): self.thread.join(timeout=max(1, self.interval + 1))
+        if self.thread and self.thread.is_alive(): raise LeaseError("lease heartbeat thread did not stop")
+        self.assert_owned()
     def _claim_sentinel(self) -> None:
         try:
             handle=os.open(self.sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -536,7 +541,7 @@ class _Lease(AbstractContextManager["_Lease"]):
             prior=self._read_prior(); status=prior["status"]; age=self.clock()-float(prior["heartbeat_monotonic"]); foreign_boot=prior["boot_id"] != _boot_id(); heartbeat=_utc_datetime(prior["heartbeat_utc"])
             assert heartbeat is not None
             wall_age=self.wall_time()-heartbeat.timestamp()
-            if status == "active" and (wall_age < self.stale_after or (not foreign_boot and age < self.stale_after)):
+            if status == "active" and (wall_age < self.stale_after or (not foreign_boot and (age < 0 or age < self.stale_after))):
                 raise LeaseError("another live comparison runner owns this output root")
             if status == "active" and not self.stale_takeover:
                 raise LeaseError("stale lease requires explicit --take-over-stale-lease")
@@ -562,14 +567,12 @@ class _Lease(AbstractContextManager["_Lease"]):
                 except BaseException as error: self.failure=error; self.stop.set(); return
         self.thread=threading.Thread(target=refresh, daemon=True, name="comparison-lease"); self.thread.start(); return self
     def __exit__(self, *exc: object) -> None:
-        self.stop.set()
-        if self.thread: self.thread.join(timeout=max(1, self.interval + 1))
-        try: self._write("released")
-        finally:
-            try:
-                if self.sentinel.exists() and self.sentinel.read_text(encoding="utf-8").strip() == self.token: self.sentinel.unlink()
-            except (OSError, UnicodeDecodeError): pass
-        if self.failure is not None and exc[0] is None: raise self.failure
+        self.quiesce()
+        self._write("released")
+        self.assert_owned()
+        snapshot = self._snapshot_sentinel()
+        if self._sentinel_token(snapshot) != self.token: raise LeaseError("lease sentinel ownership changed")
+        self._unlink_sentinel_if_unchanged(snapshot)
 
 
 def _boot_id() -> str:
@@ -841,21 +844,23 @@ def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_
             actions = stage_actions or {"preflight":runner.preflight,"smoke_raw_direct":lambda: runner.smoke("raw_direct"),"smoke_candidate_cnn":lambda: runner.smoke("candidate_cnn"),"train_raw_direct":lambda: runner.train("raw_direct"),"evaluate_raw_direct":lambda: runner.evaluate_arm("raw_direct"),"train_candidate_cnn":lambda: runner.train("candidate_cnn"),"evaluate_candidate_cnn":lambda: runner.evaluate_arm("candidate_cnn"),"evaluate_common_step":runner.common_evaluation,"build_report":lambda: write_complete_report(root),"integrity_verification":runner.integrity}
             try:
                 for stage in JOURNAL_STAGES: runner.run_stage(stage, actions[stage])
-                lease.assert_owned()
+                lease.quiesce()
                 marker = runner._complete_marker()
                 lease.assert_owned()
                 atomic_write_json(complete_path, marker)
                 lease.assert_owned()
             except BaseException as error:
-                _remove_owned_complete_marker(complete_path, lease.token)
                 try:
                     lease.assert_owned()
+                    _remove_owned_complete_marker(complete_path, lease.token)
                     write_partial_report(root,f"{type(error).__name__}: {error}")
                 except BaseException: pass
                 raise
     except BaseException:
-        if lease.acquired:
+        try:
+            lease.assert_owned()
             _remove_owned_complete_marker(complete_path, lease.token)
+        except BaseException: pass
         raise
 
 

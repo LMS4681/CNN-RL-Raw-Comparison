@@ -12,7 +12,7 @@ from sb3_contrib import MaskablePPO
 
 import evaluation_runner
 from alloc_env.observation_state import ObservationScales
-from comparison.artifact_manifest import sha256_file
+from comparison.artifact_manifest import read_json_object, sha256_file
 from comparison.wall_clock_callback import atomic_write_json, read_wall_clock_state, resolve_state_checkpoint
 from evaluation_runner import ModelActionPolicy
 
@@ -277,10 +277,8 @@ def merge_checkpoint_manifest(
 
 def update_checkpoint_manifest(path: Path, arm: str, checkpoints: Mapping[str, CheckpointRef]) -> dict[str, Any]:
     manifest_path = Path(path)
-    import json
-    existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(existing, dict):
-        raise ValueError("manifest must be a JSON object")
+    try: existing = read_json_object(manifest_path)
+    except (OSError, UnicodeDecodeError, ValueError) as error: raise ValueError("manifest must be a JSON object") from error
     merged = merge_checkpoint_manifest(existing, arm, checkpoints)
     atomic_write_json(manifest_path, merged)
     return merged
@@ -327,8 +325,8 @@ def evaluate_comparison_artifacts(
             raise PartialResultError("checkpoint reference escapes root") from error
         manifest_updates[arm] = relative_refs
     write_common_step_evaluation(root, common_rows)
-    import json
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try: manifest = read_json_object(manifest_path)
+    except (OSError, UnicodeDecodeError, ValueError) as error: raise PartialResultError("root manifest.json is invalid") from error
     for arm in ARMS:
         manifest = merge_checkpoint_manifest(manifest, arm, manifest_updates[arm])
     atomic_write_json(manifest_path, manifest)

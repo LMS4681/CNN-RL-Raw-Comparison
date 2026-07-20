@@ -323,6 +323,14 @@ def test_manifest_update_uses_atomic_publication(tmp_path, monkeypatch):
     assert calls and path.read_text(encoding="utf-8") == '{"sentinel":true}'
 
 
+def test_manifest_update_rejects_duplicate_json_keys(tmp_path):
+    from comparison import checkpoint_evaluator as evaluator
+
+    path = tmp_path / "manifest.json"; path.write_text('{"checkpoints":{},"checkpoints":{}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON object"):
+        evaluator.update_checkpoint_manifest(path, "raw_direct", {"final": evaluator.CheckpointRef(Path("raw/final.sb3"), "final", 1, "a" * 64)})
+
+
 def test_evaluate_comparison_artifacts_rejects_outside_arm_directory_without_manifest_change(tmp_path):
     from comparison import checkpoint_evaluator as evaluator
     original = b'{"sentinel":true}'; (tmp_path / "manifest.json").write_bytes(original)

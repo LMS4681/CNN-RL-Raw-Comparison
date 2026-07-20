@@ -18,7 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
-from comparison.artifact_manifest import REQUIRED_ENVIRONMENT_KEYS
+from comparison.artifact_manifest import REQUIRED_ENVIRONMENT_KEYS, read_json_object
 from comparison.checkpoint_evaluator import ARMS, EVALUATION_COLUMNS, PRIMARY_TEST_SEEDS, SELECTION_SEEDS
 
 
@@ -52,8 +52,8 @@ def _read_json(path: Path, *, required: bool = True) -> dict[str, Any]:
             raise ValueError(f"missing canonical artifact: {path}")
         return {}
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        value = read_json_object(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
         raise ValueError(f"invalid JSON artifact: {path}") from error
     if not isinstance(value, dict):
         raise ValueError(f"JSON artifact must be an object: {path}")

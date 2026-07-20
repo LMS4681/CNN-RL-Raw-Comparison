@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from stable_baselines3.common.callbacks import BaseCallback
+from comparison.artifact_manifest import read_json_object
 
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -145,9 +146,9 @@ def _validated_state(payload: Mapping[str, Any]) -> WallClockState:
 def read_wall_clock_state(path: str | Path) -> WallClockState:
     """Read and strictly validate a persisted wall-clock generation."""
     state_path = Path(path)
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("wall-clock state must be a JSON object")
+    try: payload = read_json_object(state_path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
+        raise ValueError(f"wall-clock state invalid JSON: {error}") from error
     return _validated_state(payload)
 
 
