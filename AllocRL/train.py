@@ -15,9 +15,11 @@ import gc
 import os
 import sys
 import warnings
+import zipfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 # Windows cp949 콘솔에서 Unicode 출력 에러 방지
 if sys.platform == "win32" and os.environ.get("PYTHONIOENCODING") is None:
@@ -27,6 +29,7 @@ if sys.platform == "win32" and os.environ.get("PYTHONIOENCODING") is None:
 
 import gymnasium as gym
 import numpy as np
+from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 
 from alloc_env.observation_state import (
@@ -359,7 +362,7 @@ def create_evaluation_env(
 # ── 체크포인트 / 자동 이어학습 유틸 ─────────────────────────────────
 
 # 관측 공간·네트워크 구조에 영향을 주는 키. 이어학습하려면 이 값들이 모두 같아야 한다.
-ARCH_CONFIG_KEYS = (
+CONFIG_COMPATIBILITY_KEYS = tuple(sorted({
     "training_data_schema_version",
     "observation_schema_version",
     "reward_schema_version",
@@ -379,8 +382,23 @@ ARCH_CONFIG_KEYS = (
     "excluded_start_months",
     "monthly_jitter",
     "empirical_profile_probability",
-    "seed",
-)
+    "learning_rate",
+    "n_steps",
+    "batch_size",
+    "n_epochs",
+    "gamma",
+    "gae_lambda",
+}))
+# Backward-compatible name consumed by existing safety tooling.
+ARCH_CONFIG_KEYS = CONFIG_COMPATIBILITY_KEYS
+
+
+class _ConfigCompatibilityResult(tuple):
+    def __new__(cls, compatible: bool, bad_key: str | None):
+        return super().__new__(cls, (compatible, bad_key))
+
+    def __bool__(self) -> bool:
+        return bool(self[0])
 
 
 def current_run_config(
@@ -393,6 +411,15 @@ def current_run_config(
         raise ValueError(
             f"run configuration requires exactly {N_WORKSPACES} active "
             f"workspace codes, got {len(active_workspace_codes)}"
+        )
+    required_manifest_keys = ("split_seed", "source_sha256")
+    missing_manifest_keys = [
+        key for key in required_manifest_keys if key not in source_manifest
+    ]
+    if missing_manifest_keys:
+        missing = ", ".join(missing_manifest_keys)
+        raise ValueError(
+            f"source manifest is missing required compatibility fields: {missing}"
         )
     return {
         "training_data_schema_version": TRAINING_DATA_SCHEMA_VERSION,
@@ -416,6 +443,12 @@ def current_run_config(
         "empirical_profile_probability": float(
             args.empirical_profile_probability
         ),
+        "learning_rate": float(args.lr),
+        "n_steps": int(args.n_steps),
+        "batch_size": int(args.batch_size),
+        "n_epochs": int(args.n_epochs),
+        "gamma": float(args.gamma),
+        "gae_lambda": float(args.gae_lambda),
         "seed": int(args.seed),
         "eval_scenarios": args.eval_scenarios,
     }
@@ -485,41 +518,73 @@ def resolve_model_archive_path(path: str | Path) -> Path:
     raise FileNotFoundError(f"Saved model not found. Searched: {searched}")
 
 
-def find_resumable_model(output_dir):
-    """이어학습 가능한 최신 산출물 경로를 찾는다.
-
-    우선순위: 완주 모델(.sb3, legacy .zip) > checkpoints/ 중 최대 step.
-    완주 모델은 항상 가장 많은 step을 가지므로 우선한다. 완주 모델이 없으면
-    (예: 세션 끊김/크래시) checkpoints/ 중 step이 가장 큰 파일을 쓴다.
-    """
-    import re
-    import zipfile
-
-    output_dir = Path(output_dir)
-    for filename in (MODEL_FILENAME, LEGACY_MODEL_FILENAME):
-        final = output_dir / filename
-        if final.is_file():
-            return resolve_model_archive_path(final)
-    ckpt_dir = output_dir / "checkpoints"
-    if ckpt_dir.is_dir():
-        best, best_steps = None, -1
-        for pattern in ("*.sb3", "*.zip"):
-            for p in ckpt_dir.glob(pattern):
-                if not zipfile.is_zipfile(p):
-                    continue
-                m = re.search(r"(\d+)_steps", p.stem)
-                steps = int(m.group(1)) if m else 0
-                if steps > best_steps:
-                    best_steps, best = steps, p
-        return best
-    return None
+def model_num_timesteps(
+    path: Path,
+    loader=MaskablePPO.load,
+) -> int | None:
+    """Read a training archive's stored timestep without attaching an env."""
+    try:
+        model = loader(str(path), device="cpu")
+        value = getattr(model, "num_timesteps", None)
+        return int(value) if value is not None else None
+    except (EOFError, OSError, RuntimeError, ValueError, zipfile.BadZipFile):
+        return None
 
 
-def configs_compatible(saved: dict, current: dict):
-    for key in ARCH_CONFIG_KEYS:
-        if saved.get(key) != current.get(key):
-            return False, key
-    return True, None
+def find_resumable_model(
+    output_dir,
+    loader=MaskablePPO.load,
+) -> Path | None:
+    """Select the readable training state with the greatest stored timestep."""
+    root = Path(output_dir)
+    final_paths = [root / MODEL_FILENAME, root / LEGACY_MODEL_FILENAME]
+    checkpoints_dir = root / "checkpoints"
+    checkpoint_paths = (
+        list(checkpoints_dir.glob("*.sb3"))
+        if checkpoints_dir.is_dir()
+        else []
+    )
+    candidates = [
+        path
+        for path in [*final_paths, *checkpoint_paths]
+        if path.is_file() and path.name != "best_model.sb3"
+    ]
+
+    ranked = []
+    for path in candidates:
+        timesteps = model_num_timesteps(path, loader=loader)
+        if timesteps is None:
+            continue
+        ranked.append((
+            timesteps,
+            int(path in final_paths),
+            path.stat().st_mtime_ns,
+            path.name,
+            path,
+        ))
+    if not ranked:
+        return None
+    return max(ranked, key=lambda item: item[:4])[-1]
+
+
+def config_mismatches(
+    saved: Mapping,
+    current: Mapping,
+) -> dict[str, tuple[Any, Any]]:
+    return {
+        key: (saved.get(key), current.get(key))
+        for key in CONFIG_COMPATIBILITY_KEYS
+        if saved.get(key) != current.get(key)
+    }
+
+
+def configs_compatible(
+    saved: Mapping,
+    current: Mapping,
+) -> _ConfigCompatibilityResult:
+    mismatches = config_mismatches(saved, current)
+    bad_key = next(iter(mismatches), None)
+    return _ConfigCompatibilityResult(not mismatches, bad_key)
 
 
 def require_current_training_data_schema(
@@ -605,14 +670,17 @@ def require_compatible_run_config(
     current: dict,
     source: str,
 ) -> None:
-    compatible, bad_key = configs_compatible(saved, current)
-    if compatible:
+    mismatches = config_mismatches(saved, current)
+    if not mismatches:
         return
+    details = "\n".join(
+        f"  {key}: saved={saved_value!r}, current={current_value!r}"
+        for key, (saved_value, current_value) in mismatches.items()
+    )
     raise ValueError(
-        f"[{source}] Saved model configuration is incompatible "
-        f"(key='{bad_key}': saved={saved.get(bad_key)} != "
-        f"current={current.get(bad_key)}). Use a matching configuration "
-        "or a new output directory."
+        f"[{source}] Saved model configuration is incompatible:\n"
+        f"{details}\n"
+        "Use a matching configuration or a new output directory."
     )
 
 
@@ -903,6 +971,18 @@ def _train(args, resources: _TrainingResourceLifecycle):
     else:
         print(f"Active workspaces: all {len(workspaces)}")
 
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_config = current_run_config(
+        args,
+        active_workspace_code_list,
+        source_split.manifest,
+        observation_scales,
+    )
+    resume_path = resolve_resume_path(args, output_dir, run_config)
+    is_resume = resume_path is not None
+    write_run_config(output_dir, run_config)
+
     # ── 2. Synthetic 블록 생성기 ─────────────────────────────────
     generator = SyntheticBlockGenerator.from_blocks(
         source_split.training_blocks,
@@ -953,26 +1033,11 @@ def _train(args, resources: _TrainingResourceLifecycle):
         f"(grid={G}×{G}, n_steps={args.n_steps}, n_envs={args.n_envs})"
     )
 
-    # ── 3. 출력 디렉토리 사전 생성 ────────────────────────────────
-    output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     # ── 4. 모델 생성 (CNN+MLP 하이브리드) ─────────────────────────
     policy_kwargs = build_policy_kwargs(
         extractor=args.extractor,
         features_dim=args.features_dim,
     )
-    # 이어학습 경로 결정: --resume-from(명시) 우선, 없으면 --auto-resume 자동 탐지
-    run_config = current_run_config(
-        args,
-        active_workspace_code_list,
-        source_split.manifest,
-        observation_scales,
-    )
-    resume_path = resolve_resume_path(args, output_dir, run_config)
-    is_resume = resume_path is not None
-    # 현재 설정 기록 (다음 auto-resume 호환성 검사 + 크래시 후 복구용)
-    write_run_config(output_dir, run_config)
 
     print(f"Feature extractor: {args.extractor}")
     if is_resume:

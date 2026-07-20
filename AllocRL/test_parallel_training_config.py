@@ -74,6 +74,12 @@ def make_args() -> SimpleNamespace:
         state_context="full",
         monthly_jitter=20,
         empirical_profile_probability=0.2,
+        lr=3e-4,
+        n_steps=960,
+        batch_size=64,
+        n_epochs=10,
+        gamma=1.0,
+        gae_lambda=0.98,
         seed=0,
         eval_scenarios="./data/fixed_eval_scenarios.json",
     )
@@ -333,6 +339,12 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             source_manifest()["source_month_counts"],
             config["target_month_counts"],
         )
+        self.assertEqual(3e-4, config["learning_rate"])
+        self.assertEqual(960, config["n_steps"])
+        self.assertEqual(64, config["batch_size"])
+        self.assertEqual(10, config["n_epochs"])
+        self.assertEqual(1.0, config["gamma"])
+        self.assertEqual(0.98, config["gae_lambda"])
 
     def test_run_config_rejects_non_ten_workspace_order(self):
         with self.assertRaisesRegex(ValueError, "exactly 10"):
