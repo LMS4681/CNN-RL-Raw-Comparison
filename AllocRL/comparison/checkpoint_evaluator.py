@@ -63,6 +63,7 @@ def readable_checkpoint_inventory(
     if regular_interval <= 0:
         raise ValueError("regular_interval must be positive")
     inventory: dict[int, Path] = {}
+    metadata: dict[int, tuple[int, str]] = {}
     for path in _archive_candidates(Path(output_dir)):
         try:
             timestep = _archive_timestep(path, model_loader)
@@ -73,20 +74,19 @@ def readable_checkpoint_inventory(
         if timestep is None or timestep < 0 or timestep % regular_interval:
             continue
         prior = inventory.get(timestep)
-        if prior is None or (mtime, path.as_posix()) > (
-            prior.stat().st_mtime_ns, prior.as_posix()
-        ):
+        if prior is None or (mtime, path.as_posix()) > metadata[timestep]:
             inventory[timestep] = path
+            metadata[timestep] = (mtime, path.as_posix())
     return inventory
 
 
 def select_common_timestep(
     raw_dir: Path,
     cnn_dir: Path,
-    regular_interval: int = REGULAR_INTERVAL,
+    regular_interval: int = REGULAR_INTERVAL, *, model_loader=MaskablePPO.load,
 ) -> int:
-    raw_steps = set(readable_checkpoint_inventory(raw_dir, regular_interval))
-    cnn_steps = set(readable_checkpoint_inventory(cnn_dir, regular_interval))
+    raw_steps = set(readable_checkpoint_inventory(raw_dir, regular_interval, model_loader=model_loader))
+    cnn_steps = set(readable_checkpoint_inventory(cnn_dir, regular_interval, model_loader=model_loader))
     shared = raw_steps & cnn_steps
     if not shared:
         raise PartialResultError("no common readable regular checkpoint timestep")
@@ -110,9 +110,12 @@ def _selected_timestep(selection_path: Path) -> int | None:
 
 
 def _verified_ref(path: Path, label: Literal["best_model", "fallback_final", "final", "common_step"], timestep: int, loader=MaskablePPO.load) -> CheckpointRef | None:
-    if not path.is_file() or _archive_timestep(path, loader) != timestep:
+    try:
+        if not path.is_file() or _archive_timestep(path, loader) != timestep:
+            return None
+        return CheckpointRef(path=path, label=label, timestep=timestep, sha256=sha256_file(path))
+    except (OSError, FileNotFoundError):
         return None
-    return CheckpointRef(path=path, label=label, timestep=timestep, sha256=sha256_file(path))
 
 
 def resolve_selected_or_fallback(
@@ -183,7 +186,10 @@ def evaluate_checkpoint(
         timestep = int(getattr(model, "num_timesteps"))
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise PartialResultError(f"checkpoint/config is not evaluable: {model_path}") from error
-    digest = sha256_file(model_path)
+    try:
+        digest = sha256_file(model_path)
+    except (OSError, FileNotFoundError) as error:
+        raise PartialResultError(f"checkpoint disappeared during verification: {model_path}") from error
     base_rows = evaluation_runner.evaluate_scenarios(
         lambda _seed: ModelActionPolicy(model, name=arm), list(ordered),
         workspace_codes=workspace_codes, observation_scales=scales,
@@ -208,7 +214,7 @@ def _validated_rows(rows: Sequence[Mapping[str, Any]], *, arm: str | None = None
     if arm is not None and arm not in ARMS:
         raise ValueError("unknown comparison arm")
     normalized = [dict(row) for row in rows]
-    if not normalized or any(tuple(row) != EVALUATION_COLUMNS for row in normalized):
+    if not normalized or any(set(row) != set(EVALUATION_COLUMNS) for row in normalized):
         raise ValueError("evaluation rows must have the exact stable columns")
     by_arm = {row["arm"] for row in normalized}
     expected_arms = set(ARMS) if common else {arm}
@@ -225,7 +231,8 @@ def _validated_rows(rows: Sequence[Mapping[str, Any]], *, arm: str | None = None
             raise ValueError("checkpoint provenance is inconsistent")
     if common and len({row["checkpoint_timestep"] for row in normalized}) != 1:
         raise ValueError("common rows must share a timestep")
-    return sorted(normalized, key=lambda row: ((ARMS.index(row["arm"]) if common else 0), int(row["seed"])))
+    ordered = [{field: row[field] for field in EVALUATION_COLUMNS} for row in normalized]
+    return sorted(ordered, key=lambda row: ((ARMS.index(row["arm"]) if common else 0), int(row["seed"])))
 
 
 def _write_rows(path: Path, rows: Sequence[Mapping[str, Any]]) -> Path:
@@ -289,7 +296,7 @@ def evaluate_comparison_artifacts(
     manifest_path = root / "manifest.json"
     if not manifest_path.is_file():
         raise PartialResultError("root manifest.json must already exist")
-    common_step = select_common_timestep(raw_dir, cnn_dir, regular_interval)
+    common_step = select_common_timestep(raw_dir, cnn_dir, regular_interval, model_loader=model_loader)
     inventories = {
         "raw_direct": readable_checkpoint_inventory(raw_dir, regular_interval, model_loader=model_loader),
         "candidate_cnn": readable_checkpoint_inventory(cnn_dir, regular_interval, model_loader=model_loader),
