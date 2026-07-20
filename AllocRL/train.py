@@ -14,6 +14,7 @@ import argparse
 import gc
 import os
 import pickle
+import re
 import sys
 import warnings
 import zipfile
@@ -33,6 +34,12 @@ import numpy as np
 import torch
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CheckpointCallback
+
+from comparison.wall_clock_callback import (
+    WallClockBudgetCallback,
+    read_wall_clock_state,
+    resolve_state_checkpoint,
+)
 
 from alloc_env.observation_state import (
     FUTURE_DAY_WINDOWS,
@@ -714,6 +721,19 @@ def resolve_resume_path(args, output_dir, current_config):
     """
     import json
 
+    max_training_seconds = float(
+        getattr(args, "max_training_seconds", 0.0)
+    )
+    if max_training_seconds < 0:
+        raise ValueError("--max-training-seconds must be non-negative")
+    if max_training_seconds > 0:
+        return _resolve_wall_clock_resume_path(
+            args,
+            output_dir,
+            current_config,
+            target_seconds=max_training_seconds,
+        )
+
     if args.resume_from:
         candidate = resolve_model_archive_path(args.resume_from)
         saved_config = load_model_run_config(candidate)
@@ -740,6 +760,79 @@ def resolve_resume_path(args, output_dir, current_config):
         saved_cfg, current_config, source="auto-resume"
     )
     print(f"[auto-resume] 호환 체크포인트 발견 → 이어학습: {candidate}")
+    return candidate
+
+
+def _wall_clock_state_path(args, output_dir: str | Path) -> Path:
+    configured = getattr(args, "wall_clock_state", None)
+    if configured is not None:
+        return Path(configured).expanduser().resolve()
+    return (Path(output_dir) / "run_state.json").resolve()
+
+
+def _resolve_wall_clock_resume_path(
+    args,
+    output_dir: str | Path,
+    current_config: dict,
+    *,
+    target_seconds: float,
+) -> Path | None:
+    """Resolve only the exact verified generation named by wall-clock state."""
+    config_sha256 = getattr(args, "comparison_config_sha256", None)
+    if not isinstance(config_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", config_sha256
+    ) is None:
+        raise ValueError(
+            "wall-clock training requires --comparison-config-sha256 as "
+            "64-character lowercase hexadecimal"
+        )
+    if getattr(args, "auto_resume", False):
+        raise ValueError(
+            "--auto-resume is not allowed in wall-clock mode; pass the exact "
+            "state-named archive with --resume-from"
+        )
+
+    output_dir = Path(output_dir).resolve()
+    state_path = _wall_clock_state_path(args, output_dir)
+    if not state_path.exists():
+        if getattr(args, "resume_from", None):
+            raise ValueError(
+                "wall-clock resume requires an existing verified run_state.json"
+            )
+        return None
+
+    state = read_wall_clock_state(state_path)
+    if state.target_training_seconds != float(target_seconds):
+        raise ValueError(
+            "wall-clock target changed on resume: "
+            f"state {state.target_training_seconds}, requested {target_seconds}"
+        )
+    if state.config_sha256 != config_sha256:
+        raise ValueError("wall-clock config SHA256 changed on resume")
+    expected = resolve_state_checkpoint(output_dir, state)
+    requested = getattr(args, "resume_from", None)
+    if not requested:
+        raise ValueError(
+            "existing wall-clock state requires --resume-from with the exact "
+            "state-named checkpoint"
+        )
+    candidate = resolve_model_archive_path(requested)
+    if candidate.resolve() != expected.resolve():
+        raise ValueError(
+            "--resume-from must be the exact checkpoint named by run_state.json: "
+            f"expected {expected}, got {candidate}"
+        )
+    stored_timestep = model_num_timesteps(candidate)
+    if stored_timestep != state.last_checkpoint_timestep:
+        raise ValueError(
+            "state checkpoint timestep "
+            f"{state.last_checkpoint_timestep} does not match archive "
+            f"{stored_timestep}"
+        )
+    saved_config = load_model_run_config(candidate)
+    require_compatible_run_config(
+        saved_config, current_config, source="resume-from"
+    )
     return candidate
 
 
@@ -993,6 +1086,16 @@ def _train(args, resources: _TrainingResourceLifecycle):
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    max_training_seconds = float(
+        getattr(args, "max_training_seconds", 0.0)
+    )
+    wall_clock_enabled = max_training_seconds > 0
+    if max_training_seconds < 0:
+        raise ValueError("--max-training-seconds must be non-negative")
+    if wall_clock_enabled and args.checkpoint_freq <= 0:
+        raise ValueError(
+            "wall-clock training requires --checkpoint-freq to be positive"
+        )
     run_config = current_run_config(
         args,
         active_workspace_code_list,
@@ -1105,7 +1208,7 @@ def _train(args, resources: _TrainingResourceLifecycle):
     )
     if holdout_callback is not None:
         callback.append(holdout_callback)
-    if args.checkpoint_freq > 0:
+    if args.checkpoint_freq > 0 and not wall_clock_enabled:
         # SB3 CheckpointCallback은 콜백 호출 횟수 기준이라 n_envs로 나눠 step 단위를 맞춘다.
         save_freq = max(args.checkpoint_freq // max(args.n_envs, 1), 1)
         callback.append(Sb3CheckpointCallback(
@@ -1117,6 +1220,24 @@ def _train(args, resources: _TrainingResourceLifecycle):
         print(
             f"중간 체크포인트: 약 {args.checkpoint_freq} step마다 "
             f"→ {output_dir / 'checkpoints'}"
+        )
+    if wall_clock_enabled:
+        callback.append(WallClockBudgetCallback(
+            output_dir,
+            target_seconds=max_training_seconds,
+            checkpoint_freq=args.checkpoint_freq,
+            heartbeat_seconds=float(
+                getattr(args, "wall_clock_heartbeat_seconds", 300.0)
+            ),
+            config_sha256=getattr(
+                args, "comparison_config_sha256", None
+            ),
+            state_path=_wall_clock_state_path(args, output_dir),
+        ))
+        print(
+            "Wall-clock budget: "
+            f"{max_training_seconds:.0f} seconds, verified checkpoints → "
+            f"{output_dir / 'checkpoints'}"
         )
 
     # ── 6. 학습 ──────────────────────────────────────────────────
@@ -1130,6 +1251,21 @@ def _train(args, resources: _TrainingResourceLifecycle):
         callback=callback,
         reset_num_timesteps=not is_resume,
     )
+
+    if wall_clock_enabled:
+        state_path = _wall_clock_state_path(args, output_dir)
+        try:
+            wall_clock_state = read_wall_clock_state(state_path)
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                "training returned before a complete wall-clock state was "
+                "persisted"
+            ) from error
+        if wall_clock_state.status != "complete":
+            raise RuntimeError(
+                "training timestep ceiling returned before the wall-clock "
+                "budget completed; the arm remains incomplete"
+            )
 
     # ── 7. 모델 저장 ─────────────────────────────────────────────
     sb3_path = str(output_dir / MODEL_FILENAME)
@@ -1449,6 +1585,12 @@ def main():
     parser.add_argument("--checkpoint-freq", type=int, default=0,
                         help=("중간 체크포인트 저장 주기(env step 단위). 0=비활성. "
                               "예: 10000. 세션 끊김 대비 + auto-resume 복구 지점."))
+    parser.add_argument("--max-training-seconds", type=float, default=0.0)
+    parser.add_argument("--wall-clock-state", default=None)
+    parser.add_argument(
+        "--wall-clock-heartbeat-seconds", type=float, default=300.0
+    )
+    parser.add_argument("--comparison-config-sha256", default=None)
     parser.add_argument("--export-onnx", action="store_true", default=True,
                         help="ONNX export 수행")
     parser.add_argument("--no-export-onnx", action="store_false", dest="export_onnx")

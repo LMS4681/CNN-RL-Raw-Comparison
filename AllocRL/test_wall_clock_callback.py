@@ -1,0 +1,271 @@
+"""Wall-clock training budget and durable checkpoint regression tests."""
+
+from __future__ import annotations
+
+import csv
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from comparison import wall_clock_callback as wall_clock_module
+from comparison.wall_clock_callback import (
+    WallClockBudgetCallback,
+    read_wall_clock_state,
+    resolve_state_checkpoint,
+)
+
+
+TEST_CONFIG_SHA256 = "a" * 64
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.seconds = 0.0
+        self.started_at = datetime(2026, 7, 21, tzinfo=timezone.utc)
+
+    def monotonic(self) -> float:
+        return self.seconds
+
+    def utc_now(self) -> datetime:
+        return self.started_at + timedelta(seconds=self.seconds)
+
+    def advance(self, seconds: float) -> None:
+        self.seconds += seconds
+
+
+class FakeModel:
+    """Complete local archive double used by the callback tests."""
+
+    def __init__(self) -> None:
+        self.num_timesteps = 0
+        self.save_raises: Exception | None = None
+
+    def save(self, path: str | Path) -> None:
+        if self.save_raises is not None:
+            raise self.save_raises
+        Path(path).write_text(str(self.num_timesteps), encoding="utf-8")
+
+
+@pytest.fixture
+def fake_clock() -> FakeClock:
+    return FakeClock()
+
+
+def read_fake_archive(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def prepared_callback(
+    output_dir: Path,
+    fake_clock: FakeClock,
+    *,
+    target_seconds: float = 10_800,
+    checkpoint_freq: int = 10_000,
+    heartbeat_seconds: float = 300,
+    model: FakeModel | None = None,
+) -> tuple[WallClockBudgetCallback, FakeModel]:
+    selected_model = model or FakeModel()
+    callback = WallClockBudgetCallback(
+        output_dir,
+        target_seconds=target_seconds,
+        checkpoint_freq=checkpoint_freq,
+        heartbeat_seconds=heartbeat_seconds,
+        config_sha256=TEST_CONFIG_SHA256,
+        monotonic=fake_clock.monotonic,
+        utc_now=fake_clock.utc_now,
+        archive_timestep_reader=read_fake_archive,
+    )
+    callback.model = selected_model
+    return callback, selected_model
+
+
+def test_wall_clock_stops_at_cumulative_budget(tmp_path, fake_clock):
+    callback, model = prepared_callback(
+        tmp_path, fake_clock, target_seconds=10_800, checkpoint_freq=10_000
+    )
+    callback._on_training_start()
+    fake_clock.advance(10_799)
+    assert callback._on_step() is True
+    fake_clock.advance(1)
+    assert callback._on_step() is False
+    state = read_wall_clock_state(tmp_path / "run_state.json")
+    assert state.status == "complete"
+    assert state.completed_training_seconds == pytest.approx(10_800)
+    assert state.last_checkpoint_timestep == model.num_timesteps
+    assert state.last_checkpoint_file
+    assert len(state.last_checkpoint_sha256) == 64
+    assert state.config_sha256 == TEST_CONFIG_SHA256
+
+
+def test_resume_uses_only_remaining_budget(tmp_path, fake_clock):
+    first, model = prepared_callback(tmp_path, fake_clock, target_seconds=10_800)
+    first._on_training_start()
+    model.num_timesteps = 120_000
+    fake_clock.advance(7_200)
+    first.persist_checkpoint(status="running")
+
+    callback, _ = prepared_callback(
+        tmp_path, fake_clock, target_seconds=10_800, model=model
+    )
+    callback._on_training_start()
+    fake_clock.advance(3_599)
+    assert callback._on_step() is True
+    fake_clock.advance(1)
+    assert callback._on_step() is False
+
+
+def test_state_never_advances_past_readable_checkpoint(tmp_path, fake_clock):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    model.save_raises = OSError("drive unavailable")
+    with pytest.raises(OSError, match="drive unavailable"):
+        callback.persist_checkpoint(status="running")
+    assert not (tmp_path / "run_state.json").exists()
+
+
+def test_heartbeat_persists_before_timestep_interval(tmp_path, fake_clock):
+    callback, model = prepared_callback(
+        tmp_path,
+        fake_clock,
+        target_seconds=10_800,
+        checkpoint_freq=10_000,
+        heartbeat_seconds=300,
+    )
+    callback._on_training_start()
+    model.num_timesteps = 17
+    fake_clock.advance(300)
+    assert callback._on_step() is True
+    state = read_wall_clock_state(tmp_path / "run_state.json")
+    assert state.last_checkpoint_timestep == 17
+    assert state.last_regular_checkpoint_timestep == 0
+    assert state.completed_training_seconds == pytest.approx(300)
+
+
+def test_resume_rejects_model_not_named_by_state(tmp_path, fake_clock):
+    first, model = prepared_callback(tmp_path, fake_clock)
+    first._on_training_start()
+    model.num_timesteps = 100
+    first.persist_checkpoint(status="running")
+    model.num_timesteps = 200
+    resumed, _ = prepared_callback(tmp_path, fake_clock, model=model)
+    with pytest.raises(ValueError, match="state checkpoint timestep 100.*model 200"):
+        resumed._on_training_start()
+
+
+def test_archive_verified_before_state_crash_keeps_prior_generation(
+    tmp_path, fake_clock, monkeypatch
+):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start()
+    model.num_timesteps = 100
+    callback.persist_checkpoint(status="running")
+    prior = read_wall_clock_state(tmp_path / "run_state.json")
+
+    model.num_timesteps = 200
+    monkeypatch.setattr(
+        wall_clock_module,
+        "atomic_write_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("state write failed")
+        ),
+    )
+    with pytest.raises(OSError, match="state write failed"):
+        callback.persist_checkpoint(status="running")
+
+    current = read_wall_clock_state(tmp_path / "run_state.json")
+    assert current == prior
+    assert resolve_state_checkpoint(tmp_path, current).name == (
+        prior.last_checkpoint_file
+    )
+    assert any(
+        "_g2.sb3" in path.name
+        for path in (tmp_path / "checkpoints").iterdir()
+    )
+
+
+def test_selection_elapsed_time_is_charged_to_same_budget(
+    tmp_path, fake_clock
+):
+    callback, _ = prepared_callback(tmp_path, fake_clock, target_seconds=10_800)
+    callback._on_training_start()
+    fake_clock.advance(10_800)
+    assert callback._on_step() is False
+
+
+def test_checkpoint_io_time_is_included_in_persisted_elapsed(
+    tmp_path, fake_clock
+):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start()
+    original_save = model.save
+
+    def timed_save(path):
+        fake_clock.advance(7)
+        original_save(path)
+
+    model.save = timed_save
+    callback.persist_checkpoint(status="running")
+
+    state = read_wall_clock_state(tmp_path / "run_state.json")
+    assert state.completed_training_seconds == pytest.approx(7)
+
+
+def test_progress_rows_record_verified_generation(tmp_path, fake_clock):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start()
+    model.num_timesteps = 10_001
+    callback.persist_checkpoint(status="running")
+
+    with (tmp_path / "progress_timing.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows == [
+        {
+            "generation": "1",
+            "timestep": "10001",
+            "recorded_training_seconds": "0.0",
+            "updated_at_utc": "2026-07-21T00:00:00+00:00",
+            "status": "running",
+            "checkpoint_file": "model_10001_g1.sb3",
+        }
+    ]
+    assert read_wall_clock_state(
+        tmp_path / "run_state.json"
+    ).last_regular_checkpoint_timestep == 10_000
+
+
+def test_copy_sha_mismatch_never_advances_state(
+    tmp_path, fake_clock, monkeypatch
+):
+    callback, _ = prepared_callback(tmp_path, fake_clock)
+    original_copy = wall_clock_module.shutil.copyfile
+
+    def corrupting_copy(source, destination):
+        result = original_copy(source, destination)
+        with Path(destination).open("ab") as stream:
+            stream.write(b" ")
+        return result
+
+    monkeypatch.setattr(wall_clock_module.shutil, "copyfile", corrupting_copy)
+    with pytest.raises(ValueError, match="SHA256"):
+        callback.persist_checkpoint(status="running")
+
+    assert not (tmp_path / "run_state.json").exists()
+
+
+def test_config_sha_must_be_a_lowercase_hex_string(tmp_path, fake_clock):
+    with pytest.raises(ValueError, match="comparison config SHA256"):
+        WallClockBudgetCallback(
+            tmp_path,
+            target_seconds=10,
+            checkpoint_freq=10,
+            heartbeat_seconds=1,
+            config_sha256=None,
+            monotonic=fake_clock.monotonic,
+            utc_now=fake_clock.utc_now,
+            archive_timestep_reader=read_fake_archive,
+        )

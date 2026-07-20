@@ -6,7 +6,9 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from dataclasses import asdict
 from datetime import date
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -16,6 +18,7 @@ from stable_baselines3.common import save_util
 
 import train as train_module
 from alloc_env.observation_state import ObservationScales
+from comparison.wall_clock_callback import WallClockState, atomic_write_json
 
 
 WORKSPACE_CODES = [
@@ -166,6 +169,47 @@ def save_real_model(path: Path, timesteps: int) -> Path:
         if env is not None:
             env.close()
     return path
+
+
+def write_wall_clock_state(
+    output_dir: Path,
+    checkpoint: Path,
+    *,
+    timestep: int,
+    state_path: Path | None = None,
+) -> Path:
+    target = state_path or output_dir / "run_state.json"
+    state = WallClockState(
+        schema_version=1,
+        target_training_seconds=10_800.0,
+        completed_training_seconds=600.0,
+        last_checkpoint_timestep=timestep,
+        last_regular_checkpoint_timestep=0,
+        last_checkpoint_file=checkpoint.name,
+        last_checkpoint_sha256=sha256(checkpoint.read_bytes()).hexdigest(),
+        config_sha256="a" * 64,
+        generation=1,
+        restart_count=0,
+        max_unrecorded_seconds=300.0,
+        status="running",
+        started_at_utc="2026-07-21T00:00:00+00:00",
+        updated_at_utc="2026-07-21T00:10:00+00:00",
+        completed_at_utc=None,
+    )
+    atomic_write_json(target, asdict(state))
+    return target
+
+
+def wall_clock_args(checkpoint: Path | None, **overrides):
+    values = {
+        "resume_from": str(checkpoint) if checkpoint is not None else None,
+        "auto_resume": False,
+        "max_training_seconds": 10_800.0,
+        "wall_clock_state": None,
+        "comparison_config_sha256": "a" * 64,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def corrupt_policy_member(source: Path, destination: Path) -> None:
@@ -511,6 +555,90 @@ def test_model_num_timesteps_does_not_swallow_unexpected_loader_errors(
         train_module.model_num_timesteps(model_path, loader=loader)
 
 
+def test_wall_clock_resume_accepts_only_state_named_verified_archive(tmp_path):
+    output_dir = tmp_path / "output"
+    checkpoint = save_real_model(
+        output_dir / "checkpoints" / "model_100_g1.sb3", 100
+    )
+    write_wall_clock_state(output_dir, checkpoint, timestep=100)
+    train_module.write_run_config(output_dir, complete_config())
+
+    resolved = train_module.resolve_resume_path(
+        wall_clock_args(checkpoint), output_dir, complete_config()
+    )
+
+    assert resolved == checkpoint.resolve()
+
+
+def test_wall_clock_resume_rejects_archive_not_named_by_state(tmp_path):
+    output_dir = tmp_path / "output"
+    named = save_real_model(
+        output_dir / "checkpoints" / "model_100_g1.sb3", 100
+    )
+    other = save_real_model(
+        output_dir / "checkpoints" / "model_100_g2.sb3", 100
+    )
+    write_wall_clock_state(output_dir, named, timestep=100)
+    train_module.write_run_config(output_dir, complete_config())
+
+    with pytest.raises(ValueError, match="exact checkpoint named by run_state"):
+        train_module.resolve_resume_path(
+            wall_clock_args(other), output_dir, complete_config()
+        )
+
+
+def test_wall_clock_resume_rejects_checkpoint_hash_mismatch(tmp_path):
+    output_dir = tmp_path / "output"
+    checkpoint = save_real_model(
+        output_dir / "checkpoints" / "model_100_g1.sb3", 100
+    )
+    write_wall_clock_state(output_dir, checkpoint, timestep=100)
+    checkpoint.write_bytes(checkpoint.read_bytes() + b"changed")
+    train_module.write_run_config(output_dir, complete_config())
+
+    with pytest.raises(ValueError, match="SHA256"):
+        train_module.resolve_resume_path(
+            wall_clock_args(checkpoint), output_dir, complete_config()
+        )
+
+
+def test_wall_clock_resume_rejects_stored_timestep_mismatch(tmp_path):
+    output_dir = tmp_path / "output"
+    checkpoint = save_real_model(
+        output_dir / "checkpoints" / "model_100_g1.sb3", 100
+    )
+    write_wall_clock_state(output_dir, checkpoint, timestep=99)
+    train_module.write_run_config(output_dir, complete_config())
+
+    with pytest.raises(ValueError, match="state checkpoint timestep 99.*archive 100"):
+        train_module.resolve_resume_path(
+            wall_clock_args(checkpoint), output_dir, complete_config()
+        )
+
+
+def test_wall_clock_mode_rejects_broad_auto_resume(tmp_path):
+    with pytest.raises(ValueError, match="auto-resume.*wall-clock"):
+        train_module.resolve_resume_path(
+            wall_clock_args(None, auto_resume=True),
+            tmp_path,
+            complete_config(),
+        )
+
+
+def test_wall_clock_state_requires_explicit_exact_resume_archive(tmp_path):
+    output_dir = tmp_path / "output"
+    checkpoint = save_real_model(
+        output_dir / "checkpoints" / "model_100_g1.sb3", 100
+    )
+    write_wall_clock_state(output_dir, checkpoint, timestep=100)
+    train_module.write_run_config(output_dir, complete_config())
+
+    with pytest.raises(ValueError, match="--resume-from"):
+        train_module.resolve_resume_path(
+            wall_clock_args(None), output_dir, complete_config()
+        )
+
+
 class TrainResumeCliTest(unittest.TestCase):
     @staticmethod
     def _run_config(observation_schema_version=3):
@@ -634,6 +762,36 @@ class TrainResumeCliTest(unittest.TestCase):
             ".\\data\\fixed_eval_scenarios.json",
             captured["eval_scenarios"],
         )
+
+    def test_wall_clock_arguments_are_accepted(self):
+        captured = {}
+
+        def fake_train(args):
+            captured.update(vars(args))
+
+        argv = [
+            "train.py",
+            "--max-training-seconds",
+            "10800",
+            "--wall-clock-state",
+            ".\\output\\run_state.json",
+            "--wall-clock-heartbeat-seconds",
+            "300",
+            "--comparison-config-sha256",
+            "a" * 64,
+        ]
+
+        with patch.object(sys, "argv", argv), patch.object(
+            train_module, "train", fake_train
+        ):
+            train_module.main()
+
+        self.assertEqual(10_800, captured["max_training_seconds"])
+        self.assertEqual(
+            ".\\output\\run_state.json", captured["wall_clock_state"]
+        )
+        self.assertEqual(300, captured["wall_clock_heartbeat_seconds"])
+        self.assertEqual("a" * 64, captured["comparison_config_sha256"])
 
     def test_obsolete_future_cli_argument_is_rejected(self):
         with (
