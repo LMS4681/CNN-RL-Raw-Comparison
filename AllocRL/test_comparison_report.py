@@ -349,3 +349,26 @@ def test_common_numeric_fields_are_finite(tmp_path, field, value):
     with path.open(encoding="utf-8",newline="") as s: rows=list(csv.DictReader(s))
     rows[0][field]=value; _write_csv(path,rows)
     with pytest.raises(ValueError): build_comparison_summary(tmp_path)
+
+
+def test_partial_failure_text_cannot_inject_markdown_or_html(tmp_path):
+    from comparison.report_builder import write_partial_report
+    failure = "[click](https://example.invalid) ![img](https://example.invalid/x) # heading **bold** ``` <script>alert(1)</script>\nnext"
+    text = write_partial_report(tmp_path, failure).read_text("utf-8")
+    assert "<pre><code>" in text and "</code></pre>" in text and "&lt;script&gt;alert" in text and "&lt;/script&gt;" in text
+    for unsafe in ("[click](https://example.invalid)", "![img](https://example.invalid/x)", "# heading", "```", "<script>"):
+        assert unsafe not in text
+    assert "click" in text and "heading" in text and "\ufffd" not in text
+
+
+def test_holdout_plot_closes_figure_when_first_bar_raises(tmp_path, monkeypatch):
+    import matplotlib.pyplot as plt
+    from matplotlib.axes import Axes
+    from comparison import report_builder
+    write_complete_fixture(tmp_path)
+    summary = report_builder.build_comparison_summary(tmp_path); pairs = report_builder.build_paired_differences(tmp_path)
+    before = set(plt.get_fignums())
+    monkeypatch.setattr(Axes, "bar", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("bar")))
+    with pytest.raises(RuntimeError, match="bar"):
+        report_builder._holdout_plot(summary, pairs, tmp_path / "x.png")
+    assert set(plt.get_fignums()) == before

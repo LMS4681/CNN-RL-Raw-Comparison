@@ -470,7 +470,9 @@ def write_partial_report(root: str | Path, failure: str) -> Path:
         except ValueError:
             journal_text = "stage metadata: invalid metadata"
     state = "후보 CNN 결과가 없어 우열을 결론내리지 않음" if raw_ok and not cnn_ok else ("raw-direct 결과가 없어 비교를 결론내리지 않음" if cnn_ok and not raw_ok else ("두 arm 모두 없어서 비교를 결론내리지 않음" if not raw_ok and not cnn_ok else "두 arm 자료는 있으나 무결성 또는 보고 단계가 불완전하여 결론내리지 않음"))
-    safe_failure = html.escape(failure).replace("`", "&#96;")
+    markdown_tokens = {token: f"&#{ord(token)};" for token in "`[]()!#*"}
+    safe_failure = "".join(markdown_tokens.get(char, char) for char in failure)
+    safe_failure = html.escape(safe_failure)
     text = f"# 부분 비교 보고서\n\n실패 원인:\n<pre><code>{safe_failure}</code></pre>\n\n사용 가능 단계: raw-direct runtime={'있음' if raw_ok else '없음'}, candidate-CNN runtime={'있음' if cnn_ok else '없음'}.\n{journal_text}\n\n{state}. 누락 수치는 {MISSING}이며 0 또는 추정값으로 대체하지 않는다. 같은 output_root로 같은 experiment runner/notebook을 다시 실행하여 검증 완료 stage를 건너뛰고 재개한다.\n"
     path = base / "comparison" / "PARTIAL_REPORT.md"; path.parent.mkdir(parents=True, exist_ok=True); path.write_text(text, encoding="utf-8", newline="\n")
     return path
