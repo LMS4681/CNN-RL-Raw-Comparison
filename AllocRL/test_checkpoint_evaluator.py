@@ -173,8 +173,10 @@ def test_evaluate_checkpoint_labels_rows_and_writes_partitions(tmp_path, monkeyp
     assert {row["evaluation_partition"] for row in rows if row["seed"] == 1005} == {"primary_test"}
 
     all_path, primary_path = evaluator.write_arm_evaluations(tmp_path, "raw_direct", rows)
-    assert len(list(csv.DictReader(all_path.open(encoding="utf-8")))) == 20
-    assert [int(row["seed"]) for row in csv.DictReader(primary_path.open(encoding="utf-8"))] == list(range(1005, 1020))
+    with all_path.open(encoding="utf-8") as stream:
+        assert len(list(csv.DictReader(stream))) == 20
+    with primary_path.open(encoding="utf-8") as stream:
+        assert [int(row["seed"]) for row in csv.DictReader(stream)] == list(range(1005, 1020))
 
 
 def test_manifest_checkpoint_entries_merge_without_fabricating_metadata(tmp_path):
@@ -203,7 +205,8 @@ def test_common_writer_rejects_incomplete_or_mismatched_pair(tmp_path):
                 "selection" if seed < 1005 else "primary_test",
             ))))
     evaluator.write_common_step_evaluation(tmp_path, list(reversed(rows)))
-    written = list(csv.DictReader((tmp_path / "comparison" / "common_step_evaluation.csv").open(encoding="utf-8")))
+    with (tmp_path / "comparison" / "common_step_evaluation.csv").open(encoding="utf-8") as stream:
+        written = list(csv.DictReader(stream))
     assert [(row["arm"], int(row["seed"])) for row in written] == [(arm, seed) for arm in evaluator.ARMS for seed in range(1000, 1020)]
     rows.pop()
     with pytest.raises(ValueError, match="holdout"):
@@ -275,7 +278,8 @@ def test_validated_rows_accepts_different_mapping_insertion_order(tmp_path):
         values = {"source":"x","policy":"raw_direct","seed":seed,"mean_reward":1.,"mean_terminal_score":1.,"mean_dropout_rate":0.,"mean_delay_days":0.,"mean_delayed_count":0.,"mean_retained_choice_ratio":1.,"arm":"raw_direct","checkpoint":"best_model","checkpoint_timestep":1,"checkpoint_sha256":"a"*64,"evaluation_partition":"selection" if seed < 1005 else "primary_test"}
         rows.append({key: values[key] for key in reversed(evaluator.EVALUATION_COLUMNS)})
     all_path, _ = evaluator.write_arm_evaluations(tmp_path, "raw_direct", list(reversed(rows)))
-    loaded = list(csv.DictReader(all_path.open(encoding="utf-8")))
+    with all_path.open(encoding="utf-8") as stream:
+        loaded = list(csv.DictReader(stream))
     assert list(loaded[0]) == list(evaluator.EVALUATION_COLUMNS)
     assert [int(row["seed"]) for row in loaded] == list(range(1000, 1020))
 
@@ -297,7 +301,8 @@ def test_evaluate_comparison_artifacts_writes_complete_paired_outputs_and_manife
     assert set(manifest["checkpoints"]) == set(evaluator.ARMS)
     expected = {arm: {name: {"path": f"{arm}/{name}.sb3", "label": ("final" if name == "final" else ("common_step" if name == "common" else "best_model")), "sha256": arm[0] * 64, "timestep": 10_000} for name in ("selected", "final", "common")} for arm in evaluator.ARMS}
     assert manifest["checkpoints"] == expected
-    assert len(list(csv.DictReader((root / "comparison" / "common_step_evaluation.csv").open(encoding="utf-8")))) == 40
+    with (root / "comparison" / "common_step_evaluation.csv").open(encoding="utf-8") as stream:
+        assert len(list(csv.DictReader(stream))) == 40
 
 
 def test_evaluate_comparison_artifacts_failure_does_not_partially_update_manifest(tmp_path, monkeypatch):
