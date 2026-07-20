@@ -8,6 +8,7 @@ specialist modules so a restart can verify rather than infer their state.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
@@ -30,7 +31,7 @@ from comparison.artifact_manifest import (
     sha256_file,
 )
 from comparison.checkpoint_evaluator import evaluate_comparison_artifacts
-from comparison.report_builder import JOURNAL_STAGES, JOURNAL_STATUSES, write_complete_report, write_partial_report
+from comparison.report_builder import PAIR_COLUMNS, JOURNAL_STAGES, JOURNAL_STATUSES, build_comparison_summary, build_paired_differences, write_complete_report, write_partial_report
 from comparison.wall_clock_callback import atomic_write_json, read_wall_clock_state, resolve_state_checkpoint
 from evaluation_scenarios import read_scenarios
 from holdout_model_selection import validate_fixed_holdout_scenarios
@@ -265,6 +266,77 @@ def _strict_json_line(line: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("environment segment must be a JSON object")
     return value
+
+
+_REPORT_ARTIFACTS = (
+    "summary.json", "scenario_paired_differences.csv", "learning_curves.png",
+    "holdout_comparison.png", "preliminary_comparison_ko.md",
+)
+
+
+def _validate_report_artifacts(root: Path) -> dict[str, str]:
+    """Rebuild report inputs and require byte-identical deterministic outputs."""
+    base = Path(root)
+    comparison = base / "comparison"
+    try:
+        summary = build_comparison_summary(base)
+        pairs = build_paired_differences(base)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, KeyError) as error:
+        raise ExperimentIntegrityError("report inputs no longer reconcile") from error
+    summary_path = comparison / "summary.json"
+    try:
+        summary_bytes = summary_path.read_bytes()
+        decoded_summary = summary_bytes.decode("utf-8")
+        persisted_summary = _strict_json_line(decoded_summary)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
+        raise ExperimentIntegrityError("summary.json is not strict canonical JSON") from error
+    expected_summary = _strict_json_line(_canonical(summary).decode("utf-8"))
+    if persisted_summary != expected_summary or summary_bytes != _canonical(summary):
+        raise ExperimentIntegrityError("summary.json differs from current canonical report inputs")
+
+    pairs_path = comparison / "scenario_paired_differences.csv"
+    try:
+        with pairs_path.open(encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if tuple(reader.fieldnames or ()) != PAIR_COLUMNS:
+                raise ValueError("paired CSV header differs")
+            rows = list(reader)
+    except (OSError, UnicodeDecodeError, csv.Error, ValueError) as error:
+        raise ExperimentIntegrityError("paired-difference CSV is invalid") from error
+    if len(rows) != 15:
+        raise ExperimentIntegrityError("paired-difference CSV must have exactly 15 rows")
+    normalized: list[dict[str, Any]] = []
+    try:
+        for expected_seed, row in zip(range(1005, 1020), rows):
+            if set(row) != set(PAIR_COLUMNS) or row["seed"] != str(expected_seed):
+                raise ValueError("paired CSV seed order differs")
+            parsed = {"seed": expected_seed}
+            for field in PAIR_COLUMNS[1:]:
+                value = float(row[field])
+                if not math.isfinite(value):
+                    raise ValueError("paired CSV value is non-finite")
+                parsed[field] = value
+            normalized.append(parsed)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ExperimentIntegrityError("paired-difference CSV rows are invalid") from error
+    if normalized != pairs:
+        raise ExperimentIntegrityError("paired-difference CSV differs from current report inputs")
+
+    for name in ("learning_curves.png", "holdout_comparison.png"):
+        path = comparison / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+            raise ExperimentIntegrityError(f"missing report artifact: {name}")
+    markdown = comparison / "preliminary_comparison_ko.md"
+    try:
+        text = markdown.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ExperimentIntegrityError("Korean report is not valid UTF-8") from error
+    if not text.strip() or "\ufffd" in text or "seed 0" not in text or "primary_test" not in text:
+        raise ExperimentIntegrityError("Korean report lacks required preliminary limitations")
+    try:
+        return {name: sha256_file(comparison / name) for name in _REPORT_ARTIFACTS}
+    except OSError as error:
+        raise ExperimentIntegrityError("report artifact disappeared during verification") from error
 
 
 def _validate_environment_segments(
@@ -599,9 +671,55 @@ class _Runner:
             if not self._state_complete(self.root/arm,state): raise ExperimentIntegrityError("incomplete arm")
         _validate_environment_segments(self.root, environment, provenance, production_loaded=self.config.production_loaded)
         _validate_checkpoint_manifest(self.root, manifest, self.archive_reader)
-        for path in (self.root/"comparison"/"summary.json", self.root/"comparison"/"scenario_paired_differences.csv", self.root/"comparison"/"learning_curves.png", self.root/"comparison"/"holdout_comparison.png", self.root/"comparison"/"preliminary_comparison_ko.md"):
-            if not path.is_file() or path.stat().st_size == 0: raise ExperimentIntegrityError(f"missing report artifact: {path.name}")
-        atomic_write_json(self.root/"integrity_verification.json", {"manifest_sha256": sha256_file(self.root / "manifest.json"), "verified_at_utc": _utc()})
+        reports = _validate_report_artifacts(self.root)
+        atomic_write_json(self.root/"integrity_verification.json", {
+            "schema_version": 1, "manifest_sha256": sha256_file(self.root / "manifest.json"),
+            "environment_sha256": sha256_file(self.root / "environment.json"),
+            "report_artifact_sha256": reports, "verified_at_utc": _utc(),
+        })
+
+    def _verify_completion_journal(self) -> dict[str, dict[str, Any]]:
+        raw = _json(self.journal_path)
+        if set(raw) != set(JOURNAL_STAGES):
+            raise ExperimentIntegrityError("completion requires an exact complete stage journal")
+        journal = self.journal()
+        for stage in JOURNAL_STAGES:
+            entry = journal[stage]
+            if entry["status"] != "complete" or entry["output_sha256"] != self.output_hash(stage):
+                raise ExperimentIntegrityError("completion journal output hash is stale")
+            if entry["input_sha256"] != self.input_hash(stage, journal):
+                raise ExperimentIntegrityError("completion journal input chain is stale")
+        return journal
+
+    def _complete_marker(self) -> dict[str, Any]:
+        journal = self._verify_completion_journal()
+        stage_hashes = {stage: journal[stage]["output_sha256"] for stage in JOURNAL_STAGES}
+        if self._injected_output_hasher is not None:
+            provenance = {
+                "config_sha256": self.config.config_sha256, "baseline_sha256": self.config.baseline_commit,
+                "scenario_sha256": self.config.fixed_scenarios_sha256, "split_sha256": self.config.split_manifest_sha256,
+                "lock_sha256": "0" * 64, "comparison_git_sha": "0" * 40,
+            }
+            report_hashes = {name: canonical_json_sha256({"test_artifact": name}) for name in _REPORT_ARTIFACTS}
+            manifest_hash = canonical_json_sha256({"test": "manifest"})
+            environment_hash = canonical_json_sha256({"test": "environment"})
+        else:
+            provenance = self.provenance()
+            manifest = _json(self.root / "manifest.json"); environment = _json(self.root / "environment.json")
+            _validate_root_environment(environment, provenance, production_loaded=self.config.production_loaded)
+            _validate_root_manifest(manifest, provenance, environment)
+            report_hashes = _validate_report_artifacts(self.root)
+            manifest_hash, environment_hash = sha256_file(self.root / "manifest.json"), sha256_file(self.root / "environment.json")
+            provenance = {**provenance, "comparison_git_sha": environment["comparison_git_sha"]}
+        return {
+            "schema_version": 1, "status": "complete", "stages": REQUIRED_COMPLETE_STAGES,
+            "config_sha256": provenance["config_sha256"], "baseline_sha256": provenance["baseline_sha256"],
+            "scenario_sha256": provenance["scenario_sha256"], "split_sha256": provenance["split_sha256"],
+            "lock_sha256": provenance["lock_sha256"], "comparison_git_sha": provenance["comparison_git_sha"],
+            "manifest_sha256": manifest_hash, "environment_sha256": environment_hash,
+            "stage_output_sha256": stage_hashes, "report_artifact_sha256": report_hashes,
+            "completed_at_utc": _utc(),
+        }
 
 
 def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_root: str | Path, *, subprocess_runner: Callable[..., Any] = subprocess.run, clock: Callable[[], float] = time.monotonic, python_executable: str | None = None, archive_timestep_reader: Callable[[Path], int | None] | None = None, runner_command: Sequence[str] | None = None, stale_takeover: bool = False, lease_interval_seconds: float = 60, lease_stale_seconds: float = 900, stage_actions: Mapping[str, Callable[[], None]] | None = None, stage_output_hashers: Mapping[str, Callable[[], str]] | None = None) -> None:
@@ -612,16 +730,20 @@ def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_
     root=Path(output_root).resolve(); root.mkdir(parents=True,exist_ok=True); runner=_Runner(config,root,subprocess_runner=subprocess_runner,clock=clock,python_executable=python_executable,archive_timestep_reader=archive_timestep_reader,output_hasher=(lambda name: stage_output_hashers[name]()) if stage_output_hashers else None,runner_command=runner_command)
     lease = _Lease(root,stale_takeover=stale_takeover,clock=clock,interval=lease_interval_seconds,stale_after=lease_stale_seconds)
     runner.lease = lease
+    complete_path = root / "COMPLETE.json"
     try:
         with lease:
+            complete_path.unlink(missing_ok=True)
             actions = stage_actions or {"preflight":runner.preflight,"smoke_raw_direct":lambda: runner.smoke("raw_direct"),"smoke_candidate_cnn":lambda: runner.smoke("candidate_cnn"),"train_raw_direct":lambda: runner.train("raw_direct"),"evaluate_raw_direct":lambda: runner.evaluate_arm("raw_direct"),"train_candidate_cnn":lambda: runner.train("candidate_cnn"),"evaluate_candidate_cnn":lambda: runner.evaluate_arm("candidate_cnn"),"evaluate_common_step":runner.common_evaluation,"build_report":lambda: write_complete_report(root),"integrity_verification":runner.integrity}
             for stage in JOURNAL_STAGES: runner.run_stage(stage, actions[stage])
         # A refresh error raised by __exit__ prevents publication.  The marker
         # is deliberately outside the lease context so it never claims a run
         # complete while its ownership heartbeat is uncertain.
-        atomic_write_json(root/"COMPLETE.json",{"status":"complete","stages":REQUIRED_COMPLETE_STAGES})
+        atomic_write_json(complete_path, runner._complete_marker())
     except BaseException as error:
         if lease.acquired:
+            try: complete_path.unlink(missing_ok=True)
+            except OSError: pass
             try: write_partial_report(root,f"{type(error).__name__}: {error}")
             except BaseException: pass
         raise

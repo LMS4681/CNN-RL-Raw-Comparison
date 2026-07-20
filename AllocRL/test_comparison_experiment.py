@@ -474,6 +474,7 @@ def test_run_entrypoint_orders_both_smokes_before_raw_training(tmp_path: Path, m
     monkeypatch.setattr(runner_module, "write_complete_report", lambda root: None)
     monkeypatch.setattr(runner_module._Runner, "integrity", lambda self: None)
     monkeypatch.setattr(runner_module._Runner, "provenance", lambda self: {"lock_sha256": "a" * 64})
+    monkeypatch.setattr(runner_module._Runner, "_complete_marker", lambda self: {"status": "test"})
     runner_module.run_overnight_experiment(config, tmp_path, lease_interval_seconds=999)
     assert observed == list(runner_module.JOURNAL_STAGES)
     assert observed.index("smoke_candidate_cnn") < observed.index("train_raw_direct")
@@ -687,3 +688,84 @@ def test_blocked_owner_cannot_overwrite_or_delete_stolen_lease(tmp_path: Path):
     release.set(); worker.join(2)
     assert errors and isinstance(errors[0], LeaseError) and not (tmp_path / "COMPLETE.json").exists()
     assert json.loads((tmp_path / "lease.json").read_text())["token"] == "new-token" and (tmp_path / ".lease.acquire").read_text(encoding="utf-8").strip() == "new-token"
+
+
+def _report_integrity_fixture(tmp_path: Path):
+    from test_comparison_report import write_complete_fixture
+    from comparison.report_builder import write_complete_report
+    write_complete_fixture(tmp_path); write_complete_report(tmp_path)
+    return tmp_path / "comparison"
+
+
+def test_report_integrity_validator_requires_current_canonical_summary_and_pairs(tmp_path: Path):
+    from comparison import experiment_runner as runner_module
+    comparison = _report_integrity_fixture(tmp_path)
+    hashes = runner_module._validate_report_artifacts(tmp_path)
+    assert set(hashes) == {"summary.json", "scenario_paired_differences.csv", "learning_curves.png", "holdout_comparison.png", "preliminary_comparison_ko.md"}
+    assert all(len(value) == 64 for value in hashes.values())
+    (comparison / "summary.json").write_text('{"stale":true}\n', encoding="utf-8")
+    with pytest.raises(runner_module.ExperimentIntegrityError): runner_module._validate_report_artifacts(tmp_path)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda path: path.write_text("wrong,header\n1005,0\n", encoding="utf-8"),
+    lambda path: path.write_text(path.read_text(encoding="utf-8").replace("1005", "999", 1), encoding="utf-8"),
+    lambda path: path.write_text(path.read_text(encoding="utf-8").replace("0.09999999999999998", "nan"), encoding="utf-8"),
+])
+def test_report_integrity_validator_rejects_paired_csv_tampering(tmp_path: Path, mutation):
+    from comparison import experiment_runner as runner_module
+    comparison = _report_integrity_fixture(tmp_path); mutation(comparison / "scenario_paired_differences.csv")
+    with pytest.raises(runner_module.ExperimentIntegrityError): runner_module._validate_report_artifacts(tmp_path)
+
+
+@pytest.mark.parametrize("name,payload", [("learning_curves.png", None), ("holdout_comparison.png", b""), ("preliminary_comparison_ko.md", b"\xff"), ("preliminary_comparison_ko.md", b"seed 0\n\xef\xbf\xbd")])
+def test_report_integrity_validator_rejects_missing_or_invalid_rendered_artifacts(tmp_path: Path, name: str, payload: bytes | None):
+    from comparison import experiment_runner as runner_module
+    comparison = _report_integrity_fixture(tmp_path); path = comparison / name
+    if payload is None: path.unlink()
+    else: path.write_bytes(payload)
+    with pytest.raises(runner_module.ExperimentIntegrityError): runner_module._validate_report_artifacts(tmp_path)
+
+
+@pytest.mark.parametrize("relative", ["raw_direct/runtime_metrics.json", "raw_direct/evaluation_scenarios.csv", "manifest.json"])
+def test_report_integrity_validator_detects_post_report_input_changes(tmp_path: Path, relative: str):
+    from comparison import experiment_runner as runner_module
+    _report_integrity_fixture(tmp_path); path = tmp_path / relative
+    if path.suffix == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if relative.endswith("runtime_metrics.json"): payload["end_to_end_training_seconds"] += 1
+        else: payload["provenance"] = {"changed": True}
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    else: path.write_text(path.read_text(encoding="utf-8").replace("0.4", "0.41", 1), encoding="utf-8")
+    with pytest.raises(runner_module.ExperimentIntegrityError): runner_module._validate_report_artifacts(tmp_path)
+
+
+def test_public_marker_has_exact_provenance_and_stage_hash_schema(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, JOURNAL_STAGES, REQUIRED_COMPLETE_STAGES, run_overnight_experiment
+    calls, actions, hashers = _public_harness(); run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    marker = json.loads((tmp_path / "COMPLETE.json").read_text(encoding="utf-8"))
+    assert set(marker) == {"schema_version", "status", "stages", "config_sha256", "baseline_sha256", "scenario_sha256", "split_sha256", "lock_sha256", "comparison_git_sha", "manifest_sha256", "environment_sha256", "stage_output_sha256", "report_artifact_sha256", "completed_at_utc"}
+    assert marker["schema_version"] == 1 and marker["status"] == "complete" and marker["stages"] == REQUIRED_COMPLETE_STAGES
+    assert marker["stage_output_sha256"] == {stage: hashers[stage]() for stage in JOURNAL_STAGES}
+
+
+def test_owned_failure_removes_an_old_complete_marker_before_stages(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentStageError, ExperimentConfig, run_overnight_experiment
+    (tmp_path / "COMPLETE.json").write_text('{"old":true}', encoding="utf-8")
+    calls, actions, hashers = _public_harness(); actions["smoke_raw_direct"] = lambda: (_ for _ in ()).throw(RuntimeError("stop"))
+    with pytest.raises(ExperimentStageError): run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    assert not (tmp_path / "COMPLETE.json").exists()
+
+
+def test_complete_marker_write_failure_leaves_no_marker_and_writes_partial(tmp_path: Path, monkeypatch):
+    from comparison import experiment_runner as runner_module
+
+    original = runner_module.atomic_write_json
+    def fail_marker(path, payload):
+        if Path(path).name == "COMPLETE.json": raise OSError("marker write failed")
+        return original(path, payload)
+    monkeypatch.setattr(runner_module, "atomic_write_json", fail_marker)
+    calls, actions, hashers = _public_harness()
+    with pytest.raises(OSError, match="marker write failed"):
+        runner_module.run_overnight_experiment(runner_module.ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    assert not (tmp_path / "COMPLETE.json").exists() and (tmp_path / "comparison" / "PARTIAL_REPORT.md").is_file()
