@@ -208,3 +208,51 @@ def test_common_writer_rejects_incomplete_or_mismatched_pair(tmp_path):
     rows.pop()
     with pytest.raises(ValueError, match="holdout"):
         evaluator.write_common_step_evaluation(tmp_path, rows)
+
+
+def test_inventory_does_not_restat_disappearing_prior_duplicate(tmp_path, monkeypatch):
+    from comparison import checkpoint_evaluator as evaluator
+
+    older = _checkpoint(tmp_path, "older.sb3", 10_000)
+    newer = _checkpoint(tmp_path, "newer.sb3", 10_000)
+    now = time.time(); os.utime(older, (now - 60, now - 60)); os.utime(newer, (now + 60, now + 60))
+    monkeypatch.setattr(evaluator, "_archive_timestep", lambda *_: 10_000)
+    monkeypatch.setattr(evaluator, "sha256_file", lambda path: "a" * 64)
+    original_stat = Path.stat
+    calls = {older: 0}
+    def stat(path, *args, **kwargs):
+        if path == older:
+            calls[older] += 1
+            if calls[older] > 1:
+                raise FileNotFoundError(path)
+        return original_stat(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "stat", stat)
+    assert evaluator.readable_checkpoint_inventory(tmp_path)[10_000] == newer
+    assert calls[older] == 1
+
+
+def test_best_hash_race_falls_back_to_verified_state(tmp_path, monkeypatch):
+    from comparison import checkpoint_evaluator as evaluator
+
+    best = tmp_path / "best_model.sb3"; best.write_bytes(b"best")
+    final = _checkpoint(tmp_path, "final.sb3", 60_000)
+    (tmp_path / "holdout_selection.csv").write_text("timestep,mean_terminal_score,mean_dropout_rate,mean_delay_days,is_best\n50000,1,0,0,1\n", encoding="utf-8")
+    monkeypatch.setattr(evaluator, "_archive_timestep", lambda path, loader: 50_000 if path == best else 60_000)
+    monkeypatch.setattr(evaluator, "read_wall_clock_state", lambda _: SimpleNamespace(status="complete", last_checkpoint_timestep=60_000, last_checkpoint_sha256=_sha256(final)))
+    monkeypatch.setattr(evaluator, "resolve_state_checkpoint", lambda *_: final)
+    original_hash = evaluator.sha256_file
+    monkeypatch.setattr(evaluator, "sha256_file", lambda path: (_ for _ in ()).throw(FileNotFoundError(path)) if path == best else original_hash(path))
+    assert evaluator.resolve_selected_or_fallback(tmp_path).path == final
+
+
+def test_common_selection_passes_custom_loader_to_inventory(tmp_path, monkeypatch):
+    from comparison import checkpoint_evaluator as evaluator
+    raw = _checkpoint(tmp_path / "raw", "raw.sb3", 10_000).parents[1]
+    cnn = _checkpoint(tmp_path / "cnn", "cnn.sb3", 10_000).parents[1]
+    seen = []
+    def reader(path, loader):
+        seen.append(loader); return 10_000
+    marker = object()
+    monkeypatch.setattr(evaluator, "_archive_timestep", reader)
+    assert evaluator.select_common_timestep(raw, cnn, model_loader=marker) == 10_000
+    assert seen == [marker, marker]
