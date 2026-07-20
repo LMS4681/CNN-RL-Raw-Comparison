@@ -1260,6 +1260,7 @@ $pattern = '(' + ($secretPatternParts -join '|') + ')'
 $hitFiles = git grep -l -I -E $pattern HEAD
 if ($LASTEXITCODE -eq 0) { $hitFiles; exit 1 }
 if ($LASTEXITCODE -ne 1) { exit $LASTEXITCODE }
+exit 0
 ```
 
 Expected: exit 0 with no matches. Confirm that the same owner already publishes the inherited `AllocRL/data` snapshot in the baseline repository; if its public authorization has changed, stop rather than pushing data.

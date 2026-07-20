@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -173,6 +175,70 @@ def test_publication_secret_gate_does_not_match_itself_or_print_secret_values():
     assert "$pattern = '(' + ($secretPatternParts -join '|') + ')'" in plan
     assert "git grep -l -I -E $pattern HEAD" in plan
     assert "git grep -n -I -E" not in plan
+
+
+def test_publication_secret_gate_exits_zero_in_a_clean_repository(tmp_path):
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if powershell is None:
+        import pytest
+
+        pytest.skip("PowerShell is not installed")
+
+    plan = PLAN_PATH.read_text(encoding="utf-8")
+    match = re.search(
+        r"Run this tracked-content secret gate before any public push:\s*"
+        r"```powershell\r?\n(?P<source>.*?)\r?\n```",
+        plan,
+        re.DOTALL,
+    )
+    assert match is not None
+
+    repository = tmp_path / "clean-repository"
+    repository.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Publication Test"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "publication-test@example.invalid"],
+        cwd=repository,
+        check=True,
+    )
+    (repository / "README.md").write_text("clean\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "--quiet", "-m", "test fixture"],
+        cwd=repository,
+        check=True,
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert status.stdout == ""
+
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            match["source"],
+        ],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
 
 
 def test_comparison_lock_is_checked_out_as_canonical_lf_bytes():
