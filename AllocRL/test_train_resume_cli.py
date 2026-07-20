@@ -163,6 +163,7 @@ def save_real_model(path: Path, timesteps: int) -> Path:
     )
     try:
         model.num_timesteps = timesteps
+        path.parent.mkdir(parents=True, exist_ok=True)
         model.save(path)
     finally:
         env = model.get_env()
