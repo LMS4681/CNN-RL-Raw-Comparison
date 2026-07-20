@@ -55,6 +55,96 @@ def _text_loader(path, **_kwargs):
     return SimpleNamespace(num_timesteps=_text_timestep(Path(path)))
 
 
+def _evaluation_rows(
+    arm: str,
+    *,
+    checkpoint: str = "best_model",
+    timestep: int = 50_000,
+    digest: str | None = None,
+) -> list[dict]:
+    from comparison.checkpoint_evaluator import EVALUATION_COLUMNS
+
+    checkpoint_digest = digest or (("a" if arm == "raw_direct" else "b") * 64)
+    return [
+        dict(
+            zip(
+                EVALUATION_COLUMNS,
+                (
+                    "holdout_fixed20",
+                    arm,
+                    seed,
+                    1.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    arm,
+                    checkpoint,
+                    timestep,
+                    checkpoint_digest,
+                    "selection" if seed < 1005 else "primary_test",
+                ),
+            )
+        )
+        for seed in range(1000, 1020)
+    ]
+
+
+def _stub_training_evidence(
+    monkeypatch,
+    evaluator,
+    arm_root: Path,
+    selected,
+    final,
+    *,
+    selection_outcome: str = "best_model",
+    fallback_reason: str | None = None,
+):
+    runtime_path = arm_root / "runtime_metrics.json"
+    receipt_path = arm_root / "training_completion.json"
+    runtime = {
+        "selected_checkpoint_timestep": selected.timestep,
+        "selection_count": 5 if selection_outcome == "best_model" else 0,
+        "selection_tuple": [1.0, 0.0, 0.0]
+        if selection_outcome == "best_model"
+        else None,
+        "selection_outcome": selection_outcome,
+        "fallback_reason": fallback_reason,
+        "checkpoint_identity": {
+            "filename": selected.path.name,
+            "sha256": selected.sha256,
+        },
+    }
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    receipt = {
+        "config_sha256": "c" * 64,
+        "final_timestep": final.timestep,
+        "checkpoint_file": final.path.name,
+        "checkpoint_sha256": final.sha256,
+        "artifact_sha256": {
+            "runtime_metrics.json": _sha256(runtime_path),
+            "best_model.sb3": (
+                selected.sha256 if selection_outcome == "best_model" else None
+            ),
+        },
+    }
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    monkeypatch.setattr(
+        evaluator,
+        "read_runtime_metrics",
+        lambda _path: runtime,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "read_training_completion",
+        lambda _path: receipt,
+        raising=False,
+    )
+    return runtime, receipt
+
+
 def test_selection_decision_records_verified_best_provenance(tmp_path):
     from comparison import checkpoint_evaluator as evaluator
 
@@ -480,6 +570,583 @@ def test_validated_rows_accepts_different_mapping_insertion_order(tmp_path):
         loaded = list(csv.DictReader(stream))
     assert list(loaded[0]) == list(evaluator.EVALUATION_COLUMNS)
     assert [int(row["seed"]) for row in loaded] == list(range(1000, 1020))
+
+
+def test_evaluate_arm_artifacts_publishes_csv_manifest_then_exact_marker(
+    tmp_path, monkeypatch
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root = tmp_path.resolve()
+    arm = "raw_direct"
+    arm_root = root / arm
+    arm_root.mkdir()
+    selected_path = arm_root / "best_model.sb3"
+    final_path = arm_root / "checkpoints" / "final.sb3"
+    selected_path.write_bytes(b"selected")
+    final_path.parent.mkdir()
+    final_path.write_bytes(b"final")
+    selected = evaluator.CheckpointRef(
+        selected_path, "best_model", 50_000, _sha256(selected_path)
+    )
+    final = evaluator.CheckpointRef(
+        final_path, "final", 60_000, _sha256(final_path)
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_archive_timestep",
+        lambda path, _loader: (
+            selected.timestep if Path(path) == selected_path else final.timestep
+        ),
+    )
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sentinel": True,
+                "checkpoints": {"candidate_cnn": {"sentinel": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        evaluator, "resolve_final_checkpoint", lambda *_args, **_kwargs: final
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "resolve_selection_decision",
+        lambda *_args, **_kwargs: evaluator.SelectionDecision(
+            selected, "best_model", None, 5, [1.0, 0.0, 0.0]
+        ),
+    )
+    runtime, receipt = _stub_training_evidence(
+        monkeypatch, evaluator, arm_root, selected, final
+    )
+    calls = []
+
+    def fake_evaluate(path, config, scenarios, label, received_arm, model_loader):
+        calls.append(
+            (path, dict(config), list(scenarios), label, received_arm, model_loader)
+        )
+        return _evaluation_rows(
+            arm,
+            checkpoint="best_model",
+            timestep=selected.timestep,
+            digest=selected.sha256,
+        )
+
+    monkeypatch.setattr(evaluator, "evaluate_checkpoint", fake_evaluate)
+    scenarios = [{"seed": seed} for seed in range(1000, 1020)]
+    marker = evaluator.evaluate_arm_artifacts(
+        root,
+        arm,
+        scenarios,
+        {"run": "config"},
+        config_sha256="c" * 64,
+        scenario_sha256="d" * 64,
+        model_loader="loader",
+    )
+
+    assert calls == [
+        (
+            selected_path,
+            {"run": "config"},
+            scenarios,
+            "best_model",
+            arm,
+            "loader",
+        )
+    ]
+    with (arm_root / "evaluation_scenarios.csv").open(
+        encoding="utf-8", newline=""
+    ) as stream:
+        assert len(list(csv.DictReader(stream))) == 20
+    with (arm_root / "evaluation_primary_test.csv").open(
+        encoding="utf-8", newline=""
+    ) as stream:
+        assert [int(row["seed"]) for row in csv.DictReader(stream)] == list(
+            range(1005, 1020)
+        )
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["sentinel"] is True
+    assert manifest["checkpoints"]["candidate_cnn"] == {"sentinel": True}
+    assert set(manifest["checkpoints"][arm]) == {"selected", "final"}
+    expected_marker = {
+        "schema_version": 1,
+        "arm": arm,
+        "config_sha256": "c" * 64,
+        "scenario_sha256": "d" * 64,
+        "checkpoints": manifest["checkpoints"][arm],
+        "artifacts": {
+            "evaluation_scenarios.csv": _sha256(
+                arm_root / "evaluation_scenarios.csv"
+            ),
+            "evaluation_primary_test.csv": _sha256(
+                arm_root / "evaluation_primary_test.csv"
+            ),
+            "training_completion.json": _sha256(
+                arm_root / "training_completion.json"
+            ),
+            "runtime_metrics.json": _sha256(
+                arm_root / "runtime_metrics.json"
+            ),
+        },
+        "evaluation_seed_count": 20,
+        "primary_test_seed_count": 15,
+        "selection_outcome": "best_model",
+        "fallback_reason": None,
+    }
+    assert marker == expected_marker
+    assert json.loads(
+        (arm_root / "evaluation_stage.json").read_text(encoding="utf-8")
+    ) == expected_marker
+    assert evaluator.validate_arm_evaluation_stage(
+        root,
+        arm,
+        expected_config_sha256="c" * 64,
+        expected_scenario_sha256="d" * 64,
+    ) == expected_marker
+    calls.clear()
+    assert evaluator.evaluate_arm_artifacts(
+        root,
+        arm,
+        scenarios,
+        {"run": "config"},
+        config_sha256="c" * 64,
+        scenario_sha256="d" * 64,
+        model_loader="loader",
+    ) == expected_marker
+    assert calls == []
+    runtime["selected_checkpoint_timestep"] += 1
+    runtime_path = arm_root / "runtime_metrics.json"
+    receipt_path = arm_root / "training_completion.json"
+    runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+    receipt["artifact_sha256"]["runtime_metrics.json"] = _sha256(runtime_path)
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    forged_marker = json.loads(json.dumps(expected_marker))
+    forged_marker["artifacts"]["runtime_metrics.json"] = _sha256(runtime_path)
+    forged_marker["artifacts"]["training_completion.json"] = _sha256(
+        receipt_path
+    )
+    (arm_root / "evaluation_stage.json").write_text(
+        json.dumps(forged_marker), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="runtime selected fields"):
+        evaluator.validate_arm_evaluation_stage(root, arm)
+
+
+def test_evaluate_arm_artifacts_failure_invalidates_old_marker(tmp_path, monkeypatch):
+    from comparison import checkpoint_evaluator as evaluator
+
+    arm_root = tmp_path / "raw_direct"
+    arm_root.mkdir()
+    marker = arm_root / "evaluation_stage.json"
+    marker.write_text('{"stale":true}', encoding="utf-8")
+    (tmp_path / "manifest.json").write_text('{"schema_version":1}', encoding="utf-8")
+    monkeypatch.setattr(
+        evaluator,
+        "resolve_final_checkpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            evaluator.PartialResultError("evaluation failed")
+        ),
+    )
+
+    with pytest.raises(evaluator.PartialResultError, match="evaluation failed"):
+        evaluator.evaluate_arm_artifacts(
+            tmp_path,
+            "raw_direct",
+            [{"seed": seed} for seed in range(1000, 1020)],
+            {},
+            config_sha256="c" * 64,
+            scenario_sha256="d" * 64,
+        )
+    assert not marker.exists()
+
+
+def test_evaluate_arm_marker_is_not_trusted_after_csv_or_manifest_tamper(
+    tmp_path, monkeypatch
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root = tmp_path.resolve()
+    arm_root = root / "raw_direct"
+    arm_root.mkdir()
+    selected_path = arm_root / "best_model.sb3"
+    final_path = arm_root / "checkpoints" / "final.sb3"
+    selected_path.write_bytes(b"selected")
+    final_path.parent.mkdir()
+    final_path.write_bytes(b"final")
+    selected = evaluator.CheckpointRef(
+        selected_path, "best_model", 50_000, _sha256(selected_path)
+    )
+    final = evaluator.CheckpointRef(final_path, "final", 60_000, _sha256(final_path))
+    monkeypatch.setattr(
+        evaluator,
+        "_archive_timestep",
+        lambda path, _loader: (
+            selected.timestep if Path(path) == selected_path else final.timestep
+        ),
+    )
+    (root / "manifest.json").write_text(
+        '{"schema_version":1,"checkpoints":{}}', encoding="utf-8"
+    )
+    monkeypatch.setattr(evaluator, "resolve_final_checkpoint", lambda *_a, **_k: final)
+    monkeypatch.setattr(
+        evaluator,
+        "resolve_selection_decision",
+        lambda *_a, **_k: evaluator.SelectionDecision(
+            selected, "best_model", None, 5, [1.0, 0.0, 0.0]
+        ),
+    )
+    _stub_training_evidence(monkeypatch, evaluator, arm_root, selected, final)
+    monkeypatch.setattr(
+        evaluator,
+        "evaluate_checkpoint",
+        lambda *_a, **_k: _evaluation_rows(
+            "raw_direct",
+            checkpoint="best_model",
+            timestep=selected.timestep,
+            digest=selected.sha256,
+        ),
+    )
+    evaluator.evaluate_arm_artifacts(
+        root,
+        "raw_direct",
+        [{"seed": seed} for seed in range(1000, 1020)],
+        {},
+        config_sha256="c" * 64,
+        scenario_sha256="d" * 64,
+    )
+
+    csv_path = arm_root / "evaluation_scenarios.csv"
+    original_csv = csv_path.read_bytes()
+    csv_path.write_bytes(original_csv + b"tamper")
+    with pytest.raises(ValueError, match="evaluation artifact hash"):
+        evaluator.validate_arm_evaluation_stage(root, "raw_direct")
+    csv_path.write_bytes(original_csv)
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["checkpoints"]["raw_direct"]["common"] = {
+        "path": "raw_direct/checkpoints/common.sb3",
+        "label": "common_step",
+        "sha256": "f" * 64,
+        "timestep": 40_000,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert evaluator.validate_arm_evaluation_stage(root, "raw_direct")["arm"] == (
+        "raw_direct"
+    )
+    manifest["checkpoints"]["raw_direct"]["selected"]["timestep"] += 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="evaluation checkpoint manifest"):
+        evaluator.validate_arm_evaluation_stage(root, "raw_direct")
+
+
+def test_evaluate_arm_marker_write_failure_leaves_no_trusted_marker(
+    tmp_path, monkeypatch
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root = tmp_path.resolve()
+    arm_root = root / "raw_direct"
+    arm_root.mkdir()
+    selected_path = arm_root / "best_model.sb3"
+    final_path = arm_root / "checkpoints" / "final.sb3"
+    selected_path.write_bytes(b"selected")
+    final_path.parent.mkdir()
+    final_path.write_bytes(b"final")
+    selected = evaluator.CheckpointRef(
+        selected_path, "best_model", 50_000, _sha256(selected_path)
+    )
+    final = evaluator.CheckpointRef(final_path, "final", 60_000, _sha256(final_path))
+    monkeypatch.setattr(
+        evaluator,
+        "_archive_timestep",
+        lambda path, _loader: (
+            selected.timestep if Path(path) == selected_path else final.timestep
+        ),
+    )
+    (root / "manifest.json").write_text(
+        '{"schema_version":1,"checkpoints":{}}', encoding="utf-8"
+    )
+    (arm_root / "evaluation_stage.json").write_text("stale", encoding="utf-8")
+    monkeypatch.setattr(evaluator, "resolve_final_checkpoint", lambda *_a, **_k: final)
+    monkeypatch.setattr(
+        evaluator,
+        "resolve_selection_decision",
+        lambda *_a, **_k: evaluator.SelectionDecision(
+            selected, "best_model", None, 5, [1.0, 0.0, 0.0]
+        ),
+    )
+    _stub_training_evidence(monkeypatch, evaluator, arm_root, selected, final)
+    monkeypatch.setattr(
+        evaluator,
+        "evaluate_checkpoint",
+        lambda *_a, **_k: _evaluation_rows(
+            "raw_direct",
+            checkpoint="best_model",
+            timestep=selected.timestep,
+            digest=selected.sha256,
+        ),
+    )
+    original_atomic_write_json = evaluator.atomic_write_json
+
+    def fail_marker(path, payload):
+        if Path(path).name == "evaluation_stage.json":
+            raise OSError("marker replace failed")
+        return original_atomic_write_json(path, payload)
+
+    monkeypatch.setattr(evaluator, "atomic_write_json", fail_marker)
+    with pytest.raises(OSError, match="marker replace failed"):
+        evaluator.evaluate_arm_artifacts(
+            root,
+            "raw_direct",
+            [{"seed": seed} for seed in range(1000, 1020)],
+            {},
+            config_sha256="c" * 64,
+            scenario_sha256="d" * 64,
+        )
+    assert not (arm_root / "evaluation_stage.json").exists()
+
+
+def test_evaluate_arm_rejects_rows_not_bound_to_resolved_selected_checkpoint(
+    tmp_path, monkeypatch
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root = tmp_path.resolve()
+    arm_root = root / "raw_direct"
+    arm_root.mkdir()
+    selected_path = arm_root / "best_model.sb3"
+    final_path = arm_root / "checkpoints" / "final.sb3"
+    selected_path.write_bytes(b"selected")
+    final_path.parent.mkdir()
+    final_path.write_bytes(b"final")
+    selected = evaluator.CheckpointRef(
+        selected_path, "best_model", 50_000, _sha256(selected_path)
+    )
+    final = evaluator.CheckpointRef(final_path, "final", 60_000, _sha256(final_path))
+    monkeypatch.setattr(
+        evaluator,
+        "_archive_timestep",
+        lambda path, _loader: (
+            selected.timestep if Path(path) == selected_path else final.timestep
+        ),
+    )
+    (root / "manifest.json").write_text(
+        '{"schema_version":1,"checkpoints":{}}', encoding="utf-8"
+    )
+    monkeypatch.setattr(evaluator, "resolve_final_checkpoint", lambda *_a, **_k: final)
+    monkeypatch.setattr(
+        evaluator,
+        "resolve_selection_decision",
+        lambda *_a, **_k: evaluator.SelectionDecision(
+            selected, "best_model", None, 5, [1.0, 0.0, 0.0]
+        ),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "evaluate_checkpoint",
+        lambda *_a, **_k: _evaluation_rows(
+            "raw_direct",
+            checkpoint="best_model",
+            timestep=selected.timestep,
+            digest="0" * 64,
+        ),
+    )
+
+    with pytest.raises(evaluator.PartialResultError, match="selected checkpoint"):
+        evaluator.evaluate_arm_artifacts(
+            root,
+            "raw_direct",
+            [{"seed": seed} for seed in range(1000, 1020)],
+            {},
+            config_sha256="c" * 64,
+            scenario_sha256="d" * 64,
+        )
+    assert not (arm_root / "evaluation_stage.json").exists()
+    assert not (arm_root / "evaluation_scenarios.csv").exists()
+
+
+def test_second_atomic_csv_replace_failure_preserves_complete_files_without_marker(
+    tmp_path, monkeypatch
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root = tmp_path.resolve()
+    arm_root = root / "raw_direct"
+    arm_root.mkdir()
+    selected_path = arm_root / "best_model.sb3"
+    final_path = arm_root / "checkpoints" / "final.sb3"
+    selected_path.write_bytes(b"selected")
+    final_path.parent.mkdir()
+    final_path.write_bytes(b"final")
+    selected = evaluator.CheckpointRef(
+        selected_path, "best_model", 50_000, _sha256(selected_path)
+    )
+    final = evaluator.CheckpointRef(final_path, "final", 60_000, _sha256(final_path))
+    monkeypatch.setattr(
+        evaluator,
+        "_archive_timestep",
+        lambda path, _loader: (
+            selected.timestep if Path(path) == selected_path else final.timestep
+        ),
+    )
+    (root / "manifest.json").write_text(
+        '{"schema_version":1,"checkpoints":{}}', encoding="utf-8"
+    )
+    old_rows = _evaluation_rows(
+        "raw_direct",
+        checkpoint="best_model",
+        timestep=selected.timestep,
+        digest=selected.sha256,
+    )
+    for row in old_rows:
+        row["mean_reward"] = 0.0
+    evaluator.write_arm_evaluations(root, "raw_direct", old_rows)
+    old_primary = (arm_root / "evaluation_primary_test.csv").read_bytes()
+    (arm_root / "evaluation_stage.json").write_text("stale", encoding="utf-8")
+    monkeypatch.setattr(evaluator, "resolve_final_checkpoint", lambda *_a, **_k: final)
+    monkeypatch.setattr(
+        evaluator,
+        "resolve_selection_decision",
+        lambda *_a, **_k: evaluator.SelectionDecision(
+            selected, "best_model", None, 5, [1.0, 0.0, 0.0]
+        ),
+    )
+    _stub_training_evidence(monkeypatch, evaluator, arm_root, selected, final)
+    monkeypatch.setattr(
+        evaluator,
+        "evaluate_checkpoint",
+        lambda *_a, **_k: _evaluation_rows(
+            "raw_direct",
+            checkpoint="best_model",
+            timestep=selected.timestep,
+            digest=selected.sha256,
+        ),
+    )
+    original_replace = evaluator.os.replace
+
+    def fail_primary(source, destination):
+        if Path(destination).name == "evaluation_primary_test.csv":
+            raise OSError("second CSV replace failed")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(evaluator.os, "replace", fail_primary)
+    with pytest.raises(OSError, match="second CSV replace failed"):
+        evaluator.evaluate_arm_artifacts(
+            root,
+            "raw_direct",
+            [{"seed": seed} for seed in range(1000, 1020)],
+            {},
+            config_sha256="c" * 64,
+            scenario_sha256="d" * 64,
+        )
+
+    assert not (arm_root / "evaluation_stage.json").exists()
+    assert (arm_root / "evaluation_primary_test.csv").read_bytes() == old_primary
+    for name, count in (
+        ("evaluation_scenarios.csv", 20),
+        ("evaluation_primary_test.csv", 15),
+    ):
+        with (arm_root / name).open(encoding="utf-8", newline="") as stream:
+            assert len(list(csv.DictReader(stream))) == count
+    assert not list(arm_root.glob(".*.tmp"))
+
+
+def test_selected_checkpoint_symlink_inside_arm_is_rejected_before_model_load(
+    tmp_path,
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    arm_root = tmp_path / "raw_direct"
+    arm_root.mkdir()
+    target = arm_root / "real_best.sb3"
+    target.write_bytes(b"checkpoint:50000")
+    link = arm_root / "best_model.sb3"
+    try:
+        os.symlink(target, link)
+    except OSError as error:
+        pytest.skip(f"symlink unavailable: {error}")
+    reference = evaluator.CheckpointRef(
+        link, "best_model", 50_000, _sha256(target)
+    )
+    loads = []
+
+    def loader(*args, **kwargs):
+        loads.append((args, kwargs))
+        return SimpleNamespace(num_timesteps=50_000)
+
+    with pytest.raises(evaluator.PartialResultError, match="regular"):
+        evaluator._stable_checkpoint_reference(
+            reference, arm_root, model_loader=loader
+        )
+    assert loads == []
+
+
+def test_arm_marker_validator_checks_actual_checkpoint_timestep(
+    tmp_path, monkeypatch
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root = tmp_path.resolve()
+    arm_root = root / "raw_direct"
+    checkpoints = arm_root / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    selected_path = arm_root / "best_model.sb3"
+    final_path = checkpoints / "final.sb3"
+    selected_path.write_bytes(b"selected")
+    final_path.write_bytes(b"final")
+    selected = evaluator.CheckpointRef(
+        selected_path, "best_model", 50_000, _sha256(selected_path)
+    )
+    final = evaluator.CheckpointRef(final_path, "final", 60_000, _sha256(final_path))
+    monkeypatch.setattr(
+        evaluator,
+        "_archive_timestep",
+        lambda path, _loader: (
+            selected.timestep if Path(path) == selected_path else final.timestep
+        ),
+    )
+    (root / "manifest.json").write_text(
+        '{"schema_version":1,"checkpoints":{}}', encoding="utf-8"
+    )
+    _stub_training_evidence(monkeypatch, evaluator, arm_root, selected, final)
+    monkeypatch.setattr(evaluator, "resolve_final_checkpoint", lambda *_a, **_k: final)
+    monkeypatch.setattr(
+        evaluator,
+        "resolve_selection_decision",
+        lambda *_a, **_k: evaluator.SelectionDecision(
+            selected, "best_model", None, 5, [1.0, 0.0, 0.0]
+        ),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "evaluate_checkpoint",
+        lambda *_a, **_k: _evaluation_rows(
+            "raw_direct",
+            checkpoint="best_model",
+            timestep=selected.timestep,
+            digest=selected.sha256,
+        ),
+    )
+    evaluator.evaluate_arm_artifacts(
+        root,
+        "raw_direct",
+        [{"seed": seed} for seed in range(1000, 1020)],
+        {},
+        config_sha256="c" * 64,
+        scenario_sha256="d" * 64,
+    )
+
+    with pytest.raises(ValueError, match="checkpoint timestep"):
+        evaluator.validate_arm_evaluation_stage(
+            root,
+            "raw_direct",
+            archive_timestep_reader=lambda path: (
+                49_999 if Path(path).name == "best_model.sb3" else 60_000
+            ),
+        )
 
 
 def test_evaluate_comparison_artifacts_writes_complete_paired_outputs_and_manifest(tmp_path, monkeypatch):

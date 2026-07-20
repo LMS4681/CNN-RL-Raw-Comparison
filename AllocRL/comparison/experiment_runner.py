@@ -33,7 +33,11 @@ from comparison.artifact_manifest import (
     read_json_object,
     sha256_file,
 )
-from comparison.checkpoint_evaluator import evaluate_comparison_artifacts
+from comparison.checkpoint_evaluator import (
+    evaluate_arm_artifacts,
+    evaluate_comparison_artifacts,
+    validate_arm_evaluation_stage,
+)
 from comparison.report_builder import PAIR_COLUMNS, JOURNAL_STAGES, JOURNAL_STATUSES, build_comparison_summary, build_paired_differences, write_complete_report, write_partial_report
 from comparison.wall_clock_callback import atomic_write_json, read_wall_clock_state, resolve_state_checkpoint
 from comparison.training_completion import validate_training_completion
@@ -677,6 +681,17 @@ class _Runner:
             self._training_completion(root)
             return sha256_file(root / "training_completion.json")
         if name.startswith("evaluate_") and name != "evaluate_common_step":
+            arm = name.removeprefix("evaluate_")
+            from train import model_num_timesteps
+            validate_arm_evaluation_stage(
+                self.root,
+                arm,
+                expected_config_sha256=self.config.config_sha256,
+                expected_scenario_sha256=self.config.fixed_scenarios_sha256,
+                archive_timestep_reader=(
+                    self.archive_reader or model_num_timesteps
+                ),
+            )
             return sha256_file(self.stage_path(name))
         if name == "evaluate_common_step":
             manifest = _json(self.root / "manifest.json")
@@ -779,12 +794,48 @@ class _Runner:
             raise ExperimentStageError("smoke subprocess did not produce a readable requested-timestep archive")
         atomic_write_json(marker,{"arm":arm,"config_sha256":self.config.config_sha256,"path":archive.name,"sha256":sha256_file(archive),"timestep":timestep})
     def evaluate_arm(self, arm: str) -> None:
-        # The paired evaluator is the sole authority for selected/final CSVs;
-        # this ordered stage proves the arm's complete state before CNN starts.
         self._training_completion(self.root / arm)
         state=read_wall_clock_state(self.root/arm/"run_state.json")
         if not self._state_complete(self.root/arm,state): raise ExperimentIntegrityError("arm cannot be evaluated before a complete verified state")
-        atomic_write_json(self.root/arm/"evaluation_stage.json",{"arm":arm,"checkpoint":state.last_checkpoint_file,"sha256":state.last_checkpoint_sha256,"timestep":state.last_checkpoint_timestep})
+        provenance = self.provenance()
+        scenarios = read_scenarios(_allocrl_dir() / self.config.scenario_path)
+        run_config = _json(self.root / arm / "run_config.json")
+        evaluate_arm_artifacts(
+            self.root,
+            arm,
+            scenarios,
+            run_config,
+            config_sha256=provenance["config_sha256"],
+            scenario_sha256=provenance["scenario_sha256"],
+        )
+    def refresh_raw_partial(self) -> Path:
+        """Publish the honest raw-only handoff before CNN training begins."""
+        from train import model_num_timesteps
+        validate_arm_evaluation_stage(
+            self.root,
+            "raw_direct",
+            expected_config_sha256=self.config.config_sha256,
+            expected_scenario_sha256=self.config.fixed_scenarios_sha256,
+            archive_timestep_reader=(
+                self.archive_reader or model_num_timesteps
+            ),
+        )
+        path = write_partial_report(
+            self.root,
+            "raw-direct evaluation complete; candidate-CNN training pending",
+        )
+        expected = self.root / "comparison" / "PARTIAL_REPORT.md"
+        if path != expected or not path.is_file():
+            raise ExperimentIntegrityError("raw partial report was not published")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            raise ExperimentIntegrityError("raw partial report is unreadable") from error
+        if "raw-direct runtime=있음" not in text:
+            raise ExperimentIntegrityError(
+                "raw partial report does not identify trusted raw artifacts"
+            )
+        return path
     def train(self, arm: str) -> None:
         root=self.root/arm; root.mkdir(parents=True,exist_ok=True); resume=None
         # A restarted process may legitimately skip the preflight journal entry;
@@ -927,7 +978,21 @@ def run_overnight_experiment(config_path: str | Path | ExperimentConfig, output_
             complete_path.unlink(missing_ok=True)
             actions = stage_actions or {"preflight":runner.preflight,"smoke_raw_direct":lambda: runner.smoke("raw_direct"),"smoke_candidate_cnn":lambda: runner.smoke("candidate_cnn"),"train_raw_direct":lambda: runner.train("raw_direct"),"evaluate_raw_direct":lambda: runner.evaluate_arm("raw_direct"),"train_candidate_cnn":lambda: runner.train("candidate_cnn"),"evaluate_candidate_cnn":lambda: runner.evaluate_arm("candidate_cnn"),"evaluate_common_step":runner.common_evaluation,"build_report":lambda: write_complete_report(root),"integrity_verification":runner.integrity}
             try:
-                for stage in JOURNAL_STAGES: runner.run_stage(stage, actions[stage])
+                for stage in JOURNAL_STAGES:
+                    runner.run_stage(stage, actions[stage])
+                    if stage == "evaluate_raw_direct":
+                        if stage_actions is None:
+                            runner.refresh_raw_partial()
+                        else:
+                            partial = write_partial_report(
+                                root,
+                                "raw-direct evaluation complete; "
+                                "candidate-CNN training pending",
+                            )
+                            if not partial.is_file():
+                                raise ExperimentIntegrityError(
+                                    "raw partial report was not published"
+                                )
                 lease.quiesce()
                 marker = runner._complete_marker()
                 lease.assert_owned()

@@ -582,6 +582,7 @@ def test_run_entrypoint_orders_both_smokes_before_raw_training(tmp_path: Path, m
     monkeypatch.setattr(runner_module._Runner, "common_evaluation", lambda self: None)
     monkeypatch.setattr(runner_module, "write_complete_report", lambda root: None)
     monkeypatch.setattr(runner_module._Runner, "integrity", lambda self: None)
+    monkeypatch.setattr(runner_module._Runner, "refresh_raw_partial", lambda self: None)
     monkeypatch.setattr(runner_module._Runner, "provenance", lambda self: {"lock_sha256": "a" * 64})
     monkeypatch.setattr(runner_module._Runner, "_complete_marker", lambda self: {"status": "test"})
     runner_module.run_overnight_experiment(config, tmp_path, lease_interval_seconds=999)
@@ -623,6 +624,104 @@ def test_common_evaluation_uses_configured_checkpoint_interval(tmp_path: Path, m
     )
     assert captured["args"][3] == records
     assert captured["kwargs"]["regular_interval"] == config.checkpoint_freq
+
+
+def test_evaluate_arm_runs_selected_checkpoint_evaluation_with_locked_inputs(
+    tmp_path: Path, monkeypatch
+):
+    from comparison import experiment_runner as runner_module
+
+    config = runner_module.ExperimentConfig.for_test(
+        target_training_seconds_per_arm=10
+    )
+    output_root = tmp_path / "output"
+    arm_root = output_root / "raw_direct"
+    _write_runner_state(arm_root, config, target=10, seconds=10)
+    (arm_root / "run_config.json").write_text(
+        json.dumps({"locked": "config"}), encoding="utf-8"
+    )
+    scenarios = [{"seed": seed} for seed in range(1000, 1020)]
+    base = tmp_path / "allocrl"
+    scenario_path = base / config.scenario_path
+    scenario_path.parent.mkdir(parents=True)
+    scenario_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(runner_module, "_allocrl_dir", lambda: base)
+    monkeypatch.setattr(runner_module, "read_scenarios", lambda _path: scenarios)
+    captured = {}
+
+    def evaluate(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(runner_module, "evaluate_arm_artifacts", evaluate)
+    runner = runner_module._Runner(
+        config,
+        output_root,
+        subprocess_runner=lambda *_args, **_kwargs: None,
+        clock=lambda: 0,
+        python_executable="python",
+        archive_timestep_reader=lambda _path: 7,
+    )
+    monkeypatch.setattr(runner, "_training_completion", lambda _root: {})
+    monkeypatch.setattr(
+        runner,
+        "provenance",
+        lambda: {
+            "baseline_sha256": "a" * 40,
+            "config_sha256": config.config_sha256,
+            "scenario_sha256": "c" * 64,
+            "split_sha256": "d" * 64,
+            "lock_sha256": "e" * 64,
+        },
+    )
+
+    runner.evaluate_arm("raw_direct")
+
+    assert captured["args"] == (
+        output_root,
+        "raw_direct",
+        scenarios,
+        {"locked": "config"},
+    )
+    assert captured["kwargs"]["config_sha256"] == config.config_sha256
+    assert captured["kwargs"]["scenario_sha256"] == "c" * 64
+
+
+def test_evaluate_arm_output_hash_revalidates_bound_csvs(
+    tmp_path: Path, monkeypatch
+):
+    from comparison import experiment_runner as runner_module
+
+    config = runner_module.ExperimentConfig.for_test()
+    runner = runner_module._Runner(
+        config,
+        tmp_path,
+        subprocess_runner=lambda *_args, **_kwargs: None,
+        clock=lambda: 0,
+        python_executable="python",
+        archive_timestep_reader=None,
+    )
+    marker = tmp_path / "raw_direct" / "evaluation_stage.json"
+    marker.parent.mkdir()
+    marker.write_bytes(b"marker")
+    seen = []
+    monkeypatch.setattr(
+        runner_module,
+        "validate_arm_evaluation_stage",
+        lambda root, arm, **kwargs: seen.append((root, arm, kwargs)),
+    )
+
+    digest = runner.output_hash("evaluate_raw_direct")
+
+    assert digest == hashlib.sha256(b"marker").hexdigest()
+    assert len(seen) == 1
+    assert seen[0][0:2] == (tmp_path, "raw_direct")
+    assert seen[0][2]["expected_config_sha256"] == config.config_sha256
+    assert (
+        seen[0][2]["expected_scenario_sha256"]
+        == config.fixed_scenarios_sha256
+    )
+    assert callable(seen[0][2]["archive_timestep_reader"])
 
 
 def test_runner_boot_id_is_the_manifest_boot_id_source():
@@ -917,6 +1016,90 @@ def test_public_stage_harness_completes_once_then_skips_every_action(tmp_path: P
     assert calls == before and json.loads((tmp_path / "lease.json").read_text())["status"] == "released"
 
 
+def test_refresh_raw_partial_requires_trusted_raw_and_preserves_its_artifacts(
+    tmp_path: Path,
+):
+    from test_comparison_report import write_complete_fixture
+    from comparison.experiment_runner import ExperimentConfig, _Runner
+
+    write_complete_fixture(tmp_path)
+    (tmp_path / "candidate_cnn" / "evaluation_stage.json").unlink()
+    config = replace(
+        ExperimentConfig.for_test(),
+        config_sha256="b" * 64,
+        fixed_scenarios_sha256="c" * 64,
+    )
+    runner = _Runner(
+        config,
+        tmp_path,
+        subprocess_runner=lambda *_args, **_kwargs: None,
+        clock=lambda: 0,
+        python_executable="python",
+        archive_timestep_reader=lambda _path: 50_000,
+    )
+    before = {
+        name: (tmp_path / "raw_direct" / name).read_bytes()
+        for name in (
+            "evaluation_scenarios.csv",
+            "evaluation_primary_test.csv",
+            "evaluation_stage.json",
+        )
+    }
+
+    partial = runner.refresh_raw_partial()
+
+    assert "raw-direct runtime=있음" in partial.read_text(encoding="utf-8")
+    assert {
+        name: (tmp_path / "raw_direct" / name).read_bytes()
+        for name in before
+    } == before
+
+
+def test_public_runner_refreshes_partial_between_raw_evaluation_and_cnn_training_even_when_skipped(
+    tmp_path: Path, monkeypatch
+):
+    from comparison import experiment_runner as runner_module
+
+    events = []
+    actions = {
+        stage: (lambda stage=stage: events.append(stage))
+        for stage in runner_module.JOURNAL_STAGES
+    }
+    hashers = {
+        stage: (lambda stage=stage: f"{runner_module.JOURNAL_STAGES.index(stage):064x}")
+        for stage in runner_module.JOURNAL_STAGES
+    }
+
+    def partial(root, failure):
+        events.append("partial")
+        path = Path(root) / "comparison" / "PARTIAL_REPORT.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(failure, encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(runner_module, "write_partial_report", partial)
+    config = runner_module.ExperimentConfig.for_test()
+    runner_module.run_overnight_experiment(
+        config,
+        tmp_path,
+        stage_actions=actions,
+        stage_output_hashers=hashers,
+        lease_interval_seconds=999,
+    )
+    assert events.index("evaluate_raw_direct") < events.index("partial")
+    assert events.index("partial") < events.index("train_candidate_cnn")
+
+    events.clear()
+    runner_module.run_overnight_experiment(
+        config,
+        tmp_path,
+        stage_actions=actions,
+        stage_output_hashers=hashers,
+        lease_interval_seconds=999,
+    )
+    assert events == ["partial"]
+
+
 def _public_harness():
     from comparison.experiment_runner import JOURNAL_STAGES
     calls = []
@@ -941,10 +1124,10 @@ def test_public_harness_interrupt_retries_only_interrupted_and_downstream(tmp_pa
 def test_public_harness_live_lease_refusal_does_not_mutate_root(tmp_path: Path):
     from comparison.experiment_runner import ExperimentConfig, LeaseError, run_overnight_experiment
     (tmp_path / "lease.json").write_text(json.dumps({"token":"owner","pid":1,"boot_id":"process-1","heartbeat_utc":"x","heartbeat_monotonic":0,"status":"active"}), encoding="utf-8")
-    (tmp_path / ".lease.acquire").write_text("owner\n", encoding="utf-8"); before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    (tmp_path / ".lease.acquire").write_text("owner\n", encoding="utf-8"); before = {path.relative_to(tmp_path).as_posix(): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
     calls, actions, hashers = _public_harness()
     with pytest.raises(LeaseError): run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
-    assert calls == [] and {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+    assert calls == [] and {path.relative_to(tmp_path).as_posix(): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
 
 
 def test_public_harness_uses_injected_wall_clock_for_fresh_orphan_refusal(tmp_path: Path):
@@ -1168,9 +1351,9 @@ def test_live_lease_refusal_preserves_existing_complete_and_root_bytes(tmp_path:
     calls, actions, hashers = _public_harness(); config = ExperimentConfig.for_test()
     run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
     (tmp_path / "lease.json").write_text(json.dumps({"token": "owner", "pid": 1, "boot_id": "process-1", "heartbeat_utc": "x", "heartbeat_monotonic": 0, "status": "active"}), encoding="utf-8")
-    (tmp_path / ".lease.acquire").write_text("owner\n", encoding="utf-8"); before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    (tmp_path / ".lease.acquire").write_text("owner\n", encoding="utf-8"); before = {path.relative_to(tmp_path).as_posix(): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
     with pytest.raises(LeaseError): run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
-    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+    assert {path.relative_to(tmp_path).as_posix(): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
 
 
 def test_active_foreign_windows_fallback_lease_needs_proven_stale_wall_heartbeat(tmp_path: Path):

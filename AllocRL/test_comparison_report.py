@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from pathlib import Path
 
@@ -17,13 +18,19 @@ def _json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
-def _rows(arm: str, scores: dict[int, tuple[float, float, float, float]], checkpoint: str = "best_model") -> list[dict]:
+def _rows(
+    arm: str,
+    scores: dict[int, tuple[float, float, float, float]],
+    checkpoint: str = "best_model",
+    checkpoint_sha256: str | None = None,
+) -> list[dict]:
     rows = []
     for seed in range(1000, 1020):
         score, dropout, delay, delayed = scores.get(seed, (0.1, 0.2, 5.0, 4.0))
         rows.append(dict(zip(EVALUATION_COLUMNS, (
             "holdout_fixed20", arm, seed, score, score, dropout, delay, delayed,
-            0.5, arm, checkpoint, 50_000, ("a" if arm == "raw_direct" else "b") * 64,
+            0.5, arm, checkpoint, 50_000,
+            checkpoint_sha256 or (("a" if arm == "raw_direct" else "b") * 64),
             "selection" if seed < 1005 else "primary_test",
         ))))
     return rows
@@ -36,16 +43,59 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         writer.writeheader(); writer.writerows(rows)
 
 
+def _write_evaluation_marker(root: Path, arm: str) -> None:
+    arm_root = root / arm
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    _json(
+        arm_root / "evaluation_stage.json",
+        {
+            "schema_version": 1,
+            "arm": arm,
+            "config_sha256": "b" * 64,
+            "scenario_sha256": "c" * 64,
+            "checkpoints": {
+                key: manifest["checkpoints"][arm][key]
+                for key in ("selected", "final")
+            },
+            "artifacts": {
+                name: hashlib.sha256((arm_root / name).read_bytes()).hexdigest()
+                for name in (
+                    "evaluation_scenarios.csv",
+                    "evaluation_primary_test.csv",
+                    "training_completion.json",
+                    "runtime_metrics.json",
+                )
+            },
+            "evaluation_seed_count": 20,
+            "primary_test_seed_count": 15,
+            "selection_outcome": "best_model",
+            "fallback_reason": None,
+        },
+    )
+
+
 def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary: float = 0.5) -> None:
+    selected_sha: dict[str, str] = {}
+    final_sha: dict[str, str] = {}
+    for arm in ("raw_direct", "candidate_cnn"):
+        arm_root = root / arm
+        arm_root.mkdir(parents=True, exist_ok=True)
+        selected_path = arm_root / "best_model.sb3"
+        final_path = arm_root / "checkpoints" / "model_50000_g1.sb3"
+        selected_path.write_bytes(f"{arm}:selected".encode("utf-8"))
+        final_path.parent.mkdir(exist_ok=True)
+        final_path.write_bytes(f"{arm}:final".encode("utf-8"))
+        selected_sha[arm] = hashlib.sha256(selected_path.read_bytes()).hexdigest()
+        final_sha[arm] = hashlib.sha256(final_path.read_bytes()).hexdigest()
     raw = {seed: (raw_primary, 0.10, 4.0, 3.0) for seed in range(1005, 1020)}
     cnn = {seed: (cnn_primary, 0.04, 2.5, 1.0) for seed in range(1005, 1020)}
     raw.update({seed: (0.99, 0.01, 1.0, 0.0) for seed in range(1000, 1005)})
     cnn.update({seed: (0.98, 0.02, 1.2, 0.1) for seed in range(1000, 1005)})
-    _write_csv(root / "raw_direct" / "evaluation_scenarios.csv", _rows("raw_direct", raw))
-    _write_csv(root / "raw_direct" / "evaluation_primary_test.csv", _rows("raw_direct", raw)[5:])
-    _write_csv(root / "candidate_cnn" / "evaluation_scenarios.csv", _rows("candidate_cnn", cnn))
-    _write_csv(root / "candidate_cnn" / "evaluation_primary_test.csv", _rows("candidate_cnn", cnn)[5:])
-    common = _rows("raw_direct", raw, "common_step") + _rows("candidate_cnn", cnn, "common_step")
+    _write_csv(root / "raw_direct" / "evaluation_scenarios.csv", _rows("raw_direct", raw, checkpoint_sha256=selected_sha["raw_direct"]))
+    _write_csv(root / "raw_direct" / "evaluation_primary_test.csv", _rows("raw_direct", raw, checkpoint_sha256=selected_sha["raw_direct"])[5:])
+    _write_csv(root / "candidate_cnn" / "evaluation_scenarios.csv", _rows("candidate_cnn", cnn, checkpoint_sha256=selected_sha["candidate_cnn"]))
+    _write_csv(root / "candidate_cnn" / "evaluation_primary_test.csv", _rows("candidate_cnn", cnn, checkpoint_sha256=selected_sha["candidate_cnn"])[5:])
+    common = _rows("raw_direct", raw, "common_step", selected_sha["raw_direct"]) + _rows("candidate_cnn", cnn, "common_step", selected_sha["candidate_cnn"])
     _write_csv(root / "comparison" / "common_step_evaluation.csv", common)
     for arm, total, feature in (("raw_direct", 100, 0), ("candidate_cnn", 200, 80)):
         _json(root / arm / "runtime_metrics.json", {
@@ -63,7 +113,7 @@ def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary:
             "selected_checkpoint_timestep": 50000, "selection_count": 5,
             "selection_tuple": [0.9, -0.1, -4.0],
             "selection_outcome": "best_model", "fallback_reason": None,
-            "checkpoint_identity": {"filename": "best_model.sb3", "sha256": ("a" if arm == "raw_direct" else "b") * 64},
+            "checkpoint_identity": {"filename": "best_model.sb3", "sha256": selected_sha[arm]},
         })
         _json(root / arm / "run_origin.json", {
             "schema_version": 1,
@@ -79,7 +129,7 @@ def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary:
             "last_checkpoint_timestep": 50000,
             "last_regular_checkpoint_timestep": 50000,
             "last_checkpoint_file": "model_50000_g1.sb3",
-            "last_checkpoint_sha256": "f" * 64,
+            "last_checkpoint_sha256": final_sha[arm],
             "config_sha256": "b" * 64,
             "generation": 1,
             "restart_count": 1,
@@ -95,11 +145,35 @@ def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary:
     checkpoints = {}
     for arm in ("raw_direct", "candidate_cnn"):
         checkpoints[arm] = {
-            "selected": {"path": f"{arm}/best_model.sb3", "label": "best_model", "sha256": ("a" if arm == "raw_direct" else "b") * 64, "timestep": 50000},
-            "final": {"path": f"{arm}/final.sb3", "label": "final", "sha256": "f" * 64, "timestep": 50000},
-            "common": {"path": f"{arm}/common.sb3", "label": "common_step", "sha256": ("a" if arm == "raw_direct" else "b") * 64, "timestep": 50000},
+            "selected": {"path": f"{arm}/best_model.sb3", "label": "best_model", "sha256": selected_sha[arm], "timestep": 50000},
+            "final": {"path": f"{arm}/checkpoints/model_50000_g1.sb3", "label": "final", "sha256": final_sha[arm], "timestep": 50000},
+            "common": {"path": f"{arm}/common.sb3", "label": "common_step", "sha256": selected_sha[arm], "timestep": 50000},
         }
     _json(root / "manifest.json", {"schema_version": 1, "checkpoints": checkpoints})
+    from comparison.training_completion import ARTIFACT_KEYS
+    for arm in ("raw_direct", "candidate_cnn"):
+        artifacts = {name: "0" * 64 for name in ARTIFACT_KEYS}
+        artifacts["runtime_metrics.json"] = hashlib.sha256(
+            (root / arm / "runtime_metrics.json").read_bytes()
+        ).hexdigest()
+        artifacts["best_model.sb3"] = selected_sha[arm]
+        _json(
+            root / arm / "training_completion.json",
+            {
+                "schema_version": 1,
+                "config_sha256": "b" * 64,
+                "generation": 1,
+                "final_timestep": 50000,
+                "checkpoint_file": "model_50000_g1.sb3",
+                "checkpoint_sha256": final_sha[arm],
+                "recorded_training_seconds": 10800.0,
+                "finalization_mode": "in_process",
+                "finalized_at_utc": "2026-07-21T03:01:40+00:00",
+                "artifact_sha256": artifacts,
+            },
+        )
+    for arm in ("raw_direct", "candidate_cnn"):
+        _write_evaluation_marker(root, arm)
     for arm in ("raw_direct", "candidate_cnn"):
         arm_root = root / arm
         (arm_root / "progress_timing.csv").write_text("generation,timestep,recorded_training_seconds,updated_at_utc,status,checkpoint_file\n1,50000,10800,2026-07-21T03:00:00+00:00,complete,model_50000_g1.sb3\n", encoding="utf-8")
@@ -151,12 +225,41 @@ def test_complete_report_is_deterministic_and_creates_nonempty_closed_plots(tmp_
 def test_missing_arm_creates_partial_not_complete_report(tmp_path):
     from comparison.report_builder import write_partial_report
     write_complete_fixture(tmp_path)
-    for path in (tmp_path / "candidate_cnn").glob("*"):
-        path.unlink()
+    raw_artifacts = {
+        name: (tmp_path / "raw_direct" / name).read_bytes()
+        for name in (
+            "evaluation_scenarios.csv",
+            "evaluation_primary_test.csv",
+            "evaluation_stage.json",
+        )
+    }
+    (tmp_path / "candidate_cnn" / "evaluation_stage.json").unlink()
     path = write_partial_report(tmp_path, failure="candidate runtime stopped")
     assert path.name == "PARTIAL_REPORT.md"
     assert not (tmp_path / "COMPLETE.json").exists()
     assert "후보 CNN 결과가 없어 우열을 결론내리지 않음" in path.read_text("utf-8")
+
+
+    assert {
+        name: (tmp_path / "raw_direct" / name).read_bytes()
+        for name in raw_artifacts
+    } == raw_artifacts
+
+
+def test_partial_report_rejects_orphan_evaluation_csvs_without_stage_marker(
+    tmp_path,
+):
+    from comparison.report_builder import write_partial_report
+
+    write_complete_fixture(tmp_path)
+    (tmp_path / "raw_direct" / "evaluation_stage.json").unlink()
+    (tmp_path / "candidate_cnn" / "evaluation_stage.json").unlink()
+
+    text = write_partial_report(tmp_path, "candidate training failed").read_text(
+        encoding="utf-8"
+    )
+
+    assert "raw-direct runtime=없음" in text
 
 
 def test_korean_report_is_utf8_and_has_no_replacement_character(tmp_path):
@@ -225,10 +328,11 @@ def test_dynamic_timings_fallback_and_partial_failure_safety(tmp_path):
     write_complete_fixture(tmp_path)
     for arm in ("raw_direct", "candidate_cnn"):
         path = tmp_path / arm / "runtime_metrics.json"; payload = json.loads(path.read_text(encoding="utf-8"))
-        payload.update({"target_training_seconds": 15.0, "recorded_training_seconds": 16.0, "run_wall_span_seconds": 18.0, "metrics_recorded_at_utc": "2026-07-21T00:00:18+00:00", "steps_per_second": 50000 / 16, "overrun_seconds": 1.0, "selection_count": 0, "selection_tuple": None, "selection_outcome": "fallback_final", "fallback_reason": "selection_not_run", "checkpoint_identity": {"filename": "fallback.sb3", "sha256": ("a" if arm == "raw_direct" else "b") * 64}})
+        manifest_path = tmp_path / "manifest.json"; manifest = json.loads(manifest_path.read_text(encoding="utf-8")); digest = manifest["checkpoints"][arm]["selected"]["sha256"]
+        payload.update({"target_training_seconds": 15.0, "recorded_training_seconds": 16.0, "run_wall_span_seconds": 18.0, "metrics_recorded_at_utc": "2026-07-21T00:00:18+00:00", "steps_per_second": 50000 / 16, "overrun_seconds": 1.0, "selection_count": 0, "selection_tuple": None, "selection_outcome": "fallback_final", "fallback_reason": "selection_not_run", "checkpoint_identity": {"filename": "fallback.sb3", "sha256": digest}})
         _json(path, payload)
         state_path = tmp_path / arm / "run_state.json"; state = json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds": 15.0, "completed_training_seconds": 16.0}); _json(state_path, state)
-        manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8")); manifest["checkpoints"][arm]["selected"].update({"path": f"{arm}/fallback.sb3", "label": "fallback_final"}); _json(tmp_path / "manifest.json", manifest)
+        manifest["checkpoints"][arm]["selected"].update({"path": f"{arm}/fallback.sb3", "label": "fallback_final"}); _json(manifest_path, manifest)
         for name in ("evaluation_scenarios.csv", "evaluation_primary_test.csv"):
             file = tmp_path / arm / name
             with file.open(encoding="utf-8", newline="") as stream: rows = list(csv.DictReader(stream))
@@ -297,7 +401,7 @@ def test_partial_report_uses_valid_artifact_groups_and_stage_journal(tmp_path, p
     from comparison.report_builder import write_partial_report
     write_complete_fixture(tmp_path)
     for arm in {"raw_direct", "candidate_cnn"} - set(present):
-        for path in (tmp_path / arm).glob("*"): path.unlink()
+        (tmp_path / arm / "evaluation_stage.json").unlink()
     _json(tmp_path / "stage_journal.json", {"preflight": {"status": "complete", "input_sha256": "a" * 64, "output_sha256": "b" * 64, "started_at_utc": "2026-01-01T00:00:00+00:00", "completed_at_utc": "2026-01-01T00:01:00+00:00", "error": None}, "train_candidate_cnn": {"status": "failed", "input_sha256": "a" * 64, "output_sha256": None, "started_at_utc": "2026-01-01T00:00:00+00:00", "completed_at_utc": "2026-01-01T00:01:00+00:00", "error": "bad"}})
     complete = tmp_path / "COMPLETE.json"; complete.write_text("sentinel", encoding="utf-8")
     text = write_partial_report(tmp_path, "<b>bad</b>\n[link]").read_text(encoding="utf-8")
@@ -392,12 +496,13 @@ def test_report_renders_all_actual_runtime_and_selection_fields(tmp_path):
     from comparison.report_builder import write_complete_report
     write_complete_fixture(tmp_path)
     for arm, tag, fallback in (("raw_direct", "11", False), ("candidate_cnn", "22", True)):
-        path = tmp_path / arm / "runtime_metrics.json"; p = json.loads(path.read_text("utf-8")); digest = ("a" if arm == "raw_direct" else "b") * 64
+        manifest_path = tmp_path / "manifest.json"; manifest=json.loads(manifest_path.read_text("utf-8")); digest = manifest["checkpoints"][arm]["selected"]["sha256"]
+        path = tmp_path / arm / "runtime_metrics.json"; p = json.loads(path.read_text("utf-8"))
         selected_step = int(tag) * 100 + 1
         p.update({"target_training_seconds": float(tag), "recorded_training_seconds": float(tag)+.1, "run_wall_span_seconds":float(tag)+.2, "metrics_recorded_at_utc":f"2026-07-21T00:00:{float(tag)+.2:04.1f}+00:00", "overrun_seconds":(float(tag)+.1)-float(tag), "restart_count":int(tag), "max_unrecorded_seconds":float(tag)+.4, "start_timestep":int(tag)*100, "end_timestep":selected_step, "steps_per_second":1/(float(tag)+.1), "evaluation_seconds":float(tag)+.6, "parameter_counts":{"total":int(tag)*10,"feature_extractor":int(tag),"policy":int(tag)*2,"value":int(tag)*7}, "peak_cuda_memory_bytes":int(tag)*1000, "selection_count":0 if fallback else 5, "selection_tuple":None if fallback else [1.1,2.2,3.3], "selection_outcome":"fallback_final" if fallback else "best_model", "fallback_reason":"selection_not_run" if fallback else None, "selected_checkpoint_timestep":selected_step, "checkpoint_identity":{"filename":"fallback.sb3" if fallback else "best_model.sb3","sha256":digest}}); _json(path,p)
         origin_path=tmp_path/arm/"run_origin.json"; origin=json.loads(origin_path.read_text("utf-8")); origin["initial_timestep"]=int(tag)*100; _json(origin_path,origin)
         state_path=tmp_path/arm/"run_state.json"; state=json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds":float(tag),"completed_training_seconds":float(tag)+.1,"restart_count":int(tag),"max_unrecorded_seconds":float(tag)+.4,"last_checkpoint_timestep":int(tag)*100+1}); _json(state_path,state)
-        manifest=json.loads((tmp_path/"manifest.json").read_text("utf-8")); manifest["checkpoints"][arm]["selected"].update({"label":"fallback_final" if fallback else "best_model","path":f"{arm}/{'fallback.sb3' if fallback else 'best_model.sb3'}","timestep":selected_step}); _json(tmp_path/"manifest.json",manifest)
+        manifest["checkpoints"][arm]["selected"].update({"label":"fallback_final" if fallback else "best_model","path":f"{arm}/{'fallback.sb3' if fallback else 'best_model.sb3'}","timestep":selected_step}); _json(manifest_path,manifest)
         for name in ("evaluation_scenarios.csv","evaluation_primary_test.csv"):
             file=tmp_path/arm/name
             with file.open(encoding="utf-8",newline="") as s: rows=list(csv.DictReader(s))

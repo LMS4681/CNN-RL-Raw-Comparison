@@ -25,7 +25,13 @@ from comparison.artifact_manifest import (
     read_run_origin,
     read_runtime_metrics,
 )
-from comparison.checkpoint_evaluator import ARMS, EVALUATION_COLUMNS, PRIMARY_TEST_SEEDS, SELECTION_SEEDS
+from comparison.checkpoint_evaluator import (
+    ARMS,
+    EVALUATION_COLUMNS,
+    PRIMARY_TEST_SEEDS,
+    SELECTION_SEEDS,
+    validate_arm_evaluation_stage,
+)
 from comparison.wall_clock_callback import read_progress_timing, read_wall_clock_state
 from comparison import training_log_validation
 
@@ -477,11 +483,12 @@ def write_partial_report(root: str | Path, failure: str) -> Path:
     base = Path(root)
     def valid_arm(arm: str) -> bool:
         try:
+            validate_arm_evaluation_stage(base, arm)
             _runtime(base / arm)
             _read_evaluation(base / arm / "evaluation_scenarios.csv", arm, tuple(range(1000, 1020)))
             _read_evaluation(base / arm / "evaluation_primary_test.csv", arm, PRIMARY_TEST_SEEDS)
             return True
-        except ValueError:
+        except (OSError, ValueError):
             return False
     raw_ok, cnn_ok = valid_arm("raw_direct"), valid_arm("candidate_cnn")
     journal_text = "stage metadata: absent"
