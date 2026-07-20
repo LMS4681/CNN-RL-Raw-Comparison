@@ -563,6 +563,49 @@ def test_run_entrypoint_orders_both_smokes_before_raw_training(tmp_path: Path, m
     assert observed.index("smoke_candidate_cnn") < observed.index("train_raw_direct")
 
 
+def test_common_evaluation_uses_configured_checkpoint_interval(tmp_path: Path, monkeypatch):
+    from comparison import experiment_runner as runner_module
+
+    config = runner_module.ExperimentConfig.for_test(checkpoint_freq=128)
+    records = [{"seed": 1000 + index} for index in range(20)]
+    scenario_path = tmp_path / config.scenario_path
+    scenario_path.parent.mkdir(parents=True, exist_ok=True)
+    scenario_path.write_text(json.dumps({"scenarios": records}), encoding="utf-8")
+    for arm in ("raw_direct", "candidate_cnn"):
+        directory = tmp_path / arm
+        directory.mkdir()
+        (directory / "run_config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(runner_module, "_allocrl_dir", lambda: tmp_path)
+    captured = {}
+    def evaluate(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+    monkeypatch.setattr(runner_module, "evaluate_comparison_artifacts", evaluate)
+    runner = runner_module._Runner(
+        config,
+        tmp_path,
+        subprocess_runner=lambda *_args, **_kwargs: None,
+        clock=lambda: 0,
+        python_executable="python",
+        archive_timestep_reader=None,
+    )
+    runner.common_evaluation()
+    assert captured["args"][:3] == (
+        tmp_path,
+        tmp_path / "raw_direct",
+        tmp_path / "candidate_cnn",
+    )
+    assert captured["args"][3] == records
+    assert captured["kwargs"]["regular_interval"] == config.checkpoint_freq
+
+
+def test_runner_boot_id_is_the_manifest_boot_id_source():
+    from comparison import artifact_manifest as manifest_module
+    from comparison import experiment_runner as runner_module
+
+    assert runner_module._boot_id is manifest_module._boot_id
+
+
 def _write_runner_state(root: Path, config, *, status="complete", target=10, seconds=10,
                         config_sha=None, checkpoint_bytes=b"state", timestep=7) -> Path:
     checkpoint = root / "checkpoints" / "model_7_g1.sb3"

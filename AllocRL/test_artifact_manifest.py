@@ -6,6 +6,7 @@ import pytest
 import torch.nn as nn
 from types import SimpleNamespace
 
+from comparison import artifact_manifest as artifact_manifest_module
 from comparison.artifact_manifest import (
     REQUIRED_ENVIRONMENT_KEYS,
     append_environment_segment,
@@ -56,6 +57,40 @@ def test_environment_manifest_contains_required_provenance(monkeypatch):
     assert manifest["command"] == ["python", "train.py"]
     assert manifest["vm_boot_id"]
     assert "gpu_uuid" in manifest
+
+
+def test_windows_boot_id_is_cached_and_independent_of_process_id(monkeypatch):
+    timestamp = "2026-07-21T01:02:03.4567890+00:00"
+    calls: list[list[str]] = []
+    monkeypatch.setattr(artifact_manifest_module.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(artifact_manifest_module, "_WINDOWS_BOOT_ID", None, raising=False)
+    monkeypatch.setattr(artifact_manifest_module.Path, "is_file", lambda _path: True)
+    monkeypatch.setattr(artifact_manifest_module.Path, "read_text", lambda *_args, **_kwargs: "linux-boot-id")
+    monkeypatch.setattr(
+        artifact_manifest_module,
+        "_run_text",
+        lambda command: (calls.append(list(command)), timestamp)[1],
+    )
+    monkeypatch.setattr(artifact_manifest_module.os, "getpid", lambda: 101)
+    first = artifact_manifest_module._boot_id()
+    monkeypatch.setattr(artifact_manifest_module.os, "getpid", lambda: 202)
+    second = artifact_manifest_module._boot_id()
+    assert first == second
+    assert first.startswith("windows-")
+    assert timestamp not in first
+    assert len(calls) == 1
+    assert calls[0][:3] == ["powershell.exe", "-NoProfile", "-NonInteractive"]
+
+
+@pytest.mark.parametrize("output", [None, "", "not-a-timestamp"])
+def test_windows_boot_id_fails_closed_when_boot_timestamp_is_unavailable_or_invalid(
+    monkeypatch, output
+):
+    monkeypatch.setattr(artifact_manifest_module.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(artifact_manifest_module, "_WINDOWS_BOOT_ID", None, raising=False)
+    monkeypatch.setattr(artifact_manifest_module, "_run_text", lambda _command: output)
+    with pytest.raises(RuntimeError, match="Windows boot timestamp"):
+        artifact_manifest_module._boot_id()
 
 
 def test_sha256_file_is_content_based(tmp_path):

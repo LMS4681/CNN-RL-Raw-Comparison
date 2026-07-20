@@ -26,6 +26,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from comparison.artifact_manifest import (
     REQUIRED_ENVIRONMENT_KEYS,
+    _boot_id,
     canonical_json_sha256,
     collect_environment,
     read_json_object,
@@ -575,11 +576,6 @@ class _Lease(AbstractContextManager["_Lease"]):
         self._unlink_sentinel_if_unchanged(snapshot)
 
 
-def _boot_id() -> str:
-    path=Path("/proc/sys/kernel/random/boot_id")
-    return path.read_text().strip() if path.is_file() else f"process-{os.getpid()}"
-
-
 class _Runner:
     def __init__(self, config: ExperimentConfig, root: Path, *, subprocess_runner: Callable[..., Any], clock: Callable[[], float], python_executable: str | None, archive_timestep_reader: Callable[[Path], int | None] | None, output_hasher: Callable[[str], str] | None = None, runner_command: Sequence[str] | None = None) -> None:
         command = list(sys.argv if runner_command is None else runner_command)
@@ -746,7 +742,7 @@ class _Runner:
         records=scenarios.get("scenarios",scenarios) if isinstance(scenarios,dict) else scenarios
         if not isinstance(records,list): raise ExperimentIntegrityError("fixed scenarios must be a list")
         raw_config=_json(self.root/"raw_direct"/"run_config.json"); cnn_config=_json(self.root/"candidate_cnn"/"run_config.json")
-        evaluate_comparison_artifacts(self.root,self.root/"raw_direct",self.root/"candidate_cnn",records,raw_config,cnn_config)
+        evaluate_comparison_artifacts(self.root,self.root/"raw_direct",self.root/"candidate_cnn",records,raw_config,cnn_config,regular_interval=self.config.checkpoint_freq)
     def _validate_integrity(self, *, write_record: bool) -> dict[str, Any]:
         provenance=self.provenance(); manifest=_json(self.root/"manifest.json"); environment=_json(self.root/"environment.json")
         _validate_root_environment(environment, provenance, production_loaded=self.config.production_loaded)

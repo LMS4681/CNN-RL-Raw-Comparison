@@ -48,6 +48,7 @@ REQUIRED_ENVIRONMENT_KEYS = frozenset(
 
 
 _URL_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s]+")
+_WINDOWS_BOOT_ID: str | None = None
 
 
 def _canonical_json(payload: Mapping[str, Any]) -> str:
@@ -135,12 +136,35 @@ def _pip_freeze() -> list[str]:
 
 def _boot_id() -> str:
     boot_file = Path("/proc/sys/kernel/random/boot_id")
-    if boot_file.is_file():
+    if platform.system() == "Linux" and boot_file.is_file():
         value = boot_file.read_text(encoding="utf-8").strip()
         if value:
             return value
-    # Windows lacks a Linux boot-id API.  The process-local fallback is explicit
-    # and stable throughout a training subprocess without exposing host secrets.
+    if platform.system() == "Windows":
+        global _WINDOWS_BOOT_ID
+        if _WINDOWS_BOOT_ID is not None:
+            return _WINDOWS_BOOT_ID
+        output = _run_text(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime().ToString('o')",
+            ]
+        )
+        timestamp = output.strip() if isinstance(output, str) else ""
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise RuntimeError("Windows boot timestamp is unavailable or invalid") from error
+        if not timestamp or parsed.tzinfo is None:
+            raise RuntimeError("Windows boot timestamp is unavailable or invalid")
+        normalized = parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
+        _WINDOWS_BOOT_ID = "windows-" + hashlib.sha256(
+            f"windows-{normalized}".encode("utf-8")
+        ).hexdigest()
+        return _WINDOWS_BOOT_ID
     return f"process-{os.getpid()}"
 
 
