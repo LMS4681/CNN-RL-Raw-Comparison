@@ -1,258 +1,272 @@
-# -*- coding: utf-8 -*-
-"""
-CNN + Dict Obs 통합 스모크 테스트.
+"""Short schema-3 train/save/load/evaluate workflows for every extractor."""
 
-1. OccupancyGridRenderer 렌더링 검증
-2. Three approved feature extractors forward pass 검증
-3. BlockPlacementEnv reset/step 동작 검증
-4. SyntheticBlockGenerator.generate_workspaces() 검증
-"""
-import sys, os
-sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+from __future__ import annotations
 
+import argparse
+import math
+import tempfile
 from pathlib import Path
-BASE = Path(__file__).resolve().parent
-os.chdir(BASE)
+from typing import Sequence
 
-import numpy as np
-from datetime import date
-
-PASS = 0
-FAIL = 0
-
-def check(name, condition, detail=""):
-    global PASS, FAIL
-    if condition:
-        PASS += 1
-        print(f"  ✅ {name}")
-    else:
-        FAIL += 1
-        print(f"  ❌ {name} — {detail}")
-
-
-print("=" * 60)
-print("  CNN + Dict Obs 통합 스모크 테스트")
-print("=" * 60)
-
-# ── 1. 데이터 로드 ────────────────────────────────────────────────
-print("\n[1] 데이터 로드")
-from alloc_env.data_loader import load_workspaces, load_blocks
-from alloc_env.strategy import BaseGridStrategy
-
-strategy = BaseGridStrategy(step=5.0)
-data_dir = BASE / "data"
-ws_csv = str(data_dir / "선행건조 작업장 기준정보.csv")
-lot_csv = str(data_dir / "선행건조 지번 기준정보.csv")
-blk_csv = str(data_dir / "블록데이터.csv")
-
-workspaces = load_workspaces(ws_csv, lot_csv, strategy)
-blocks = load_blocks(blk_csv, workspaces)
-check("작업장 로드", len(workspaces) > 0, f"{len(workspaces)}개")
-check("블록 로드", len(blocks) > 0, f"{len(blocks)}개")
-print(f"  작업장 {len(workspaces)}개, 블록 {len(blocks)}개")
-
-# ── 2. 점유 그리드 렌더러 ─────────────────────────────────────────
-print("\n[2] OccupancyGridRenderer 테스트")
-from alloc_env.occupancy_grid import OccupancyGridRenderer, GridCache
-
-renderer = OccupancyGridRenderer(grid_size=128)
-env_date = date(2026, 4, 1)
-
-# 단일 작업장 렌더링
-ws0 = workspaces[0]
-grid = renderer.render(ws0, env_date)
-check("그리드 shape", grid.shape == (3, 128, 128), f"got {grid.shape}")
-check("그리드 dtype", grid.dtype == np.float32)
-check("Ch0 범위 [0,1]", 0.0 <= grid[0].min() and grid[0].max() <= 1.0)
-check("Ch1 범위 [0,1]", 0.0 <= grid[1].min() and grid[1].max() <= 1.0)
-check("Ch2 (경계 마스크) 존재", grid[2].sum() > 0, f"sum={grid[2].sum():.0f}")
-
-# 전체 작업장 렌더링
-grids = renderer.render_all(workspaces, env_date)
-check("전체 그리드 shape",
-      grids.shape == (len(workspaces), 3, 128, 128),
-      f"got {grids.shape}")
-
-# 스케일 값
-scale = renderer.compute_scale_value(ws0)
-check("scale > 0", scale > 0, f"scale={scale:.4f} m/px")
-print(f"  작업장 {ws0.code}: {ws0.length:.0f}×{ws0.breadth:.0f}m, scale={scale:.4f} m/px")
-
-# 캐시 테스트
-cache = GridCache(renderer, len(workspaces))
-cache.invalidate_all()
-cached = cache.get_grids(workspaces, env_date)
-check("캐시 그리드 shape", cached.shape == grids.shape)
-# 두 번째 호출 (캐시 hit)
-cached2 = cache.get_grids(workspaces, env_date)
-check("캐시 hit 일관성", np.allclose(cached, cached2))
-
-# ── 3. CNN Feature Extractor ──────────────────────────────────────
-print("\n[3] Feature extractor 테스트")
-import torch
 import gymnasium as gym
-from gymnasium import spaces
-from alloc_env.alloc_env import FUTURE_BLOCK_FEATURE_DIM
-from alloc_env.cnn_extractor import (
-    CandidateCnnExtractor,
-    FixedGridExtractor,
-    StructuredExtractor,
+import numpy as np
+from sb3_contrib import MaskablePPO
+
+from alloc_env.alloc_env import DROPOUT_THRESHOLD
+from alloc_env.callbacks import CnnDiagnosticTracker
+from alloc_env.observation_state import (
+    CURRENT_BLOCK_FEATURE_DIM,
+    FUTURE_BLOCK_FEATURE_DIM,
+    FUTURE_DEMAND_FEATURE_DIM,
+    GRID_SIZE,
+    N_WORKSPACES,
+    ORDERED_FUTURE_COUNT,
+    PENDING_BLOCK_FEATURE_DIM,
+    PENDING_QUEUE_SLOTS,
+    PENDING_SUMMARY_FEATURE_DIM,
+    WORKSPACE_META_FEATURE_DIM,
+    build_observation_scales,
+)
+from alloc_env.strategy import BaseGridStrategy
+from train import (
+    DEFAULT_ACTIVE_WORKSPACE_CODES,
+    build_policy_kwargs,
+    create_evaluation_env,
+    evaluate,
+    load_allocation_scenario,
+    parse_workspace_codes,
 )
 
-N = len(workspaces)
-G = 128
-K = 4
-extractor_grid_size = 32
-obs_space = spaces.Dict({
-    "block": spaces.Box(0, 1, shape=(10,), dtype=np.float32),
-    "grids": spaces.Box(
-        0, 1, shape=(N, 4, extractor_grid_size, extractor_grid_size),
-        dtype=np.float32,
-    ),
-    "ws_meta": spaces.Box(0, 1, shape=(N, 3), dtype=np.float32),
-    "future_blocks": spaces.Box(
-        0, 1, shape=(K, FUTURE_BLOCK_FEATURE_DIM), dtype=np.float32,
-    ),
-    "future_mask": spaces.Box(0, 1, shape=(K,), dtype=np.float32),
-})
 
-dummy_obs = {
-    "block": torch.randn(1, 10),
-    "grids": torch.randn(
-        1, N, 4, extractor_grid_size, extractor_grid_size
+BASE_DIR = Path(__file__).resolve().parent
+EXTRACTORS = ("structured", "fixed-grid", "candidate-cnn")
+SMOKE_ROLLOUT_STEPS = 32
+SCHEMA3_OBSERVATION_SHAPES = {
+    "block": (CURRENT_BLOCK_FEATURE_DIM,),
+    "grids": (N_WORKSPACES, 4, GRID_SIZE, GRID_SIZE),
+    "ws_meta": (N_WORKSPACES, WORKSPACE_META_FEATURE_DIM),
+    "future_blocks": (
+        ORDERED_FUTURE_COUNT,
+        FUTURE_BLOCK_FEATURE_DIM,
     ),
-    "ws_meta": torch.randn(1, N, 3),
-    "future_blocks": torch.randn(1, K, FUTURE_BLOCK_FEATURE_DIM),
-    "future_mask": torch.ones(1, K),
+    "future_mask": (ORDERED_FUTURE_COUNT,),
+    "future_demand": (3, FUTURE_DEMAND_FEATURE_DIM),
+    "pending_blocks": (
+        N_WORKSPACES,
+        PENDING_QUEUE_SLOTS,
+        PENDING_BLOCK_FEATURE_DIM,
+    ),
+    "pending_mask": (N_WORKSPACES, PENDING_QUEUE_SLOTS),
+    "pending_summary": (
+        N_WORKSPACES,
+        PENDING_SUMMARY_FEATURE_DIM,
+    ),
 }
-for extractor_class in (
-    StructuredExtractor,
-    FixedGridExtractor,
-    CandidateCnnExtractor,
+
+
+def validate_schema3_observation_space(
+    observation_space: gym.spaces.Dict,
+) -> None:
+    """Fail early if a smoke environment does not expose exact schema 3."""
+    assert isinstance(observation_space, gym.spaces.Dict), (
+        "schema-3 observation space must be gym.spaces.Dict"
+    )
+    actual_keys = set(observation_space.spaces)
+    expected_keys = set(SCHEMA3_OBSERVATION_SHAPES)
+    assert actual_keys == expected_keys, (
+        "schema-3 keys differ: "
+        f"expected {sorted(expected_keys)}, got {sorted(actual_keys)}"
+    )
+    for key, expected_shape in SCHEMA3_OBSERVATION_SHAPES.items():
+        space = observation_space.spaces[key]
+        assert space.shape == expected_shape, (
+            f"{key} must have shape {expected_shape}, got {space.shape}"
+        )
+        assert space.dtype == np.dtype(np.float32), (
+            f"{key} must use np.float32, got {space.dtype}"
+        )
+
+
+def validate_cnn_diagnostics(diagnostics: dict[str, float]) -> None:
+    """Require evidence that PPO updated candidate-CNN parameters."""
+    gradient_norm = float(diagnostics.get("cnn_gradient_norm", 0.0))
+    weight_change = float(diagnostics.get("cnn_weight_change", 0.0))
+    assert math.isfinite(gradient_norm) and gradient_norm > 0.0, (
+        f"candidate CNN gradient norm must be positive, got {gradient_norm}"
+    )
+    assert math.isfinite(weight_change) and weight_change > 0.0, (
+        f"candidate CNN weight change must be positive, got {weight_change}"
+    )
+
+
+def _build_smoke_environment(seed: int = 0):
+    strategy = BaseGridStrategy(step=5.0)
+    blocks, workspaces = load_allocation_scenario(
+        BASE_DIR / "data",
+        strategy,
+        parse_workspace_codes(DEFAULT_ACTIVE_WORKSPACE_CODES),
+    )
+    observation_scales = build_observation_scales(
+        blocks,
+        workspaces,
+        DROPOUT_THRESHOLD,
+    )
+    env = create_evaluation_env(
+        blocks=blocks,
+        workspaces=workspaces,
+        strategy=strategy,
+        observation_scales=observation_scales,
+        grid_size=GRID_SIZE,
+        state_context_mode="full",
+        seed=seed,
+    )
+    validate_schema3_observation_space(env.observation_space)
+    return env
+
+
+def train_tiny_model(
+    *,
+    extractor: str,
+    timesteps: int,
 ):
-    extractor = extractor_class(obs_space, features_dim=256)
-    feat = extractor(dummy_obs)
-    name = extractor_class.__name__
-    check(f"{name} output shape", feat.shape == (1, 256), f"got {feat.shape}")
-    check(f"{name} output finite", torch.isfinite(feat).all().item())
+    """Train one extractor through real MaskablePPO actor/critic losses."""
+    if extractor not in EXTRACTORS:
+        raise ValueError(
+            f"unknown extractor {extractor!r}; choose one of {EXTRACTORS}"
+        )
+    if timesteps < 2:
+        raise ValueError("timesteps must be at least 2")
 
-# ── 4. 작업장 레이아웃 합성 생성 ──────────────────────────────────
-print("\n[4] generate_workspaces() 테스트")
-from alloc_env.block_generator import SyntheticBlockGenerator
+    env = _build_smoke_environment(seed=0)
+    n_steps = min(SMOKE_ROLLOUT_STEPS, timesteps)
+    model = MaskablePPO(
+        "MultiInputPolicy",
+        env,
+        policy_kwargs=build_policy_kwargs(
+            extractor=extractor,
+            features_dim=256,
+        ),
+        learning_rate=3e-4,
+        n_steps=n_steps,
+        batch_size=n_steps,
+        n_epochs=1,
+        seed=0,
+        device="cpu",
+        verbose=0,
+    )
 
-gen = SyntheticBlockGenerator.from_csv(blk_csv, seed=42)
-synth_ws = gen.generate_workspaces(workspaces, scale_range=(0.7, 1.3))
-check("합성 작업장 수 보존", len(synth_ws) == len(workspaces))
+    tracker = None
+    if extractor == "candidate-cnn":
+        tracker = CnnDiagnosticTracker(model.policy.features_extractor)
+        tracker.attach()
+    try:
+        model.learn(total_timesteps=timesteps, progress_bar=False)
+        if tracker is not None:
+            diagnostics = tracker.record_update()
+            validate_cnn_diagnostics(diagnostics)
+            print(
+                "[candidate-cnn] "
+                f"cnn_gradient_norm={diagnostics['cnn_gradient_norm']:.9f} "
+                f"cnn_weight_change={diagnostics['cnn_weight_change']:.9f}"
+            )
+    finally:
+        if tracker is not None:
+            tracker.close()
 
-# 크기가 변형되었는지 확인
-changed = any(
-    abs(s.length - o.length) > 0.1 or abs(s.breadth - o.breadth) > 0.1
-    for s, o in zip(synth_ws, workspaces)
-)
-check("크기 변형 발생", changed, "원본과 동일")
+    return model, env
 
-# 범위 확인
-for s, o in zip(synth_ws, workspaces):
-    ratio_l = s.length / max(o.length, 0.1)
-    ratio_b = s.breadth / max(o.breadth, 0.1)
-    in_range = (0.5 <= ratio_l <= 1.5) and (0.5 <= ratio_b <= 1.5)
-    if not in_range:
-        check(f"스케일 범위 {s.code}", False,
-              f"L:{ratio_l:.2f} B:{ratio_b:.2f}")
-        break
-else:
-    check("스케일 범위 전체 유효 (0.5~1.5)", True)
 
-# ── 5. 환경 reset/step ────────────────────────────────────────────
-print("\n[5] BlockPlacementEnv 통합 테스트")
-from alloc_env.alloc_env import BlockPlacementEnv
+def run_extractor_smoke(
+    extractor: str,
+    output_dir: Path,
+    *,
+    timesteps: int = 1_024,
+) -> dict[str, float]:
+    """Train, save, load, and complete one evaluation for an extractor."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model, env = train_tiny_model(
+        extractor=extractor,
+        timesteps=timesteps,
+    )
+    path = output_dir / f"{extractor}.sb3"
+    try:
+        model.save(path)
+        loaded = MaskablePPO.load(path, env=env)
+        metrics = evaluate(loaded, env, n_eval=1, return_metrics=True)
+        terminal_score = float(metrics["mean_terminal_score"])
+        assert math.isfinite(terminal_score), (
+            f"{extractor} must produce a finite terminal score, "
+            f"got {terminal_score}"
+        )
+        print(
+            f"[{extractor}] trained={timesteps} saved={path.name} "
+            f"terminal_score={terminal_score:.6f}"
+        )
+        return metrics
+    finally:
+        close = getattr(env, "close", None)
+        if close is not None:
+            close()
 
-env = BlockPlacementEnv(
-    blocks[:20],  # 빠른 테스트를 위해 20개만
-    workspaces,
-    strategy,
-    use_synthetic=False,
-    grid_size=G,
-)
 
-obs, info = env.reset()
-check("obs Dict 키", set(obs.keys()) == {"block", "grids", "ws_meta"})
-check("obs['block'] shape", obs["block"].shape == (10,), f"got {obs['block'].shape}")
-check("obs['grids'] shape",
-      obs["grids"].shape == (N, 4, G, G),
-      f"got {obs['grids'].shape}")
-check("obs['ws_meta'] shape",
-      obs["ws_meta"].shape == (N, 3),
-      f"got {obs['ws_meta'].shape}")
-check("obs 값 범위 [0,1]",
-      obs["block"].min() >= -0.01 and obs["block"].max() <= 1.01)
+def _positive_timesteps(value: str) -> int:
+    parsed = int(value)
+    if parsed < 2:
+        raise argparse.ArgumentTypeError("timesteps must be at least 2")
+    return parsed
 
-# step 실행
-mask = env.action_masks()
-valid_actions = np.where(mask)[0]
-check("마스크에 유효 액션 존재", len(valid_actions) > 0, f"{len(valid_actions)}개")
 
-if len(valid_actions) > 0:
-    action = int(valid_actions[0])
-    obs2, reward, terminated, truncated, info2 = env.step(action)
-    check("step 후 obs 키", set(obs2.keys()) == {"block", "grids", "ws_meta"})
-    check("step 중 reward finite", np.isfinite(reward), f"reward={reward}")
-    check("step 후 current_step 증가", info2["current_step"] == 1)
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run schema-3 extractor train/save/load/evaluate smoke checks"
+    )
+    parser.add_argument(
+        "--extractor",
+        choices=EXTRACTORS,
+        default="candidate-cnn",
+    )
+    parser.add_argument(
+        "--all-extractors",
+        action="store_true",
+        help="run structured, fixed-grid, and candidate-cnn",
+    )
+    parser.add_argument(
+        "--timesteps",
+        type=_positive_timesteps,
+        default=1_024,
+    )
+    parser.add_argument("--output-dir", type=Path, default=None)
+    return parser
 
-# 전체 에피소드 실행
-obs, info = env.reset()
-total_steps = 0
-done = False
-while not done:
-    mask = env.action_masks()
-    valid = np.where(mask)[0]
-    if len(valid) == 0:
-        print("  ⚠️ 유효 액션 없음 — 에피소드 강제 종료")
-        break
-    action = int(valid[0])
-    obs, reward, terminated, truncated, info = env.step(action)
-    total_steps += 1
-    done = terminated or truncated
 
-check("전체 에피소드 완료", done, f"steps={total_steps}")
-if done:
-    check("Terminal score 존재", "terminal_score" in info,
-          f"keys={list(info.keys())}")
-    check("Resolved reward 존재", "resolved_reward" in info,
-          f"keys={list(info.keys())}")
-    check("Terminal residual 존재", "terminal_residual" in info,
-          f"keys={list(info.keys())}")
-    check("Episode reward 존재", "episode_reward" in info,
-          f"keys={list(info.keys())}")
-    if "terminal_score" in info:
-        print(f"  Terminal score: {info['terminal_score']:.4f}")
+def _run_selected_extractors(
+    extractors: Sequence[str],
+    output_dir: Path,
+    timesteps: int,
+) -> None:
+    for extractor in extractors:
+        run_extractor_smoke(
+            extractor,
+            output_dir,
+            timesteps=timesteps,
+        )
 
-# ── 6. Synthetic 모드 ─────────────────────────────────────────────
-print("\n[6] Synthetic 모드 (블록+레이아웃 변형)")
-env_syn = BlockPlacementEnv(
-    blocks[:20],
-    workspaces,
-    strategy,
-    use_synthetic=True,
-    generator=gen,
-    synthetic_n_blocks=15,
-    vary_layout=True,
-    grid_size=G,
-)
 
-obs1, _ = env_syn.reset()
-obs2, _ = env_syn.reset()
-# 두 에피소드의 그리드가 다른지 확인 (레이아웃 변형)
-grids_diff = not np.allclose(obs1["grids"], obs2["grids"])
-check("에피소드 간 그리드 변형", grids_diff,
-      "두 에피소드의 그리드가 동일함")
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_argument_parser().parse_args(argv)
+    extractors = EXTRACTORS if args.all_extractors else (args.extractor,)
 
-# ── 결과 요약 ─────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-total = PASS + FAIL
-print(f"  결과: {PASS}/{total} 통과, {FAIL}개 실패")
-print("=" * 60)
+    if args.output_dir is not None:
+        output_dir = args.output_dir.resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _run_selected_extractors(extractors, output_dir, args.timesteps)
+        return 0
 
-if FAIL > 0:
-    sys.exit(1)
+    with tempfile.TemporaryDirectory(prefix="allocrl-schema3-smoke-") as tmp:
+        _run_selected_extractors(extractors, Path(tmp), args.timesteps)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

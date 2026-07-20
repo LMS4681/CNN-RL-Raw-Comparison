@@ -1,100 +1,128 @@
 # AllocRL A-E Ablation
 
+## Stage B Technical Contract
+
+Stage B uses observation schema 3 for every extractor. The observation is a
+`gym.spaces.Dict` containing exactly nine `np.float32` arrays in `[0, 1]`:
+
+| Key | Fixed dimensions | Meaning |
+| --- | --- | --- |
+| `block` | `(8,)` | Current block, timing, and decision context |
+| `grids` | `(10, 4, 64, 64)` | Four candidate-conditioned channels for each workspace |
+| `ws_meta` | `(10, 4)` | Workspace dimensions, utilization, and candidate placeability |
+| `future_blocks` | `(16, 6)` | Next 16 unassigned blocks in simulator decision order |
+| `future_mask` | `(16,)` | Valid-row mask for `future_blocks` |
+| `future_demand` | `(3, 4)` | Demand summaries for working-day windows 0-5, 6-20, and 21-60 |
+| `pending_blocks` | `(10, 32, 7)` | First 32 retry-ordered pending blocks per workspace |
+| `pending_mask` | `(10, 32)` | Valid-row mask for `pending_blocks` |
+| `pending_summary` | `(10, 4)` | Queue size, area, delay, and overflow per workspace |
+
+The ordered-future capacity is always 16. The pending queue capacity is always
+32 independently for each of the ten workspaces. These dimensions are fixed;
+they are not ablation parameters.
+
+The four `grids` channels are, in order:
+
+1. collision exclusion
+2. remaining working days
+3. post-candidate lot state
+4. candidate exclusion
+
+Blocks retain their original `length x breadth` orientation through dimension
+checks, candidate generation, preview, incremental placement, and replay.
+Rotation is prohibited; there is no rotated fallback or rotation-derived
+candidate.
+
+`CandidateCnnExtractor` is part of the shared `MaskablePPO` policy feature
+path. Its weights are trained end to end by the actor and critic losses. It is
+not a feasibility classifier, receives no feasibility labels, and is not
+pretrained as one. The action mask remains a constraint mechanism outside the
+CNN. The all-extractor smoke check proves that PPO gives the CNN a nonzero
+gradient norm and changes its weights.
+
+Reward shaping remains absent. Training uses only the existing exactly-once
+resolved delay/dropout reward and terminal residual needed to conserve the
+episode score; no occupancy, feasibility, future-choice, pending-queue, or CNN
+auxiliary reward is added.
+
+## A-E Matrix
+
+All variants use the same schema-3 environment, normalization record, action
+order, fixed 64 grid size, and reward contract. `current` state context keeps
+the current block, workspace metadata, and grids real while zeroing future,
+demand, and pending context.
+
+| ID | Extractor | State context | Comparison role |
+| --- | --- | --- | --- |
+| A | `structured` | `current` | Current-state structured baseline |
+| B | `structured` | `full` | Effect of future and pending structured state |
+| C | `fixed-grid` | `full` | Effect of deterministic pooled grid pixels |
+| D | `candidate-cnn` | `current` | Learned candidate-grid path without future/pending state |
+| E | `candidate-cnn` | `full` | Complete recommended Stage B model |
+
 ## Stage A Fixed-Holdout Protocol
 
-Stage A uses the schema-3 fixed holdout bundle at
-`data/fixed_eval_scenarios.json`. The source contains 913 rows from 40 ships.
-The ship-level split produces 673 training rows from 29 ships and 240 holdout
-rows from 11 ships. Its fixed seed is `20260716`: a ship is held out when the
-first eight bytes of `SHA-256("20260716:<ship_no>")`, interpreted as an
-unsigned big-endian integer and divided by `2**64`, are below `0.20`.
+The fixed holdout bundle is `data/fixed_eval_scenarios.json`. Its source has
+913 rows from 40 ships. The ship-level split has 673 training rows from 29
+ships and 240 holdout rows from 11 ships. The split seed is `20260716`: a ship
+is held out when the first eight bytes of
+`SHA-256("20260716:<ship_no>")`, interpreted as an unsigned big-endian integer
+and divided by `2**64`, are below `0.20`.
 
-The original allocation CSV has a one-shot business-reference evaluation role;
-it is not a regenerated reporting set. Stage A reporting uses the 20 fixed
-holdout scenarios with seeds `1000..1019`. Stage A does not select a
-checkpoint from those scenarios.
+The original allocation CSV has a one-shot business-reference evaluation
+role. Stage A reporting uses the 20 fixed holdout scenarios with seeds
+`1000..1019`; those scenarios do not select checkpoints.
 
-The required baseline command evaluates exactly `RandomValidPolicy` seeded by
-each scenario seed and `GreedyImmediateAreaPolicy`, through the shared
-evaluation runner:
+Prepare the fixed scenario file once:
 
 ```powershell
-py -B run_ablation.py --evaluate-baselines
+python -B run_ablation.py --prepare-eval-scenarios
 ```
 
-It writes `output_ablation/baselines/evaluation_scenarios.csv` with one detail
-row per policy and scenario. No Stage-A result may claim CNN improvement: the
-observation correction remains pending in Stage B.
-
-이 실험은 같은 학습 예산과 같은 고정 평가 시나리오에서 미래 블록 정보와
-후보 배치 CNN의 효과를 분리해 비교합니다.
-
-모든 학습군은 동일한 데이터 정책을 사용합니다. 7월과 11월을 제외한 913개
-블록을 지정된 10개 빈 작업장에 배치하며, 에피소드 총량은 913개로 고정합니다.
-학습 시 월별 평준화 랜덤 프로필과 실제 월별 프로필을 80:20으로 혼합하고,
-고정 평가는 실제 월별 프로필과 고정 작업장 geometry를 사용합니다.
-
-## 실험군
-
-| ID | Extractor | Future blocks | 비교 목적 |
-| --- | --- | ---: | --- |
-| A | `structured` | 0 | 현재 상태만 사용하는 최소 기준선 |
-| B | `structured` | 4 | 순서가 보존된 미래 블록 정보의 효과 |
-| C | `fixed-grid` | 4 | 학습하지 않는 직접 이미지 입력의 효과 |
-| D | `candidate-cnn` | 0 | 학습된 공간 특징만의 효과 |
-| E | `candidate-cnn` | 4 | 권장 전체 모델 |
-
-## 실행 순서
-
-고정 평가 파일은 한 번만 생성합니다. 이 파일에는 학습 seed와 분리된 평가
-seed `1000..1019`가 들어갑니다.
+Evaluate the required `RandomValidPolicy` and `GreedyImmediateAreaPolicy`
+baselines through the shared evaluation runner:
 
 ```powershell
-py -B run_ablation.py --prepare-eval-scenarios
+python -B run_ablation.py --evaluate-baselines
 ```
 
-먼저 screening 명령 15개(5개 모델 x seed 3개)를 확인하고 실행합니다.
+The result is `output_ablation/baselines/evaluation_scenarios.csv`, with one
+detail row per policy and scenario.
+
+## Training And Verification
+
+Run the 15 screening jobs, then the 25 final jobs after reviewing screening:
 
 ```powershell
-py -B run_ablation.py --mode screening --dry-run
-py -B run_ablation.py --mode screening
+python -B run_ablation.py --mode screening --dry-run
+python -B run_ablation.py --mode screening
+python -B run_ablation.py --mode final --dry-run
+python -B run_ablation.py --mode final
 ```
 
-screening 결과를 확인한 뒤 최종 비교 25개(5개 모델 x seed 5개)를 실행합니다.
+Each run writes to `output_ablation/<mode>/<ID>/seed_<seed>`. SB3 models and
+checkpoints use the `.sb3` extension.
+
+Verify all three schema-3 extractor workflows with temporary output:
 
 ```powershell
-py -B run_ablation.py --mode final --dry-run
-py -B run_ablation.py --mode final
+python smoke_test.py --all-extractors --timesteps 1024
 ```
 
-각 실행은 `output_ablation/<mode>/<ID>/seed_<seed>`에 모델과 로그를 저장합니다.
-회사 보안 환경에서 `.zip`이 변환되는 문제를 피하기 위해 SB3 모델과
-체크포인트 확장자는 `.sb3`입니다.
+Pass `--output-dir <path>` only when the smoke artifacts need to be retained
+for inspection.
 
-## 평가 지표
+## Evaluation And Promotion
 
-우선순위는 다음과 같습니다.
+Rank runs by `mean_terminal_score`, then `mean_dropout_rate`, delay metrics,
+seed stability, and `mean_retained_choice_ratio`. Retained-choice ratio is an
+evaluation diagnostic only; it is not part of the reward or action mask.
 
-1. `mean_terminal_score`
-2. `mean_dropout_rate`
-3. `mean_delay_days`, `mean_delayed_count`
-4. seed별 학습 속도와 분산
-5. `mean_retained_choice_ratio`
+Variant E must improve over B by at least one of these criteria:
 
-retained-choice ratio는 현재 행동 직전에 고정한 다음 K개 블록에 대해 가능한
-작업장 선택 수를 세고, 행동 직후 같은 블록 집합을 다시 계산한
-`after / before`입니다. `before=after=0`이면 `1.0`으로 기록합니다. 이 값은
-평가 전용이며 관측, 보상, action mask에 들어가지 않습니다.
+- absolute mean terminal score improvement of at least `0.05`
+- relative dropout-rate reduction of at least `10%`
 
-원본 CSV 평가는 `evaluation_csv.csv`, 고정 시나리오 평가는
-`evaluation_scenarios.csv`에 별도로 기록됩니다.
-
-## 승인 기준
-
-E가 B보다 다음 중 하나를 만족해야 합니다.
-
-- 평균 terminal score 절대 개선이 `0.05` 이상
-- dropout rate 상대 감소가 `10%` 이상
-
-또한 개선 방향이 최종 seed 5개 중 최소 4개에서 일관되어야 합니다. E와 C는
-학습된 convolution의 효과를, E와 D는 미래 블록 정보의 효과를 확인합니다.
+The improvement direction must agree in at least four of the five final seeds.
+Compare E with C to isolate learned convolution and E with D to isolate the
+full future/pending state.
