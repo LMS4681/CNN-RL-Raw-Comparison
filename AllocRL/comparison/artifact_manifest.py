@@ -195,6 +195,18 @@ def write_run_origin(
     initial_timestep: int,
     created_at_utc: str | None = None,
 ) -> dict[str, Any]:
+    _sha256(config_sha256, "run origin config_sha256")
+    _nonnegative_integer(initial_timestep, "run origin initial_timestep")
+    destination = Path(path)
+    if destination.exists():
+        existing = read_run_origin(destination)
+        if (
+            existing["config_sha256"] != config_sha256
+            or existing["initial_timestep"] != initial_timestep
+            or existing["source"] != "observed_before_first_learn"
+        ):
+            raise ValueError("existing run origin differs from observed origin")
+        return existing
     payload = {
         "schema_version": 1,
         "config_sha256": config_sha256,
@@ -203,12 +215,6 @@ def write_run_origin(
         "created_at_utc": created_at_utc or datetime.now(timezone.utc).isoformat(),
     }
     _validate_run_origin_payload(payload)
-    destination = Path(path)
-    if destination.exists():
-        existing = read_run_origin(destination)
-        if existing != payload:
-            raise ValueError("existing run origin differs from observed origin")
-        return existing
     _write_json(destination, payload)
     reread = read_run_origin(destination)
     if reread != payload:

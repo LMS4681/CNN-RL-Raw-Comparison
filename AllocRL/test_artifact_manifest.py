@@ -278,6 +278,74 @@ def test_run_origin_is_atomic_exact_and_never_inferred(tmp_path):
         read_run_origin(path)
 
 
+def test_run_origin_reuses_original_creation_after_pre_state_crash(tmp_path):
+    origin_path = tmp_path / "run_origin.json"
+    state_path = tmp_path / "run_state.json"
+    first = write_run_origin(
+        origin_path,
+        config_sha256="a" * 64,
+        initial_timestep=0,
+        created_at_utc="2026-07-21T00:00:00+00:00",
+    )
+    original_bytes = origin_path.read_bytes()
+    assert not state_path.exists()
+
+    replayed = write_run_origin(
+        origin_path,
+        config_sha256="a" * 64,
+        initial_timestep=0,
+        created_at_utc="2026-07-21T00:01:00+00:00",
+    )
+
+    assert replayed == first
+    assert replayed["created_at_utc"] == "2026-07-21T00:00:00+00:00"
+    assert origin_path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize(
+    ("config_sha256", "initial_timestep"),
+    [("b" * 64, 0), ("a" * 64, 1)],
+)
+def test_run_origin_replay_rejects_changed_identity(
+    tmp_path, config_sha256, initial_timestep
+):
+    origin_path = tmp_path / "run_origin.json"
+    write_run_origin(
+        origin_path,
+        config_sha256="a" * 64,
+        initial_timestep=0,
+        created_at_utc="2026-07-21T00:00:00+00:00",
+    )
+    original_bytes = origin_path.read_bytes()
+
+    with pytest.raises(ValueError, match="existing run origin differs"):
+        write_run_origin(
+            origin_path,
+            config_sha256=config_sha256,
+            initial_timestep=initial_timestep,
+            created_at_utc="2026-07-21T00:01:00+00:00",
+        )
+
+    assert origin_path.read_bytes() == original_bytes
+
+
+def test_run_origin_replay_still_validates_requested_identity(tmp_path):
+    origin_path = tmp_path / "run_origin.json"
+    write_run_origin(
+        origin_path,
+        config_sha256="a" * 64,
+        initial_timestep=0,
+        created_at_utc="2026-07-21T00:00:00+00:00",
+    )
+
+    with pytest.raises(ValueError, match="must be a non-negative integer"):
+        write_run_origin(
+            origin_path,
+            config_sha256="a" * 64,
+            initial_timestep=False,
+        )
+
+
 @pytest.mark.parametrize(
     "updates",
     [
