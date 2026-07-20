@@ -181,6 +181,58 @@ def test_selected_cuda_index_is_used_for_gpu_metadata(monkeypatch):
     assert {index for _, index in calls} == {2}
 
 
+def test_visible_cuda_devices_maps_logical_index_to_physical_smi_id(monkeypatch):
+    commands = []
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-visible-uuid,3")
+    monkeypatch.setattr("comparison.artifact_manifest.torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr(
+        "comparison.artifact_manifest.torch.cuda.get_device_name", lambda _: "GPU"
+    )
+    monkeypatch.setattr(
+        "comparison.artifact_manifest.torch.cuda.get_device_properties",
+        lambda _: SimpleNamespace(total_memory=42),
+    )
+    monkeypatch.setattr(
+        "comparison.artifact_manifest._run_text",
+        lambda command: commands.append(command) or "GPU-physical-3\n",
+    )
+    manifest = collect_environment(["python"], {"resolved_device": "cuda:1"})
+    assert manifest["gpu_uuid"] == "GPU-physical-3"
+    smi_command = next(command for command in commands if command[0] == "nvidia-smi")
+    assert "--id=3" in smi_command
+
+
+@pytest.mark.parametrize(
+    ("device", "expected_peak_call"),
+    [("cpu", None), ("cuda:2", 2)],
+)
+def test_runtime_peak_memory_uses_model_device(
+    tiny_policy, monkeypatch, device, expected_peak_call
+):
+    calls = []
+    monkeypatch.setattr(train_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        train_module.torch.cuda,
+        "max_memory_allocated",
+        lambda index: calls.append(index) or 123,
+    )
+    model = SimpleNamespace(policy=tiny_policy, num_timesteps=120, device=device)
+    state = SimpleNamespace(
+        target_training_seconds=10.0,
+        completed_training_seconds=8.0,
+        restart_count=0,
+        max_unrecorded_seconds=1.0,
+        last_checkpoint_timestep=120,
+        last_checkpoint_file="model.sb3",
+        last_checkpoint_sha256="a" * 64,
+    )
+    metrics = train_module.comparison_runtime_metrics(
+        model, state, start_timestep=0, end_to_end_seconds=8.0, evaluation_seconds=0.0
+    )
+    assert metrics["peak_cuda_memory_bytes"] == (123 if expected_peak_call is not None else None)
+    assert calls == ([] if expected_peak_call is None else [expected_peak_call])
+
+
 def test_invalid_comparison_provenance_fails_before_segment_write(tmp_path):
     args = SimpleNamespace(
         comparison_baseline_sha256="not-a-commit",
@@ -269,6 +321,41 @@ def test_runtime_metrics_ignores_malformed_holdout_selection_and_falls_back(tmp_
     (tmp_path / "holdout_selection.csv").write_text(
         "timestep,is_best\n50,1\n", encoding="utf-8"
     )
+    checkpoint = tmp_path / "checkpoints" / "model_40_g1.sb3"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"state")
+    digest = hashlib.sha256(b"state").hexdigest()
+    selected = train_module.runtime_selected_checkpoint(
+        tmp_path,
+        SimpleNamespace(
+            last_checkpoint_timestep=40,
+            last_checkpoint_file=checkpoint.name,
+            last_checkpoint_sha256=digest,
+        ),
+    )
+    assert selected["selected_checkpoint_timestep"] == 40
+
+
+@pytest.mark.parametrize(
+    "selection_csv",
+    [
+        "timestep,is_best\n50,1\n",
+        (
+            "timestep,mean_terminal_score,mean_dropout_rate,mean_delay_days,is_best\n"
+            "50,not-a-number,0.2,3.0,1\n"
+        ),
+        (
+            "timestep,mean_terminal_score,mean_dropout_rate,mean_delay_days,is_best\n"
+            "not-an-int,10.0,0.2,3.0,1\n"
+        ),
+    ],
+)
+def test_runtime_metrics_rejects_malformed_readable_selected_checkpoint(
+    tmp_path, monkeypatch, selection_csv
+):
+    (tmp_path / "best_model.sb3").write_bytes(b"readable-best")
+    (tmp_path / "holdout_selection.csv").write_text(selection_csv, encoding="utf-8")
+    monkeypatch.setattr(train_module, "model_num_timesteps", lambda path: 50)
     checkpoint = tmp_path / "checkpoints" / "model_40_g1.sb3"
     checkpoint.parent.mkdir()
     checkpoint.write_bytes(b"state")

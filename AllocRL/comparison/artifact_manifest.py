@@ -132,11 +132,20 @@ def _git_metadata() -> tuple[str | None, bool | None]:
     return (sha.strip() if sha else None, bool(dirty) if dirty is not None else None)
 
 
+def _physical_gpu_identifier(index: int) -> str:
+    """Map a logical CUDA index through CUDA_VISIBLE_DEVICES when present."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is None:
+        return str(index)
+    tokens = [token.strip() for token in visible.split(",") if token.strip()]
+    return tokens[index] if index < len(tokens) else str(index)
+
+
 def _gpu_uuid(index: int) -> str | None:
     output = _run_text(
         [
             "nvidia-smi",
-            f"--id={index}",
+            f"--id={_physical_gpu_identifier(index)}",
             "--query-gpu=uuid",
             "--format=csv,noheader",
         ]

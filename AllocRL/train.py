@@ -76,6 +76,15 @@ MODEL_FILENAME = "block_placement_ppo.sb3"
 LEGACY_MODEL_FILENAME = "block_placement_ppo.zip"
 
 
+def _cuda_device_index(device: Any) -> int | None:
+    resolved = str(device)
+    if resolved == "cuda":
+        return torch.cuda.current_device()
+    if resolved.startswith("cuda:"):
+        return int(resolved.split(":", 1)[1])
+    return None
+
+
 def comparison_runtime_metrics(
     model,
     wall_clock_state,
@@ -89,6 +98,7 @@ def comparison_runtime_metrics(
     recorded_seconds = float(wall_clock_state.completed_training_seconds)
     end_timestep = int(model.num_timesteps)
     trained_steps = end_timestep - int(start_timestep)
+    cuda_index = _cuda_device_index(getattr(model, "device", "cpu"))
     return {
         "target_training_seconds": float(wall_clock_state.target_training_seconds),
         "recorded_training_seconds": recorded_seconds,
@@ -106,8 +116,8 @@ def comparison_runtime_metrics(
         ),
         "parameter_counts": count_trainable_parameters(model.policy),
         "peak_cuda_memory_bytes": (
-            int(torch.cuda.max_memory_allocated())
-            if torch.cuda.is_available()
+            int(torch.cuda.max_memory_allocated(cuda_index))
+            if cuda_index is not None
             else None
         ),
         "evaluation_seconds": float(evaluation_seconds),
@@ -167,27 +177,39 @@ def runtime_selected_checkpoint(
     selection_path = output / "holdout_selection.csv"
     best_path = output / "best_model.sb3"
     if selection_path.is_file() and best_path.is_file():
-        with selection_path.open(encoding="utf-8", newline="") as source:
-            best_rows = [
-                row for row in csv.DictReader(source) if row.get("is_best") == "1"
-            ]
-        if best_rows:
-            row = best_rows[-1]
-            timestep = int(row["timestep"])
-            if model_num_timesteps(best_path) == timestep:
-                return {
-                    "selected_checkpoint_timestep": timestep,
-                    "selection_count": int(selection_count),
-                    "selection_tuple": [
-                        float(row["mean_terminal_score"]),
-                        -float(row["mean_dropout_rate"]),
-                        -float(row["mean_delay_days"]),
-                    ],
-                    "checkpoint_identity": {
-                        "filename": best_path.name,
-                        "sha256": sha256_file(best_path),
-                    },
-                }
+        try:
+            with selection_path.open(encoding="utf-8", newline="") as source:
+                reader = csv.DictReader(source)
+                expected_fields = (
+                    "timestep",
+                    "mean_terminal_score",
+                    "mean_dropout_rate",
+                    "mean_delay_days",
+                    "is_best",
+                )
+                if tuple(reader.fieldnames or ()) != expected_fields:
+                    raise ValueError("holdout selection CSV header is incompatible")
+                best_rows = [row for row in reader if row["is_best"] == "1"]
+            if best_rows:
+                row = best_rows[-1]
+                timestep = int(row["timestep"])
+                ranking = [
+                    float(row["mean_terminal_score"]),
+                    -float(row["mean_dropout_rate"]),
+                    -float(row["mean_delay_days"]),
+                ]
+                if model_num_timesteps(best_path) == timestep:
+                    return {
+                        "selected_checkpoint_timestep": timestep,
+                        "selection_count": int(selection_count),
+                        "selection_tuple": ranking,
+                        "checkpoint_identity": {
+                            "filename": best_path.name,
+                            "sha256": sha256_file(best_path),
+                        },
+                    }
+        except (csv.Error, KeyError, TypeError, ValueError):
+            pass
     checkpoint = output / "checkpoints" / wall_clock_state.last_checkpoint_file
     if not checkpoint.is_file() or sha256_file(checkpoint) != wall_clock_state.last_checkpoint_sha256:
         raise ValueError("complete wall-clock state checkpoint is not verifiable")
