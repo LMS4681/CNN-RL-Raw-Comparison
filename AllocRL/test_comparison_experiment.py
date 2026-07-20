@@ -769,3 +769,92 @@ def test_complete_marker_write_failure_leaves_no_marker_and_writes_partial(tmp_p
     with pytest.raises(OSError, match="marker write failed"):
         runner_module.run_overnight_experiment(runner_module.ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
     assert not (tmp_path / "COMPLETE.json").exists() and (tmp_path / "comparison" / "PARTIAL_REPORT.md").is_file()
+
+
+_SUBSTANTIVE_STAGES = ("train_raw_direct", "evaluate_raw_direct", "train_candidate_cnn", "evaluate_candidate_cnn", "evaluate_common_step", "build_report", "integrity_verification")
+
+
+@pytest.mark.parametrize("failed_stage", _SUBSTANTIVE_STAGES)
+def test_public_stage_failure_retries_exact_failed_stage_and_pending_downstream(tmp_path: Path, failed_stage: str):
+    from comparison.experiment_runner import ExperimentConfig, ExperimentStageError, JOURNAL_STAGES, run_overnight_experiment
+
+    counts = {stage: 0 for stage in JOURNAL_STAGES}
+    hashes = {stage: f"{index:064x}" for index, stage in enumerate(JOURNAL_STAGES)}
+    def action(stage):
+        def invoke():
+            counts[stage] += 1
+            if stage == failed_stage and counts[stage] == 1: raise RuntimeError("once")
+        return invoke
+    actions = {stage: action(stage) for stage in JOURNAL_STAGES}
+    hashers = {stage: (lambda stage=stage: hashes[stage]) for stage in JOURNAL_STAGES}
+    config = ExperimentConfig.for_test()
+    with pytest.raises(ExperimentStageError): run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    journal = json.loads((tmp_path / "stage_journal.json").read_text(encoding="utf-8")); index = JOURNAL_STAGES.index(failed_stage)
+    assert all(journal[stage]["status"] == "complete" for stage in JOURNAL_STAGES[:index])
+    assert journal[failed_stage]["status"] == "failed" and all(journal[stage]["status"] == "pending" for stage in JOURNAL_STAGES[index + 1:])
+    assert not (tmp_path / "COMPLETE.json").exists() and (tmp_path / "comparison" / "PARTIAL_REPORT.md").is_file() and json.loads((tmp_path / "lease.json").read_text())["status"] == "released"
+    earlier = {stage: journal[stage]["output_sha256"] for stage in JOURNAL_STAGES[:index]}
+    run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    repaired = json.loads((tmp_path / "stage_journal.json").read_text(encoding="utf-8"))
+    assert all(counts[stage] == 1 for stage in JOURNAL_STAGES[:index]) and counts[failed_stage] == 2 and all(counts[stage] == 1 for stage in JOURNAL_STAGES[index + 1:])
+    assert {stage: repaired[stage]["output_sha256"] for stage in earlier} == earlier and all(repaired[stage]["status"] == "complete" for stage in JOURNAL_STAGES)
+    assert json.loads((tmp_path / "COMPLETE.json").read_text(encoding="utf-8"))["stage_output_sha256"] == hashes
+
+
+@pytest.mark.parametrize("tampered_stage", ["smoke_raw_direct", "smoke_candidate_cnn", "train_raw_direct", "evaluate_common_step", "build_report"])
+def test_public_semantic_tamper_reruns_only_stage_and_downstream(tmp_path: Path, tampered_stage: str):
+    from comparison.experiment_runner import ExperimentConfig, JOURNAL_STAGES, run_overnight_experiment
+
+    calls = []; values = {stage: f"{index:064x}" for index, stage in enumerate(JOURNAL_STAGES)}
+    actions = {stage: (lambda stage=stage: calls.append(stage)) for stage in JOURNAL_STAGES}
+    hashers = {stage: (lambda stage=stage: values[stage]) for stage in JOURNAL_STAGES}
+    config = ExperimentConfig.for_test(); run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    before = list(calls); values[tampered_stage] = "f" * 64; calls.clear()
+    run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    index = JOURNAL_STAGES.index(tampered_stage)
+    assert calls == list(JOURNAL_STAGES[index:]) and before == list(JOURNAL_STAGES)
+    marker = json.loads((tmp_path / "COMPLETE.json").read_text(encoding="utf-8"))
+    assert marker["stage_output_sha256"] == values
+
+
+def test_public_tamper_restore_failure_removes_old_marker(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, ExperimentStageError, JOURNAL_STAGES, run_overnight_experiment
+
+    calls, actions, hashers = _public_harness(); config = ExperimentConfig.for_test()
+    run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    actions["build_report"] = lambda: (_ for _ in ()).throw(RuntimeError("restore failed"))
+    changed = {stage: hashers[stage] for stage in JOURNAL_STAGES}; changed["build_report"] = lambda: "f" * 64
+    with pytest.raises(ExperimentStageError): run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=changed, lease_interval_seconds=999)
+    assert not (tmp_path / "COMPLETE.json").exists() and (tmp_path / "comparison" / "PARTIAL_REPORT.md").is_file()
+
+
+def test_public_stale_in_progress_retries_that_stage_and_every_downstream(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, JOURNAL_STAGES, run_overnight_experiment
+
+    calls, actions, hashers = _public_harness(); config = ExperimentConfig.for_test()
+    run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    journal_path = tmp_path / "stage_journal.json"; journal = json.loads(journal_path.read_text(encoding="utf-8")); target = "evaluate_raw_direct"; index = JOURNAL_STAGES.index(target)
+    stale = dict(journal[target]); stale.update(status="in_progress", output_sha256=None, completed_at_utc=None, error=None); journal[target] = stale
+    journal_path.write_text(json.dumps(journal), encoding="utf-8"); (tmp_path / "COMPLETE.json").unlink(); calls.clear()
+    run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    repaired = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert calls == list(JOURNAL_STAGES[index:]) and all(repaired[stage]["status"] == "complete" for stage in JOURNAL_STAGES)
+
+
+def test_public_smoke_candidate_failure_blocks_raw_training_and_keeps_partial(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, ExperimentStageError, run_overnight_experiment
+
+    calls, actions, hashers = _public_harness(); actions["smoke_candidate_cnn"] = lambda: (_ for _ in ()).throw(RuntimeError("smoke failed"))
+    with pytest.raises(ExperimentStageError): run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    assert "train_raw_direct" not in calls and not (tmp_path / "COMPLETE.json").exists() and (tmp_path / "comparison" / "PARTIAL_REPORT.md").is_file()
+
+
+def test_live_lease_refusal_preserves_existing_complete_and_root_bytes(tmp_path: Path):
+    from comparison.experiment_runner import ExperimentConfig, LeaseError, run_overnight_experiment
+
+    calls, actions, hashers = _public_harness(); config = ExperimentConfig.for_test()
+    run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    (tmp_path / "lease.json").write_text(json.dumps({"token": "owner", "pid": 1, "boot_id": "process-1", "heartbeat_utc": "x", "heartbeat_monotonic": 0, "status": "active"}), encoding="utf-8")
+    (tmp_path / ".lease.acquire").write_text("owner\n", encoding="utf-8"); before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    with pytest.raises(LeaseError): run_overnight_experiment(config, tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before

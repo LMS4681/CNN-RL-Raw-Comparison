@@ -582,6 +582,12 @@ class _Runner:
         try: current_output = self.output_hash(name)
         except (OSError, ValueError, KeyError, TypeError): current_output = None
         if entry["status"]=="complete" and entry["input_sha256"]==incoming and entry["output_sha256"]==current_output: return
+        if entry["status"] != "complete":
+            # An interrupted/failed stage may have left downstream artifacts
+            # semantically plausible but procedurally unverified.  Re-run the
+            # whole suffix after it, preserving only the already proven prefix.
+            for downstream in JOURNAL_STAGES[JOURNAL_STAGES.index(name) + 1:]:
+                journal[downstream] = _journal_entry()
         journal[name]=_journal_entry("in_progress", input_sha256=incoming, started_at_utc=_utc()); self.save_journal(journal)
         try:
             action(); output_hash=self.output_hash(name)
