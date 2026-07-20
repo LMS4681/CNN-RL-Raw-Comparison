@@ -1,8 +1,6 @@
-"""Feature extractors for ordered block context and candidate grids."""
+"""Feature extractors for corrected structured state and candidate grids."""
 
 from __future__ import annotations
-
-from typing import Optional
 
 import gymnasium as gym
 import torch
@@ -11,56 +9,135 @@ import torch.nn.functional as F
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 
-class OrderedBlockEncoder(nn.Module):
-    """Encode the current block and the exact ordered future sequence."""
+N_WORKSPACES = 10
+EXPECTED_OBSERVATION_SHAPES = {
+    "block": (8,),
+    "ws_meta": (N_WORKSPACES, 4),
+    "future_blocks": (16, 6),
+    "future_mask": (16,),
+    "future_demand": (3, 4),
+    "pending_blocks": (N_WORKSPACES, 32, 7),
+    "pending_mask": (N_WORKSPACES, 32),
+    "pending_summary": (N_WORKSPACES, 4),
+}
+EXPECTED_OBSERVATION_KEYS = {
+    *EXPECTED_OBSERVATION_SHAPES,
+    "grids",
+}
 
-    output_dim = 96
 
-    def __init__(self, observation_space: gym.spaces.Dict):
+def _validate_observation_space(
+    observation_space: gym.spaces.Dict,
+) -> None:
+    actual_keys = set(observation_space.spaces)
+    missing = sorted(EXPECTED_OBSERVATION_KEYS - actual_keys)
+    unexpected = sorted(actual_keys - EXPECTED_OBSERVATION_KEYS)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected {', '.join(unexpected)}")
+        raise ValueError(
+            "Schema-3 extractors require exactly nine keys: "
+            + "; ".join(details)
+        )
+
+    for key, expected_shape in EXPECTED_OBSERVATION_SHAPES.items():
+        actual_shape = observation_space[key].shape
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"Schema-3 {key} must have shape {expected_shape}, "
+                f"got {actual_shape}."
+            )
+
+    grid_shape = observation_space["grids"].shape
+    if (
+        len(grid_shape) != 4
+        or grid_shape[:2] != (N_WORKSPACES, 4)
+        or grid_shape[2] < 1
+        or grid_shape[3] < 1
+    ):
+        raise ValueError(
+            "Schema-3 grids must have shape "
+            f"({N_WORKSPACES}, 4, height, width) with positive spatial "
+            f"dimensions, got {grid_shape}."
+        )
+
+
+class StructuredStateEncoder(nn.Module):
+    """Encode every corrected structured observation without pooling order."""
+
+    def __init__(self):
         super().__init__()
-        block_dim = observation_space["block"].shape[0]
         self.current = nn.Sequential(
-            nn.Linear(block_dim, 64),
+            nn.Linear(8, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
         )
-
-        self.k = (
-            observation_space["future_blocks"].shape[0]
-            if "future_blocks" in observation_space.spaces
-            else 0
+        self.future = nn.Sequential(
+            nn.Linear(16 * 7, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
         )
-        if self.k:
-            future_dim = observation_space["future_blocks"].shape[1]
-            self.future: Optional[nn.Module] = nn.Sequential(
-                nn.Linear(self.k * (future_dim + 1), 128),
-                nn.ReLU(),
-                nn.Linear(128, 64),
-                nn.ReLU(),
-            )
-        else:
-            self.future = None
+        self.demand = nn.Sequential(
+            nn.Linear(12, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+        )
+        self.pending = nn.Sequential(
+            nn.Linear(32 * 8, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+        )
 
     def forward(
         self,
         observations: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         current = self.current(observations["block"])
-        if self.future is None:
-            future = current.new_zeros((current.shape[0], 64))
-        else:
-            mask = observations["future_mask"]
-            masked = observations["future_blocks"] * mask.unsqueeze(-1)
-            future_input = torch.cat(
-                [masked.flatten(1), mask.flatten(1)], dim=1
-            )
-            future = self.future(future_input)
-        return torch.cat([current, future], dim=1)
+
+        future_blocks = observations["future_blocks"]
+        future_mask = observations["future_mask"].to(
+            dtype=future_blocks.dtype
+        )
+        future_input = torch.cat(
+            [
+                future_blocks * future_mask.unsqueeze(-1),
+                future_mask.unsqueeze(-1),
+            ],
+            dim=-1,
+        ).flatten(1)
+        future = self.future(future_input)
+
+        demand = self.demand(observations["future_demand"].flatten(1))
+
+        pending_blocks = observations["pending_blocks"]
+        pending_mask = observations["pending_mask"].to(
+            dtype=pending_blocks.dtype
+        )
+        pending_input = torch.cat(
+            [
+                pending_blocks * pending_mask.unsqueeze(-1),
+                pending_mask.unsqueeze(-1),
+            ],
+            dim=-1,
+        ).flatten(2)
+        pending = self.pending(pending_input)
+        return current, future, demand, pending
 
 
 class _WorkspaceExtractor(BaseFeaturesExtractor):
-    """Fuse ordered block context with one feature vector per workspace."""
+    """Fuse corrected state with one feature vector per action workspace."""
 
     def __init__(
         self,
@@ -68,14 +145,18 @@ class _WorkspaceExtractor(BaseFeaturesExtractor):
         features_dim: int,
         grid_feature_dim: int,
     ):
+        _validate_observation_space(observation_space)
         super().__init__(observation_space, features_dim)
-        self.n_workspaces = observation_space["grids"].shape[0]
-        ws_meta_dim = observation_space["ws_meta"].shape[1]
-        self.block_encoder = OrderedBlockEncoder(observation_space)
+        self.n_workspaces = N_WORKSPACES
+        self.structured_encoder = StructuredStateEncoder()
 
         workspace_input_dim = (
-            OrderedBlockEncoder.output_dim
-            + ws_meta_dim
+            32
+            + 64
+            + 32
+            + 64
+            + 4
+            + 4
             + grid_feature_dim
         )
         self.workspace_fusion = nn.Sequential(
@@ -99,11 +180,17 @@ class _WorkspaceExtractor(BaseFeaturesExtractor):
         self,
         observations: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        context = self.block_encoder(observations)
-        workspace_context = context.unsqueeze(1).expand(
-            -1, self.n_workspaces, -1
+        current, future, demand, pending = self.structured_encoder(
+            observations
         )
-        inputs = [workspace_context, observations["ws_meta"]]
+        inputs = [
+            current.unsqueeze(1).expand(-1, self.n_workspaces, -1),
+            future.unsqueeze(1).expand(-1, self.n_workspaces, -1),
+            demand.unsqueeze(1).expand(-1, self.n_workspaces, -1),
+            pending,
+            observations["pending_summary"],
+            observations["ws_meta"],
+        ]
         grid_features = self._grid_features(observations)
         if grid_features is not None:
             inputs.append(grid_features)
