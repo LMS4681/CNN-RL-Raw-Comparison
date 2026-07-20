@@ -557,7 +557,7 @@ should_heartbeat = (
 should_stop = elapsed >= self._target_seconds
 ```
 
-On an absolute regular boundary, heartbeat, or stop, save locally to a unique temporary directory, flush the archive, copy it as `checkpoints/model_<timestep>_g<generation>.sb3.partial`, rename it to the never-overwritten final generation name, reopen it with `model_num_timesteps`, and verify its SHA256. Heartbeats do not move `last_regular_checkpoint_timestep`; crossing `10_000`, `20_000`, and later absolute boundaries does. Recompute elapsed after checkpoint I/O, append `generation,timestep,recorded_training_seconds,updated_at_utc,status,checkpoint_file` to `progress_timing.csv`, then write state. Only after a verified stop generation and reread state agree may `_on_step()` return `False`. Never create both this callback and `Sb3CheckpointCallback` in a wall-clock run.
+On an absolute regular boundary, heartbeat, or stop, save locally to a unique temporary directory, flush the archive, copy it as `checkpoints/model_<timestep>_g<generation>.sb3.partial`, rename it to the never-overwritten final generation name, reopen it with `model_num_timesteps`, and verify its SHA256. Heartbeats do not move `last_regular_checkpoint_timestep`; crossing `10_000`, `20_000`, and later absolute boundaries does. Recompute elapsed after checkpoint I/O, atomically write and reread authoritative `run_state.json` first, then atomically replace the whole strictly validated `progress_timing.csv`. Initialization reconciles only a valid future crash tail or a missing committed row; malformed/same-generation conflicts fail closed. Only after a verified stop generation and reread state/progress agree may `_on_step()` return `False`. Never create both this callback and `Sb3CheckpointCallback` in a wall-clock run.
 
 - [ ] **Step 5: Integrate training CLI without changing non-comparison defaults**
 
@@ -568,7 +568,7 @@ parser.add_argument("--wall-clock-heartbeat-seconds", type=float, default=300.0)
 parser.add_argument("--comparison-config-sha256", default=None)
 ```
 
-When the limit is positive, require a 64-character config SHA, use `output_dir / "run_state.json"` unless explicitly provided, skip the ordinary `Sb3CheckpointCallback`, and append `WallClockBudgetCallback` last so allocation diagnostics and holdout-selection time are charged. A zero limit preserves current callback behavior. After `learn()` returns, require `run_state.status == "complete"`; if the timestep ceiling returned first, raise and leave the arm incomplete. Save the conventional final model only after that gate. Generalized selected/fallback evaluation is implemented in Task 4.
+When the limit is positive, require a 64-character config SHA, use `output_dir / "run_state.json"` unless explicitly provided, skip the ordinary `Sb3CheckpointCallback`, and append `WallClockBudgetCallback` last so allocation diagnostics and holdout-selection time are charged. A zero limit preserves current callback behavior. Persist exact `run_origin.json` before the first `learn()`. After `learn()` returns, require `run_state.status == "complete"`; this commits only the budget/checkpoint, not the train stage. The shared idempotent finalizer saves/evaluates/records runtime without learning and writes `training_completion.json` last. Generalized selected/fallback evaluation is implemented in Task 4.
 
 - [ ] **Step 6: Run focused and full tests**
 
@@ -1025,7 +1025,7 @@ Use `subprocess.run(command, check=True, cwd=allocrl_dir)` with argument lists, 
 
 Use exact ordered stages `preflight`, both smokes, raw train/evaluate, CNN train/evaluate, common evaluation, report, integrity verification. `stage_journal.json` records for each stage `{status,input_sha256,output_sha256,started_at_utc,completed_at_utc,error}`. At startup, change prior `in_progress` to `interrupted`; skip a completed stage only when its current input/output hashes still match. Hold a root lease containing a random token, boot ID, PID and heartbeat; a context-managed daemon thread refreshes it every 60 seconds even while `subprocess.run()` blocks. Refuse a live second writer and allow explicit stale takeover only after 900 seconds.
 
-After any training subprocess, require complete state and a state checkpoint whose basename, SHA256 and stored timestep agree; normal process exit without that gate is failure. Before `COMPLETE.json`, require canonical baseline/comparison/config/scenario/split/lock hashes, exact unique scenario seed sets, all selected/final/common checkpoint hashes, and equality across arm environments for boot ID, GPU UUID, Torch/CUDA/cuDNN and lock hash. Any caught exception writes `comparison/PARTIAL_REPORT.md`; a VM kill is recognized and documented on the next invocation.
+After any training subprocess, require a fully validated `training_completion.json` receipt. A complete state without a receipt runs guarded finalize-only recovery against the exact state checkpoint; a valid receipt skips; an invalid present receipt fails closed. Before `COMPLETE.json`, require canonical baseline/comparison/config/scenario/split/lock hashes, exact unique scenario seed sets, all selected/final/common checkpoint hashes, and comparable device class, GPU model/memory, Torch/CUDA/cuDNN and lock facts across arm segments. Boot ID and GPU UUID remain recorded instance provenance but may change on guarded reboot recovery. Any caught exception writes `comparison/PARTIAL_REPORT.md`; a VM kill is recognized and documented on the next invocation.
 
 - [ ] **Step 6: Run focused and full tests**
 
@@ -1324,7 +1324,7 @@ After this point the notebook may run unattended. Do not start a second runtime 
 
 - [ ] **Step 5: Handle interruption without inventing completion**
 
-If the runtime stops, reopen the same tagged notebook and run all. The runner skips hash-verified completed stages and continues from the exact state checkpoint. If Colab preserved the VM, boot/GPU continuity can still pass. If it assigns a new VM/GPU, finish recoverable stages but generate a partial/degraded report: common-step quality may be shown, while the 3-hour wall-time comparison is explicitly non-comparable and `COMPLETE.json` is not created. If reconnection is not performed, preserve the last journal/state artifacts; do not mark the study complete.
+If the runtime stops, reopen the same tagged notebook and run all. The runner skips receipt-verified completed train stages and continues/finalizes from the exact state checkpoint. A new boot or physical instance of the same GPU model/memory and software runtime is accepted and remains visible as another environment segment; materially different hardware/runtime fails closed. If reconnection is not performed, preserve the last journal/state artifacts; do not mark the study complete.
 
 ---
 
@@ -1340,7 +1340,7 @@ If the runtime stops, reopen the same tagged notebook and run all. The runner sk
 
 - [ ] **Step 1: Verify completion marker and checksums**
 
-Require `COMPLETE.json`; both arm states `complete`; each recorded time at least 10,800 seconds with reported overrun; exact baseline/comparison/config/scenario/split/lock hashes; one VM boot ID/GPU UUID and matching Torch/CUDA/cuDNN across all segments; exact state filename/SHA/stored-timestep agreement; exact unique disjoint selection seeds `1000..1004` and primary seeds `1005..1019`; 20 final rows and 15 primary-test rows per arm; and readable selected/final/common models with manifest hashes. If any condition fails, publish only the partial/degraded report and exact missing conditions.
+Require `COMPLETE.json`; both arm `training_completion.json` receipts and complete states; each recorded time at least 10,800 seconds with reported overrun; exact baseline/comparison/config/scenario/split/lock hashes; comparable GPU model/memory and Torch/CUDA/cuDNN across all segments; exact state filename/SHA/stored-timestep agreement; exact unique disjoint selection seeds `1000..1004` and primary seeds `1005..1019`; 20 final rows and 15 primary-test rows per arm; and readable selected/final/common models with manifest hashes. If any condition fails, publish only the partial/degraded report and exact missing conditions.
 
 - [ ] **Step 2: Recompute summary from raw CSVs**
 

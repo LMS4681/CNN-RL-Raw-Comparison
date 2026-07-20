@@ -277,6 +277,8 @@ environment.json
 stage_journal.json
 raw_direct/
   run_state.json
+  run_origin.json
+  training_completion.json
   run_config.json
   environment_segments.jsonl
   runtime_metrics.json
@@ -378,6 +380,18 @@ CNN-RL-Raw-Comparison/
 구현 완료 조건은 focused tests, 기존 전체 regression, notebook contract 검사,
 두 smoke와 짧은 로컬 time-boxed end-to-end가 모두 통과하는 것이다. 실제
 6시간 결과는 코드 완료 조건이 아니라 Colab 운영 단계의 산출물이다.
+
+### 11.1 Persistence hardening clarification
+
+`run_state.json`의 `complete`는 학습 budget/checkpoint commit만 뜻하며 train stage
+전체 완료를 뜻하지 않는다. archive 검증 뒤 state를 먼저 원자적으로 쓰고 다시 읽은
+다음, 전체 `progress_timing.csv`를 원자적으로 교체한다. 재시작 시 progress는 state와
+엄격히 reconcile하며 malformed/conflicting evidence는 삭제하지 않고 실패한다. 모델 생성
+뒤 첫 `learn()` 전 관측 timestep은 `run_origin.json`에 기록한다. 평가, conventional 모델,
+runtime metrics가 모두 검증된 뒤에만 마지막으로 `training_completion.json` receipt를 쓰며,
+runner의 train-stage 완료/skip 기준은 이 receipt이다. 같은 GPU model/memory 및
+Torch/CUDA/cuDNN/runtime 사실을 유지한 새 VM boot/GPU instance는 재개할 수 있고,
+boot ID와 GPU UUID 자체는 segment provenance로 보존하되 cross-segment equality 조건은 아니다.
 
 ## 12. Operational Limitations
 

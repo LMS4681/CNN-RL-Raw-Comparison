@@ -16,6 +16,7 @@ import pytest
 def test_production_config_is_strict_and_commands_are_safe(tmp_path: Path):
     from comparison.experiment_runner import (
         ExperimentConfig,
+        build_finalize_command,
         build_smoke_command,
         build_train_command,
     )
@@ -27,6 +28,13 @@ def test_production_config_is_strict_and_commands_are_safe(tmp_path: Path):
     assert raw[raw.index("--extractor") + 1] == "raw-direct"
     assert cnn[cnn.index("--extractor") + 1] == "candidate-cnn"
     assert "--auto-resume" not in raw
+    finalize = build_finalize_command(
+        "raw_direct", config, tmp_path / "state.sb3",
+        output_root=tmp_path, lock_sha256="a" * 64,
+    )
+    assert "--finalize-complete-state" in finalize
+    assert finalize[finalize.index("--resume-from") + 1] == str(tmp_path / "state.sb3")
+    assert "--auto-resume" not in finalize
     assert build_smoke_command("raw_direct", config, output_root=tmp_path)[1:5] == [
         "smoke_test.py", "--extractor", "raw-direct", "--timesteps"
     ]
@@ -454,7 +462,8 @@ def test_environment_segment_validator_accepts_every_restart_and_arm(tmp_path: P
 
 
 @pytest.mark.parametrize("field,value", [
-    ("vm_boot_id", "other-vm"), ("torch_version", "other-torch"),
+    ("torch_version", "other-torch"), ("gpu_name", "other-gpu"),
+    ("gpu_total_memory_bytes", 999),
     ("cuda_version", "12.0"), ("cudnn_version", 9),
     ("lock_sha256", "f" * 64), ("comparison_git_sha", "b" * 40),
 ])
@@ -466,6 +475,23 @@ def test_environment_segment_validator_rejects_cross_arm_vm_library_or_hash_mism
     (runner.root / "candidate_cnn" / "environment_segments.jsonl").write_text(json.dumps(changed) + "\n", encoding="utf-8")
     with pytest.raises(ExperimentIntegrityError):
         runner_module._validate_environment_segments(runner.root, environment, runner.provenance(), production_loaded=False)
+
+
+def test_environment_segments_accept_new_boot_and_same_gpu_model_runtime(tmp_path: Path, monkeypatch):
+    runner_module, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
+    environment = environment | {
+        "resolved_device": "cuda:0", "gpu_name": "Same GPU",
+        "gpu_uuid": "GPU-old-instance", "gpu_total_memory_bytes": 1024,
+    }
+    changed = dict(environment)
+    changed.update(vm_boot_id="new-boot", gpu_uuid="GPU-new-instance", process_id=999)
+    for arm in ("raw_direct", "candidate_cnn"):
+        (runner.root / arm / "environment_segments.jsonl").write_text(
+            json.dumps(changed) + "\n", encoding="utf-8"
+        )
+    runner_module._validate_environment_segments(
+        runner.root, environment, runner.provenance(), production_loaded=False
+    )
 
 
 @pytest.mark.parametrize("payload", ["{bad json}\n", "{\"command\":[],\"command\":[]}\n", "\n"])
@@ -645,7 +671,7 @@ def test_train_rejects_every_unverified_or_incomplete_completion_state(tmp_path:
         runner.train("raw_direct")
 
 
-def test_train_valid_complete_state_skips_subprocess(tmp_path: Path, monkeypatch):
+def test_train_complete_state_without_receipt_runs_finalize_only(tmp_path: Path, monkeypatch):
     from comparison.experiment_runner import ExperimentConfig, _Runner
     config = ExperimentConfig.for_test(target_training_seconds_per_arm=10)
     _write_runner_state(tmp_path / "raw_direct", config)
@@ -653,7 +679,38 @@ def test_train_valid_complete_state_skips_subprocess(tmp_path: Path, monkeypatch
     runner = _Runner(config, tmp_path, subprocess_runner=lambda argv, **kwargs: calls.append(argv), clock=lambda: 0,
                      python_executable="python", archive_timestep_reader=lambda _: 7)
     monkeypatch.setattr(runner, "provenance", lambda: {"lock_sha256": "a" * 64})
+    monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
     runner.train("raw_direct")
+    assert len(calls) == 1
+    assert "--finalize-complete-state" in calls[0]
+
+
+def test_train_valid_receipt_skips_subprocess(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import ExperimentConfig, _Runner
+    config = ExperimentConfig.for_test(target_training_seconds_per_arm=10)
+    root = tmp_path / "raw_direct"; _write_runner_state(root, config)
+    (root / "training_completion.json").write_text("{}", encoding="utf-8")
+    calls = []
+    runner = _Runner(config, tmp_path, subprocess_runner=lambda argv, **kwargs: calls.append(argv), clock=lambda: 0,
+                     python_executable="python", archive_timestep_reader=lambda _: 7)
+    monkeypatch.setattr(runner, "provenance", lambda: {"lock_sha256": "a" * 64})
+    monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
+    runner.train("raw_direct")
+    assert calls == []
+
+
+def test_train_invalid_present_receipt_fails_closed_without_subprocess(tmp_path: Path, monkeypatch):
+    from comparison.experiment_runner import ExperimentConfig, _Runner
+    config = ExperimentConfig.for_test(target_training_seconds_per_arm=10)
+    root = tmp_path / "raw_direct"; _write_runner_state(root, config)
+    (root / "training_completion.json").write_text('{"corrupt":true}', encoding="utf-8")
+    calls = []
+    runner = _Runner(config, tmp_path, subprocess_runner=lambda argv, **kwargs: calls.append(argv), clock=lambda: 0,
+                     python_executable="python", archive_timestep_reader=lambda _: 7)
+    monkeypatch.setattr(runner, "provenance", lambda: {"lock_sha256": "a" * 64})
+    monkeypatch.setattr(runner, "_training_completion", lambda _root: (_ for _ in ()).throw(ValueError("invalid receipt")))
+    with pytest.raises(ValueError, match="invalid receipt"):
+        runner.train("raw_direct")
     assert calls == []
 
 
@@ -669,6 +726,7 @@ def test_train_resume_uses_only_state_named_checkpoint_not_higher_orphan(tmp_pat
     runner = _Runner(config, tmp_path, subprocess_runner=process, clock=lambda: 0,
                      python_executable="python", archive_timestep_reader=lambda path: 7 if path == named else 999)
     monkeypatch.setattr(runner, "provenance", lambda: {"lock_sha256": "a" * 64})
+    monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
     runner.train("raw_direct")
     assert commands[0][commands[0].index("--resume-from") + 1] == str(named)
     assert str(orphan) not in commands[0]
@@ -874,7 +932,7 @@ def test_report_integrity_validator_detects_post_report_input_changes(tmp_path: 
     _report_integrity_fixture(tmp_path); path = tmp_path / relative
     if path.suffix == ".json":
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if relative.endswith("runtime_metrics.json"): payload["end_to_end_training_seconds"] += 1
+        if relative.endswith("runtime_metrics.json"): payload["run_wall_span_seconds"] += 1
         else: payload["provenance"] = {"changed": True}
         path.write_text(json.dumps(payload), encoding="utf-8")
     else: path.write_text(path.read_text(encoding="utf-8").replace("0.4", "0.41", 1), encoding="utf-8")
@@ -1105,6 +1163,7 @@ def test_task6_train_and_integrity_reject_duplicate_run_state(tmp_path: Path, mo
     from comparison import experiment_runner as runner_module
 
     _, runner, _, _ = _integrity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
     path = runner.root / "raw_direct" / "run_state.json"; raw = path.read_text(encoding="utf-8").rstrip()
     path.write_text(raw[:-1] + ',"generation":999}', encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate"):
@@ -1179,11 +1238,12 @@ def test_integrity_output_hash_revalidates_environment_segments_before_skip(tmp_
     from comparison import experiment_runner as runner_module
 
     _, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
     monkeypatch.setattr(runner, "_state_complete", lambda *args: True)
     monkeypatch.setattr(runner_module, "_validate_checkpoint_manifest", lambda *args: None)
     monkeypatch.setattr(runner_module, "_validate_report_artifacts", lambda *args: {"summary.json": "a" * 64})
     runner.integrity()
-    (runner.root / "raw_direct" / "environment_segments.jsonl").write_text(json.dumps(environment | {"vm_boot_id": "tampered"}) + "\n", encoding="utf-8")
+    (runner.root / "raw_direct" / "environment_segments.jsonl").write_text(json.dumps(environment | {"torch_version": "tampered"}) + "\n", encoding="utf-8")
     with pytest.raises(runner_module.ExperimentIntegrityError):
         runner.output_hash("integrity_verification")
 
@@ -1265,6 +1325,7 @@ def test_complete_marker_revalidates_environment_segments_after_integrity_stage(
     from comparison import experiment_runner as runner_module
 
     _, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
     monkeypatch.setattr(runner, "_state_complete", lambda *args: True)
     monkeypatch.setattr(runner_module, "_validate_checkpoint_manifest", lambda *args: None)
     monkeypatch.setattr(runner_module, "_validate_report_artifacts", lambda *args: {"summary.json": "a" * 64})

@@ -35,6 +35,7 @@ from comparison.artifact_manifest import (
 from comparison.checkpoint_evaluator import evaluate_comparison_artifacts
 from comparison.report_builder import PAIR_COLUMNS, JOURNAL_STAGES, JOURNAL_STATUSES, build_comparison_summary, build_paired_differences, write_complete_report, write_partial_report
 from comparison.wall_clock_callback import atomic_write_json, read_wall_clock_state, resolve_state_checkpoint
+from comparison.training_completion import validate_training_completion
 from evaluation_scenarios import read_scenarios
 from holdout_model_selection import validate_fixed_holdout_scenarios
 
@@ -362,9 +363,13 @@ def _validate_environment_segments(
     """Require every persisted arm/restart environment to equal the root facts."""
     _validate_root_environment(environment, provenance, production_loaded=production_loaded)
     comparison_keys = (
-        "vm_boot_id", "resolved_device", "gpu_name", "gpu_uuid",
-        "gpu_total_memory_bytes", "torch_version", "cuda_version",
+        "gpu_name", "gpu_total_memory_bytes", "torch_version", "cuda_version",
         "cudnn_version", "lock_sha256", "comparison_git_sha", "comparison_git_dirty",
+        "baseline_sha256", "config_sha256", "scenario_sha256", "split_sha256",
+        "python_version", "platform", "cpu_count", "pip_freeze",
+    )
+    expected_device_class = (
+        "cuda" if str(environment["resolved_device"]).startswith("cuda:") else "cpu"
     )
     expected = tuple(environment[key] for key in comparison_keys)
     for arm in _COMPARISON_ARMS:
@@ -384,8 +389,11 @@ def _validate_environment_segments(
             raise ExperimentIntegrityError(f"empty environment segments for {arm}")
         for record in records:
             _validate_root_environment(record, provenance, production_loaded=production_loaded)
-            if tuple(record[key] for key in comparison_keys) != expected:
-                raise ExperimentIntegrityError("arms must use the same Colab VM/GPU/library environment")
+            device_class = (
+                "cuda" if str(record["resolved_device"]).startswith("cuda:") else "cpu"
+            )
+            if device_class != expected_device_class or tuple(record[key] for key in comparison_keys) != expected:
+                raise ExperimentIntegrityError("arms must use comparable GPU/CPU/library environments")
 
 
 @dataclass(frozen=True)
@@ -454,6 +462,15 @@ def build_train_command(arm: str, config: ExperimentConfig, resume_path: Path | 
         raise ExperimentIntegrityError("build_train_command requires a real preflight lock SHA-256")
     command = [python_executable or sys.executable, "train.py", "--output-dir", str(arm_root), "--timesteps", str(config.timesteps_ceiling), "--lr", str(config.learning_rate), "--n-steps", str(config.n_steps), "--batch-size", str(config.batch_size), "--n-epochs", str(config.n_epochs), "--gamma", str(config.gamma), "--gae-lambda", str(config.gae_lambda), "--n-envs", str(config.n_envs), "--vec-env", config.vec_env, "--device", config.device, "--seed", str(config.seed), "--extractor", extractor, "--state-context", config.state_context, "--eval-scenarios", config.scenario_path, "--max-training-seconds", str(config.target_training_seconds_per_arm), "--wall-clock-heartbeat-seconds", str(config.checkpoint_heartbeat_seconds), "--comparison-config-sha256", config.config_sha256, "--comparison-baseline-sha256", config.baseline_commit, "--comparison-scenario-sha256", config.fixed_scenarios_sha256, "--comparison-split-sha256", config.split_manifest_sha256, "--comparison-lock-sha256", lock_sha256, "--checkpoint-freq", str(config.checkpoint_freq), "--holdout-eval-freq", str(config.holdout_eval_freq), "--holdout-selection-count", str(config.holdout_selection_count), "--no-export-onnx"]
     if resume_path is not None: command += ["--resume-from", str(Path(resume_path))]
+    return command
+
+
+def build_finalize_command(arm: str, config: ExperimentConfig, resume_path: Path, *, output_root: str | Path = "output", python_executable: str | None = None, lock_sha256: str | None = None) -> list[str]:
+    command = build_train_command(
+        arm, config, resume_path, output_root=output_root,
+        python_executable=python_executable, lock_sha256=lock_sha256,
+    )
+    command.append("--finalize-complete-state")
     return command
 
 
@@ -604,7 +621,7 @@ class _Runner:
         self.save_journal(result); return result
     def save_journal(self, data: Mapping[str, Any]) -> None: atomic_write_json(self.journal_path, dict(data))
     def stage_path(self, name: str) -> Path:
-        return {"preflight":self.root/"manifest.json", "smoke_raw_direct":self.root/"smoke"/"raw_direct"/"runner_verified.json", "smoke_candidate_cnn":self.root/"smoke"/"candidate_cnn"/"runner_verified.json", "train_raw_direct":self.root/"raw_direct"/"run_state.json", "evaluate_raw_direct":self.root/"raw_direct"/"evaluation_stage.json", "train_candidate_cnn":self.root/"candidate_cnn"/"run_state.json", "evaluate_candidate_cnn":self.root/"candidate_cnn"/"evaluation_stage.json", "evaluate_common_step":self.root/"comparison"/"common_step_evaluation.csv", "build_report":self.root/"comparison"/"preliminary_comparison_ko.md", "integrity_verification":self.root/"integrity_verification.json"}[name]
+        return {"preflight":self.root/"manifest.json", "smoke_raw_direct":self.root/"smoke"/"raw_direct"/"runner_verified.json", "smoke_candidate_cnn":self.root/"smoke"/"candidate_cnn"/"runner_verified.json", "train_raw_direct":self.root/"raw_direct"/"training_completion.json", "evaluate_raw_direct":self.root/"raw_direct"/"evaluation_stage.json", "train_candidate_cnn":self.root/"candidate_cnn"/"training_completion.json", "evaluate_candidate_cnn":self.root/"candidate_cnn"/"evaluation_stage.json", "evaluate_common_step":self.root/"comparison"/"common_step_evaluation.csv", "build_report":self.root/"comparison"/"preliminary_comparison_ko.md", "integrity_verification":self.root/"integrity_verification.json"}[name]
     def output_hash(self, name: str) -> str:
         """Hash only artifacts owned by this stage, never mutable descendants."""
         if self._injected_output_hasher is not None: return self._injected_output_hasher(name)
@@ -618,13 +635,8 @@ class _Runner:
         if name.startswith("train_"):
             arm = name.removeprefix("train_")
             root = self.root / arm
-            state = read_wall_clock_state(root / "run_state.json")
-            checkpoint = resolve_state_checkpoint(root, state)
-            owned = {"state": asdict(state), "checkpoint_sha256": sha256_file(checkpoint)}
-            for filename in ("run_config.json", "runtime_metrics.json", "progress_timing.csv"):
-                path = root / filename
-                if path.is_file(): owned[filename] = sha256_file(path)
-            return canonical_json_sha256(owned)
+            self._training_completion(root)
+            return sha256_file(root / "training_completion.json")
         if name.startswith("evaluate_") and name != "evaluate_common_step":
             return sha256_file(self.stage_path(name))
         if name == "evaluate_common_step":
@@ -712,6 +724,7 @@ class _Runner:
     def evaluate_arm(self, arm: str) -> None:
         # The paired evaluator is the sole authority for selected/final CSVs;
         # this ordered stage proves the arm's complete state before CNN starts.
+        self._training_completion(self.root / arm)
         state=read_wall_clock_state(self.root/arm/"run_state.json")
         if not self._state_complete(self.root/arm,state): raise ExperimentIntegrityError("arm cannot be evaluated before a complete verified state")
         atomic_write_json(self.root/arm/"evaluation_stage.json",{"arm":arm,"checkpoint":state.last_checkpoint_file,"sha256":state.last_checkpoint_sha256,"timestep":state.last_checkpoint_timestep})
@@ -721,15 +734,30 @@ class _Runner:
         # recompute provenance here rather than retaining an invented/empty lock.
         self.lock_sha = self.provenance()["lock_sha256"]
         state_path=root/"run_state.json"
+        receipt_path=root/"training_completion.json"
+        if receipt_path.exists():
+            self._training_completion(root)
+            return
+        finalize_only = False
         if state_path.exists():
             state=read_wall_clock_state(state_path)
             checkpoint=resolve_state_checkpoint(root,state)
-            if self._state_complete(root, state): return
+            if self._state_complete(root, state): finalize_only = True
             resume=checkpoint
-        argv=build_train_command(arm,self.config,resume,output_root=self.root,python_executable=self.python,lock_sha256=self.lock_sha)
+        builder = build_finalize_command if finalize_only else build_train_command
+        argv=builder(arm,self.config,resume,output_root=self.root,python_executable=self.python,lock_sha256=self.lock_sha)
         self.command(f"train_{arm}",argv)
-        state=read_wall_clock_state(state_path)
-        if not self._state_complete(root,state): raise ExperimentStageError("training exited without a complete verified wall-clock state")
+        try: self._training_completion(root)
+        except (OSError, ValueError, TypeError, FileNotFoundError) as error:
+            raise ExperimentStageError("training exited without a valid completion receipt") from error
+    def _training_completion(self, root: Path) -> dict[str, Any]:
+        from train import model_num_timesteps
+        return validate_training_completion(
+            root,
+            expected_config_sha256=self.config.config_sha256,
+            expected_target_seconds=self.config.target_training_seconds_per_arm,
+            archive_timestep_reader=self.archive_reader or model_num_timesteps,
+        )
     def _state_complete(self, root: Path, state: Any) -> bool:
         if state.status!="complete" or state.config_sha256!=self.config.config_sha256 or state.target_training_seconds != self.config.target_training_seconds_per_arm or state.completed_training_seconds < self.config.target_training_seconds_per_arm: return False
         checkpoint=resolve_state_checkpoint(root,state)
@@ -749,6 +777,7 @@ class _Runner:
         _validate_root_manifest(manifest, provenance, environment)
         states: dict[str, Any] = {}
         for arm in ("raw_direct","candidate_cnn"):
+            self._training_completion(self.root / arm)
             state=read_wall_clock_state(self.root/arm/"run_state.json")
             if not self._state_complete(self.root/arm,state): raise ExperimentIntegrityError("incomplete arm")
             checkpoint = resolve_state_checkpoint(self.root / arm, state)
