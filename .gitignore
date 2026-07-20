@@ -1,6 +1,7 @@
 # Repository scope for CNN-RL: keep only AllocRL in Git.
 /*
 !/.gitignore
+!/.gitattributes
 !/AllocRL/
 !/AllocRL/**
 !/README.md

@@ -6,6 +6,11 @@
 - Split manifest SHA-256: `d3df1d0076248b4bcbddb4c910a3cb81481da65c7415c6b3cacf9e055cc3f9df`
 - Public comparison immutable tag: `overnight-v1`
 - Dependency lock SHA256: `2098a1d132dde6e3255b0e7be6193edb3b09f758565aa319837afd53dbdf4bd7`
+- Inherited `AllocRL/data` tree OID: `0140dfe704c607045da2f20faa32a0141e7bcc9b`
+
+The tracked `AllocRL/data` tree is inherited unchanged from the same owner's
+public baseline at the approved commit; this comparison adds or modifies no
+files under that directory.
 
 The comparison repository is a separate publication boundary. Comparison-only
 commits must never be placed onto the original upstream main/history. The

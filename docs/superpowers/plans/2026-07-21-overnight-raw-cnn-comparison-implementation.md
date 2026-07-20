@@ -1250,8 +1250,15 @@ Expected: clean comparison branch; original `origin` still points to `LMS4681/CN
 Run this tracked-content secret gate before any public push:
 
 ```powershell
-$hits = git grep -n -I -E '(ghp_[A-Za-z0-9]{20,}|github_pat_|AIza[0-9A-Za-z_-]{20,}|-----BEGIN (RSA|OPENSSH|EC) PRIVATE KEY-----)' HEAD
-if ($LASTEXITCODE -eq 0) { $hits; exit 1 }
+$secretPatternParts = @(
+    ('gh' + 'p_[A-Za-z0-9]{20,}'),
+    ('github' + '_pat_'),
+    ('AI' + 'za[0-9A-Za-z_-]{20,}'),
+    ('-----BEGIN ' + '(RSA|OPENSSH|EC) PRIVATE KEY-----')
+)
+$pattern = '(' + ($secretPatternParts -join '|') + ')'
+$hitFiles = git grep -l -I -E $pattern HEAD
+if ($LASTEXITCODE -eq 0) { $hitFiles; exit 1 }
 if ($LASTEXITCODE -ne 1) { exit $LASTEXITCODE }
 ```
 

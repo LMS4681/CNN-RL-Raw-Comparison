@@ -1,5 +1,7 @@
 # Raw Observation vs Candidate CNN: overnight Colab comparison
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/overnight-v1/notebooks/overnight_compare.ipynb)
+
 Use the one GPU Colab notebook at `notebooks/overnight_compare.ipynb`. Select a GPU runtime, then **Run all once**. Keep the browser tab/runtime active: the comparison takes approximately 6 hours plus setup/eval.
 
 Drive is authoritative. Rerun all to resume from the last verified generation after an interruption. After an abrupt VM termination, wait until the lease is more than 15 minutes old, then rerun all; the command performs guarded stale takeover. A VM kill can leave up to 300 seconds plus the current callback interval unrecorded. Colab cannot guarantee uninterrupted completion.

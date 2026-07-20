@@ -11,6 +11,20 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 NOTEBOOK_PATH = REPOSITORY_ROOT / "notebooks" / "overnight_compare.ipynb"
 ALLOC_RL = REPOSITORY_ROOT / "AllocRL"
+PLAN_PATH = (
+    REPOSITORY_ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-07-21-overnight-raw-cnn-comparison-implementation.md"
+)
+COLAB_BADGE = (
+    "[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)]"
+    "(https://colab.research.google.com/github/LMS4681/"
+    "CNN-RL-Raw-Comparison/blob/overnight-v1/notebooks/overnight_compare.ipynb)"
+)
+DATA_TREE_OID = "0140dfe704c607045da2f20faa32a0141e7bcc9b"
+LOCK_SHA256 = "2098a1d132dde6e3255b0e7be6193edb3b09f758565aa319837afd53dbdf4bd7"
 
 
 def load_notebook() -> dict[str, object]:
@@ -124,6 +138,49 @@ def test_direct_requirements_are_exact_and_lock_is_hashed_without_colab_gpu_pack
     )
     for pin in ("gymnasium==1.3.0", "stable-baselines3==2.9.0", "sb3-contrib==2.9.0"):
         assert pin in lock
+
+
+def test_readme_has_exact_pinned_colab_badge():
+    readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    assert COLAB_BADGE in readme
+
+
+def test_data_provenance_records_unchanged_upstream_tree():
+    provenance = (REPOSITORY_ROOT / "UPSTREAM_BASELINE.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(provenance.split())
+    assert DATA_TREE_OID in provenance
+    assert (
+        "The tracked `AllocRL/data` tree is inherited unchanged from the same "
+        "owner's public baseline at the approved commit; this comparison adds "
+        "or modifies no files under that directory."
+    ) in normalized
+
+
+def test_publication_secret_gate_does_not_match_itself_or_print_secret_values():
+    plan = PLAN_PATH.read_text(encoding="utf-8")
+    secret_pattern = re.compile(
+        "(" + "|".join((
+            "gh" + r"p_[A-Za-z0-9]{20,}",
+            "github" + r"_pat_",
+            "AI" + r"za[0-9A-Za-z_-]{20,}",
+            "-----BEGIN " + r"(RSA|OPENSSH|EC) PRIVATE KEY-----",
+        )) + ")"
+    )
+    assert secret_pattern.search(plan) is None
+    assert "$secretPatternParts = @(" in plan
+    assert "$pattern = '(' + ($secretPatternParts -join '|') + ')'" in plan
+    assert "git grep -l -I -E $pattern HEAD" in plan
+    assert "git grep -n -I -E" not in plan
+
+
+def test_comparison_lock_is_checked_out_as_canonical_lf_bytes():
+    lock = (ALLOC_RL / "requirements-comparison.txt").read_bytes()
+    assert b"\r\n" not in lock
+    assert hashlib.sha256(lock).hexdigest() == LOCK_SHA256
+    attributes = (REPOSITORY_ROOT / ".gitattributes").read_text(encoding="utf-8")
+    assert "AllocRL/requirements-comparison.txt text eol=lf" in attributes.splitlines()
 
 
 def test_operator_docs_bind_the_lock_and_disclose_colab_limitations():
