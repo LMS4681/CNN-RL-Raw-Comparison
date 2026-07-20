@@ -131,13 +131,14 @@ def visualize_grids(args):
 
     for i, ws in enumerate(workspaces):
         grid = grids[i]  # (4, G, G)
-        scale = renderer.compute_scale_value(ws)
+        coordinate_map = renderer.coordinate_map(ws)
 
         fig, axes = plt.subplots(1, 5, figsize=(25, 5))
         fig.suptitle(
             f"{ws.code} ({ws.name})  |  "
             f"{ws.length:.0f}×{ws.breadth:.0f}m  |  "
-            f"scale={scale:.3f} m/px  |  date={env_date}",
+            f"x={coordinate_map.x_px_per_m:.3f} px/m, "
+            f"y={coordinate_map.y_px_per_m:.3f} px/m  |  date={env_date}",
             fontsize=13, fontweight='bold'
         )
 
@@ -235,16 +236,21 @@ def visualize_grids(args):
     print(f"\n{'='*60}")
     print(f"  그리드 통계 요약 ({G}×{G})")
     print(f"{'='*60}")
-    print(f"{'작업장':>8} {'크기(m)':>14} {'scale':>8} {'lot':>6} {'excl%':>6} {'remaining':>9}")
+    print(
+        f"{'작업장':>8} {'크기(m)':>14} {'x px/m':>8} {'y px/m':>8} "
+        f"{'lot':>6} {'excl%':>6} {'remaining':>9}"
+    )
     print(f"{'-'*60}")
     for i, ws in enumerate(workspaces):
         grid = grids[i]
         lot_state = grid[2].mean()
         exclusion = grid[0].mean() * 100
         avg_ttl = grid[1][grid[1] > 0].mean() * 60 if grid[1].any() else 0
-        scale = renderer.compute_scale_value(ws)
+        coordinate_map = renderer.coordinate_map(ws)
         print(f"{ws.code:>8} {ws.length:>6.0f}×{ws.breadth:<6.0f} "
-              f"{scale:>7.3f} {lot_state:>5.2f} {exclusion:>5.1f}% "
+              f"x={coordinate_map.x_px_per_m:.3f} px/m "
+              f"y={coordinate_map.y_px_per_m:.3f} px/m "
+              f"{lot_state:>5.2f} {exclusion:>5.1f}% "
               f"{avg_ttl:>6.1f}일")
 
     print(f"\n총 이미지 {n_ws + 1}개 저장 → {out_dir}")

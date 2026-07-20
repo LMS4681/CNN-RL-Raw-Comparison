@@ -6,10 +6,11 @@ Updated: 2026-07-20
 
 - Repository: `https://github.com/LMS4681/CNN-RL.git`
 - Working branch: `feature/schema3-state-correction`
-- Approved implementation checkpoint before this handoff: `ecd1ff1`
+- Stage B implementation checkpoint: `d00e9ff`
+- Stage B integration-gate closure: this commit
 - Stage A base: `5aa39af`
 - Stage A contains nine implementation commits.
-- Stage B Task 1 was paused before any file edit, test run, or commit.
+- Stage B Tasks B1-B8 are complete and independently verified.
 
 Do not continue this work from `main` until the feature branch has been reviewed
 and merged. The feature branch is the source of truth for the remaining tasks.
@@ -46,15 +47,46 @@ The complete Stage A commit sequence after the design/plans is:
 8. `1ca1978` - shared original CSV result-row path
 9. `ecd1ff1` - reproducible baseline evaluation workflow
 
+Stage B, State and Geometry Correction, is complete:
+
+- Rotation is absent from every allocation path while `Block.turn()` remains
+  available only for compatibility.
+- Deterministic unassigned, future, and pending queues feed the fixed nine-key
+  schema-3 observation.
+- Candidate-conditioned grids use independent physical x/y coordinate maps,
+  fixed `64 x 64` geometry, and cache identity tied to observable state.
+- All extractors consume the corrected structured state under explicit
+  `full` and `current` state-context modes.
+- Training, resume, ONNX, fixed scenarios, and visualization enforce the
+  schema-3 compatibility contract.
+- The all-extractor smoke trained, saved, loaded, and evaluated `structured`,
+  `fixed-grid`, and `candidate-cnn`; the candidate CNN had nonzero gradients
+  and a nonzero parameter update.
+- The integration-gate closure removes the stale Colab future-count option,
+  repairs independent-axis grid reporting, and makes the future-choice preview
+  reuse the exact candidate position observed for the current action.
+
+The Stage B commit sequence after the handoff checkpoint is:
+
+1. `0c749a9` - prohibit block rotation in allocation paths
+2. `179f0e7`, `86c8f33` - deterministic placement queues and validation
+3. `b668852`, `8633316` - schema-3 future/pending encoders and validation
+4. `5cfe48b`, `7fa3956` - candidate grids, coordinate maps, and cache identity
+5. `60e2c6f`, `e787651` - schema-3 environment and scale contracts
+6. `d94d4ab`, `702ca26` - shared extractor state and strict validation
+7. `ecaa5e1`, `9702a38` - schema-3 tools and fixed-scenario scale bounds
+8. `d00e9ff` - independent Stage B extractor workflow verification
+
 ## Verification At Checkpoint
 
 Run from `AllocRL` unless the command is a Git command:
 
 ```powershell
-py -B -m pytest -q
+py -3.12 -m pytest -q
 ```
 
-Result: `147 passed, 3 warnings, 14 subtests passed`.
+Result after the Stage B integration-gate closure:
+`390 passed, 3 warnings, 54 subtests passed`.
 The three warnings are pre-existing dependency deprecations.
 
 ```powershell
@@ -90,14 +122,14 @@ one full regression run before commit, and a task-scoped review.
 
 Stage B, State and Geometry Correction:
 
-- [ ] B1 Remove rotation from every allocation path.
-- [ ] B2 Expose deterministic unassigned and pending queues.
-- [ ] B3 Build pure schema-3 structured encoders.
-- [ ] B4 Correct candidate-conditioned grid geometry.
-- [ ] B5 Integrate the fixed schema-3 environment contract.
-- [ ] B6 Share corrected structured state across all extractors.
-- [ ] B7 Version training, ONNX, and visualization contracts.
-- [ ] B8 Run the independent Stage B regression and contract audit.
+- [x] B1 Remove rotation from every allocation path.
+- [x] B2 Expose deterministic unassigned and pending queues.
+- [x] B3 Build pure schema-3 structured encoders.
+- [x] B4 Correct candidate-conditioned grid geometry.
+- [x] B5 Integrate the fixed schema-3 environment contract.
+- [x] B6 Share corrected structured state across all extractors.
+- [x] B7 Version training, ONNX, and visualization contracts.
+- [x] B8 Run the independent Stage B regression and contract audit.
 
 Stage C, Training Operations and Ablation:
 
@@ -109,10 +141,11 @@ Stage C, Training Operations and Ablation:
 - [ ] C6 Update the Colab schema-3 training workflow.
 - [ ] C7 Run end-to-end operational verification.
 
-The next task is B1 in
-`docs/superpowers/plans/2026-07-16-state-geometry-correction-implementation.md`.
-Its non-negotiable contract is that blocks cannot rotate. `Block.turn()` may
-remain defined for compatibility, but no allocation path may call it.
+The next task is C1 in
+`docs/superpowers/plans/2026-07-16-training-operations-ablation-implementation.md`:
+add deterministic fixed-holdout model selection. C1 must use the first five
+fixed scenarios for periodic selection and keep the full 20-scenario report
+separate from the one-shot original-CSV business reference.
 
 ## Continue On Another PC
 

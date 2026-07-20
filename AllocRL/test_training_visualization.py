@@ -1,18 +1,28 @@
 """Tests for CSV loss logging and notebook-friendly training plots."""
 
 import csv
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import matplotlib
 
 matplotlib.use("Agg")
 
 import train as train_module
+from alloc_env.block import Block
 from alloc_env.callbacks import AllocationCallback, TrainingMetricsCsvWriter
+from alloc_env.observation_state import ObservationScales
+from alloc_env.strategy import BaseGridStrategy
+from alloc_env.workspace import Workspace
 from plot_training_curves import plot_training_curves
+from visualize_grids import visualize_grids
 
 
 class TrainingVisualizationTests(unittest.TestCase):
@@ -47,7 +57,8 @@ class TrainingVisualizationTests(unittest.TestCase):
         )
 
         self.assertIn('EXTRACTOR       = "candidate-cnn"', notebook_text)
-        self.assertIn("N_FUTURE_BLOCKS = 4", notebook_text)
+        self.assertIn("OBSERVATION_SCHEMA_VERSION = 3", notebook_text)
+        self.assertIn('STATE_CONTEXT   = "full"', notebook_text)
         self.assertIn("GAE_LAMBDA", notebook_text)
         self.assertIn("SEED", notebook_text)
         self.assertIn("N_STEPS     = 960", notebook_text)
@@ -67,8 +78,74 @@ class TrainingVisualizationTests(unittest.TestCase):
         )
         self.assertIn("--monthly-jitter", notebook_text)
         self.assertIn("--empirical-profile-probability", notebook_text)
+        self.assertIn("--state-context", notebook_text)
+        self.assertNotIn("N_FUTURE_BLOCKS", notebook_text)
+        self.assertNotIn("--n-future-blocks", notebook_text)
         self.assertNotIn("EMBED_DIM", notebook_text)
         self.assertNotIn("NUM_HEADS", notebook_text)
+
+    def test_grid_workflow_reports_independent_coordinate_maps(self):
+        strategy = BaseGridStrategy(step=1.0)
+        workspace = Workspace(
+            code="RECTANGULAR",
+            name="Rectangular",
+            origin_x=0.0,
+            origin_y=0.0,
+            length=128.0,
+            breadth=32.0,
+            strategy=strategy,
+        )
+        block = Block(
+            name="CURRENT",
+            ship_no="T001",
+            block_type="BUILD",
+            length=4.0,
+            breadth=4.0,
+            height=1.0,
+            weight=1.0,
+            in_date=date(2026, 1, 5),
+            out_date=date(2026, 1, 20),
+        )
+        scales = ObservationScales(
+            max_length=4.0,
+            max_breadth=4.0,
+            max_duration=20,
+            base_date=date(2026, 1, 5),
+            date_span_workdays=1,
+            max_workspace_area=4096.0,
+            total_workspace_area=4096.0,
+            max_workspace_length=128.0,
+            max_workspace_breadth=32.0,
+            dropout_threshold=7,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = SimpleNamespace(
+                data_dir="unused",
+                output_dir=tmpdir,
+                grid_size=64,
+                synthetic=False,
+                date=None,
+                seed=0,
+            )
+            output = io.StringIO()
+            with (
+                patch.object(
+                    train_module,
+                    "load_allocation_scenario",
+                    return_value=([block], [workspace]),
+                ),
+                patch(
+                    "alloc_env.observation_state.build_observation_scales",
+                    return_value=scales,
+                ),
+                redirect_stdout(output),
+            ):
+                visualize_grids(args)
+
+        report = output.getvalue()
+        self.assertIn("x=0.500 px/m", report)
+        self.assertIn("y=2.000 px/m", report)
 
     def test_allocation_log_uses_resolved_reward_columns(self):
         with tempfile.TemporaryDirectory() as tmpdir:

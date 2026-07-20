@@ -41,6 +41,31 @@ class StatefulPlacementStrategy(BaseGridStrategy):
         return self.responses[len(self.calls) - 1]
 
 
+class PreviewConsistencyStrategy(BaseGridStrategy):
+    """Expose repeated current lookups across deep-copied workspaces."""
+
+    def __init__(self):
+        super().__init__(step=1.0)
+        self.calls = []
+
+    def __deepcopy__(self, memo):
+        del memo
+        return self
+
+    def determine_position(self, workspace, block, env_date):
+        del env_date
+        self.calls.append(block.name)
+        if block.name == "CURRENT":
+            current_calls = self.calls.count("CURRENT")
+            return (2.0, 2.0) if current_calls == 1 else (8.0, 2.0)
+
+        cached_current_was_applied = any(
+            placed.name == "CURRENT" and placed.ref_x == 2.0
+            for placed in workspace.blocks
+        )
+        return (12.0, 2.0) if cached_current_was_applied else None
+
+
 def make_env(
     *,
     block_length: float,
@@ -215,6 +240,38 @@ def test_environment_consumes_decision_time_candidate_without_second_query():
     assert decision_strategy.calls == ["CURRENT"]
     assert candidate_position == (10.0, 5.0)
     assert (placed.ref_x, placed.ref_y) == candidate_position
+
+
+def test_action_preview_reuses_observed_candidate_and_matches_applied_state():
+    strategy = PreviewConsistencyStrategy()
+    workspace = Workspace(
+        code="STATEFUL_PREVIEW",
+        origin_x=0.0,
+        origin_y=0.0,
+        length=16.0,
+        breadth=4.0,
+        strategy=strategy,
+    )
+    env = BlockPlacementEnv(
+        [decision_block("CURRENT"), decision_block("FUTURE", day=6)],
+        [workspace],
+        strategy,
+        grid_size=32,
+        observation_scales=fixture_scales([workspace]),
+    )
+    env.reset(seed=0)
+    future_indices = env.future_workspace_choice_indices()
+
+    preview_count = env.future_workspace_choice_count_after_action(
+        0, future_indices
+    )
+
+    assert strategy.calls.count("CURRENT") == 1
+    env.step(0)
+    applied_count = env.future_workspace_choice_count(future_indices)
+    placed = env._placement_simulator.blocks[0]
+    assert (placed.ref_x, placed.ref_y) == (2.0, 2.0)
+    assert preview_count == applied_count == 1
 
 
 def test_environment_consumes_observed_none_as_initial_miss():

@@ -583,9 +583,7 @@ class BlockPlacementEnv(gym.Env):
         preview_workspaces = list(self._workspaces)
         preview_workspaces[action] = self._workspaces[action].deep_copy()
         placed_block = simulator.current_block.clone()
-        position = preview_workspaces[action].determine_placement_position(
-            placed_block, self._env_date
-        )
+        position = self._candidate_placements[action].position
         if position is not None:
             center_x, center_y = position
             placed_block.move(
