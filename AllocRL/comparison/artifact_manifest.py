@@ -20,6 +20,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import torch
 
+from comparison.path_integrity import resolve_direct_regular_file
+
 
 FALLBACK_REASON_CODES = frozenset({
     "selection_not_run",
@@ -29,6 +31,7 @@ FALLBACK_REASON_CODES = frozenset({
     "best_model_unreadable",
     "best_model_timestep_mismatch",
 })
+CANONICAL_SELECTION_COUNT = 5
 
 
 REQUIRED_ENVIRONMENT_KEYS = frozenset(
@@ -334,12 +337,22 @@ def _validate_runtime_metrics_payload(
             payload["selection_count"] != 0
             or selection_tuple is not None
             or fallback_reason not in FALLBACK_REASON_CODES
+            or payload["selected_checkpoint_timestep"] != end
         ):
             raise ValueError("fallback selection provenance is invalid")
     elif outcome != "best_model":
         raise ValueError("runtime metrics selection_outcome is invalid")
-    elif fallback_reason is not None or payload["selection_count"] <= 0:
-        raise ValueError("best-model selection provenance is invalid")
+    elif (
+        fallback_reason is not None
+        or payload["selection_count"] != CANONICAL_SELECTION_COUNT
+    ):
+        raise ValueError(
+            "best-model selection_count/fallback provenance is invalid"
+        )
+    if payload["selected_checkpoint_timestep"] > end:
+        raise ValueError(
+            "runtime metrics selected checkpoint exceeds final timestep"
+        )
     if outcome == "best_model" and (
         not isinstance(selection_tuple, list)
         or len(selection_tuple) != 3
@@ -586,10 +599,68 @@ def _write_json(path: str | Path, payload: Mapping[str, Any]) -> None:
 
 
 def append_environment_segment(path: str | Path, payload: Mapping[str, Any]) -> None:
+    """Atomically append one record to a strictly valid JSON-lines ledger."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(_canonical_json(payload) + "\n")
+    try:
+        resolve_direct_regular_file(
+            destination.parent,
+            destination,
+            label="environment segment ledger",
+        )
+    except FileNotFoundError:
+        existing = []
+    else:
+        existing = read_environment_segments(destination)
+    record = parse_json_object(_canonical_json(dict(payload)))
+    expected = [*existing, record]
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        for item in expected:
+            stream.write(_canonical_json(item) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        temporary = Path(stream.name)
+    try:
+        os.replace(temporary, destination)
+        if read_environment_segments(destination) != expected:
+            raise ValueError(
+                "environment segment reread differs from written payload"
+            )
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def read_environment_segments(path: str | Path) -> list[dict[str, Any]]:
+    """Read a complete JSON-lines ledger and reject all partial/corrupt bytes."""
+    requested = Path(path)
+    try:
+        source = resolve_direct_regular_file(
+            requested.parent,
+            requested,
+            label="environment segment ledger",
+        )
+        raw = source.read_bytes()
+        if not raw or not raw.endswith(b"\n"):
+            raise ValueError("environment segment file must end with a newline")
+        text = raw.decode("utf-8")
+        lines = text.splitlines()
+        if not lines or any(not line for line in lines):
+            raise ValueError("environment segment file contains a blank record")
+        return [parse_json_object(line) for line in lines]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
+        if isinstance(error, ValueError) and str(error).startswith(
+            "environment segment"
+        ):
+            raise
+        raise ValueError(f"invalid environment segment file: {requested}") from error
 
 
 def write_runtime_metrics(path: str | Path, metrics: Mapping[str, Any]) -> None:

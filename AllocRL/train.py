@@ -41,6 +41,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 
 from comparison.wall_clock_callback import (
     WallClockBudgetCallback,
+    atomic_write_json,
     read_wall_clock_state,
     reconcile_progress_timing,
     resolve_state_checkpoint,
@@ -224,7 +225,7 @@ def comparison_runtime_provenance(args) -> dict[str, str]:
 
 
 def runtime_selected_checkpoint(
-    output_dir: str | Path, wall_clock_state, *, selection_count: int = 1
+    output_dir: str | Path, wall_clock_state
 ) -> dict[str, Any]:
     """Return the canonical selected/fallback decision for runtime metadata."""
     from comparison.checkpoint_evaluator import (
@@ -247,10 +248,7 @@ def runtime_selected_checkpoint(
         archive_timestep_reader=model_num_timesteps,
         final_reference=final,
     )
-    fields = decision.runtime_fields()
-    if decision.selection_outcome == "best_model":
-        fields["selection_count"] = int(selection_count)
-    return fields
+    return decision.runtime_fields()
 
 
 def _atomic_save_conventional_model(model, path: Path) -> None:
@@ -373,7 +371,6 @@ def finalize_complete_wall_clock_run(
             selected_checkpoint=runtime_selected_checkpoint(
                 output,
                 wall_clock_state,
-                selection_count=args.holdout_selection_count,
             ),
         ),
     )
@@ -790,9 +787,29 @@ def current_run_config(
 
 
 def write_run_config(output_dir, config) -> None:
-    import json
-    with open(Path(output_dir) / "run_config.json", "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+    """Publish a new run configuration atomically and verify its contents."""
+    destination = Path(output_dir) / "run_config.json"
+    payload = dict(config)
+    atomic_write_json(destination, payload)
+    if load_run_config(destination) != payload:
+        raise ValueError("Run configuration reread differs from written payload")
+
+
+def persist_run_config(output_dir, config, *, is_resume: bool) -> None:
+    """Publish once, then require byte-preserving exact compatibility."""
+    destination = Path(output_dir) / "run_config.json"
+    payload = dict(config)
+    if destination.exists():
+        if load_run_config(destination) != payload:
+            raise ValueError(
+                "Existing run configuration must exactly match the current run"
+            )
+        return
+    if is_resume:
+        raise FileNotFoundError(
+            f"Resume run configuration not found: {destination}"
+        )
+    write_run_config(output_dir, payload)
 
 
 def load_run_config(path: str | Path) -> dict:
@@ -1431,7 +1448,7 @@ def _train(args, resources: _TrainingResourceLifecycle):
     )
     resume_path = resolve_resume_path(args, output_dir, run_config)
     is_resume = resume_path is not None
-    write_run_config(output_dir, run_config)
+    persist_run_config(output_dir, run_config, is_resume=is_resume)
 
     # ── 2. Synthetic 블록 생성기 ─────────────────────────────────
     generator = SyntheticBlockGenerator.from_blocks(
@@ -1711,7 +1728,6 @@ def _train(args, resources: _TrainingResourceLifecycle):
                 selected_checkpoint=runtime_selected_checkpoint(
                     output_dir,
                     wall_clock_state,
-                    selection_count=args.holdout_selection_count,
                 ),
             ),
         )

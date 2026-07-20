@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from comparison.artifact_manifest import (
+    read_environment_segments,
     read_json_object,
     read_run_origin,
     read_runtime_metrics,
@@ -22,8 +23,10 @@ from comparison.wall_clock_callback import (
     atomic_write_json,
     read_progress_timing,
     read_wall_clock_state,
+    resolve_direct_regular_file,
     resolve_state_checkpoint,
 )
+from comparison.training_log_validation import read_curve_log
 
 
 REQUIRED_ARTIFACTS = (
@@ -58,6 +61,10 @@ RECEIPT_KEYS = frozenset(
     }
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_CURVE_LOG_KINDS = {
+    "training_log.csv": "training_log",
+    "loss_log.csv": "loss_log",
+}
 
 
 def _utc(value: object, field: str) -> datetime:
@@ -146,20 +153,22 @@ def read_training_completion(path: str | Path) -> dict[str, Any]:
 
 def _regular_file(root: Path, name: str, *, required: bool) -> Path | None:
     path = root / name
-    if path.is_symlink():
-        raise ValueError(f"training completion artifact is a symlink: {name}")
-    if not path.is_file():
+    try:
+        return resolve_direct_regular_file(
+            root,
+            path,
+            label=f"training completion artifact {name}",
+        )
+    except FileNotFoundError:
         if required:
             raise ValueError(f"training completion required artifact is absent: {name}")
         return None
-    return path
 
 
 def _validate_environment_segments(path: Path) -> None:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-        records = [json.loads(line) for line in lines if line.strip()]
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        records = read_environment_segments(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError("training completion environment segments are invalid") from error
     if not records or any(not isinstance(record, dict) for record in records):
         raise ValueError("training completion environment segments are empty or invalid")
@@ -252,6 +261,30 @@ def _bundle_receipt(
     }
     if any(runtime[key] != value for key, value in exact_runtime.items()):
         raise ValueError("training completion runtime/state/origin arithmetic differs")
+    from comparison.checkpoint_evaluator import (
+        CheckpointRef,
+        resolve_selection_decision,
+    )
+
+    final_reference = CheckpointRef(
+        checkpoint,
+        "final",
+        state.last_checkpoint_timestep,
+        state.last_checkpoint_sha256,
+    )
+    decision = resolve_selection_decision(
+        root,
+        archive_timestep_reader=archive_timestep_reader,
+        final_reference=final_reference,
+    )
+    expected_selection = decision.runtime_fields()
+    actual_selection = {
+        key: runtime[key] for key in expected_selection
+    }
+    if actual_selection != expected_selection:
+        raise ValueError(
+            "training completion selection provenance differs from canonical decision"
+        )
     trained = runtime["end_timestep"] - runtime["start_timestep"]
     expected_rate = (
         trained / runtime["recorded_training_seconds"]
@@ -268,12 +301,43 @@ def _bundle_receipt(
     if finalization_mode is not None and mode != finalization_mode:
         raise ValueError("training completion finalization mode differs")
     artifacts: dict[str, str | None] = {}
+    optional_paths: dict[str, Path | None] = {}
     for name, path in required.items():
         assert path is not None
         artifacts[name] = sha256_file(path)
     for name in OPTIONAL_ARTIFACTS:
         path = _regular_file(root, name, required=False)
+        optional_paths[name] = path
+        if path is not None and name in _CURVE_LOG_KINDS:
+            read_curve_log(path, _CURVE_LOG_KINDS[name])
         artifacts[name] = sha256_file(path) if path is not None else None
+    second_decision = resolve_selection_decision(
+        root,
+        archive_timestep_reader=archive_timestep_reader,
+        final_reference=final_reference,
+    )
+    if second_decision != decision:
+        raise ValueError(
+            "training completion selection changed while bundling artifacts"
+        )
+    if decision.selection_outcome == "best_model":
+        if (
+            optional_paths["holdout_selection.csv"] is None
+            or optional_paths["best_model.sb3"] is None
+            or artifacts["best_model.sb3"] != decision.reference.sha256
+        ):
+            raise ValueError(
+                "training completion best selection artifacts are incomplete"
+            )
+    for name in ("holdout_selection.csv", "best_model.sb3"):
+        current_path = _regular_file(root, name, required=False)
+        current_digest = (
+            sha256_file(current_path) if current_path is not None else None
+        )
+        if current_digest != artifacts[name]:
+            raise ValueError(
+                "training completion selection artifact changed while bundling"
+            )
     return {
         "schema_version": 1,
         "config_sha256": expected_config_sha256,
@@ -296,7 +360,11 @@ def validate_training_completion(
     archive_timestep_reader: Callable[[Path], int | None],
 ) -> dict[str, Any]:
     base = Path(root).resolve()
-    receipt = read_training_completion(base / "training_completion.json")
+    receipt_path = _regular_file(
+        base, "training_completion.json", required=True
+    )
+    assert receipt_path is not None
+    receipt = read_training_completion(receipt_path)
     expected = _bundle_receipt(
         base,
         expected_config_sha256=expected_config_sha256,
@@ -327,7 +395,8 @@ def write_training_completion(
 ) -> dict[str, Any]:
     base = Path(root).resolve()
     path = base / "training_completion.json"
-    if path.exists():
+    existing = _regular_file(base, "training_completion.json", required=False)
+    if existing is not None:
         try:
             return validate_training_completion(
                 base,
@@ -339,6 +408,12 @@ def write_training_completion(
             raise ValueError(
                 "existing training completion receipt is invalid; refusing overwrite"
             ) from error
+    for name, kind in _CURVE_LOG_KINDS.items():
+        curve_path = _regular_file(base, name, required=False)
+        if curve_path is not None:
+            read_curve_log(
+                curve_path, kind, repair_trailing_partial=True
+            )
     timestamp = finalized_at_utc or datetime.now(timezone.utc).isoformat()
     _utc(timestamp, "finalized_at_utc")
     receipt = _bundle_receipt(
@@ -351,9 +426,26 @@ def write_training_completion(
     )
     _validated_receipt(receipt)
     atomic_write_json(path, receipt)
-    return validate_training_completion(
-        base,
-        expected_config_sha256=expected_config_sha256,
-        expected_target_seconds=expected_target_seconds,
-        archive_timestep_reader=archive_timestep_reader,
-    )
+    published_bytes: bytes | None = None
+    try:
+        published_bytes = path.read_bytes()
+        return validate_training_completion(
+            base,
+            expected_config_sha256=expected_config_sha256,
+            expected_target_seconds=expected_target_seconds,
+            archive_timestep_reader=archive_timestep_reader,
+        )
+    except Exception:
+        try:
+            current = _regular_file(
+                base, "training_completion.json", required=True
+            )
+            if (
+                published_bytes is not None
+                and current is not None
+                and current.read_bytes() == published_bytes
+            ):
+                current.unlink()
+        except (OSError, ValueError):
+            pass
+        raise

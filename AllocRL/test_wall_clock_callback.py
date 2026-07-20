@@ -213,6 +213,83 @@ def test_archive_verified_before_state_crash_keeps_prior_generation(
     )] == [1]
 
 
+def test_state_checkpoint_must_be_a_direct_regular_file(tmp_path, fake_clock):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start()
+    model.num_timesteps = 100
+    callback.persist_checkpoint(status="running")
+    state = read_wall_clock_state(tmp_path / "run_state.json")
+
+    checkpoint = tmp_path / "checkpoints" / state.last_checkpoint_file
+    resolved = resolve_state_checkpoint(tmp_path, state)
+
+    assert resolved == checkpoint.resolve()
+    assert resolved.parent == (tmp_path / "checkpoints").resolve()
+    assert resolved.is_file() and not resolved.is_symlink()
+
+
+def test_direct_regular_file_containment_rejects_an_outside_regular_file(
+    tmp_path
+):
+    root = tmp_path / "checkpoints"
+    root.mkdir()
+    inside = root / "inside.sb3"
+    inside.write_bytes(b"inside")
+    outside = tmp_path / "outside.sb3"
+    outside.write_bytes(b"outside")
+
+    assert wall_clock_module.resolve_direct_regular_file(
+        root, inside, label="checkpoint"
+    ) == inside.resolve()
+    with pytest.raises(ValueError, match="direct regular"):
+        wall_clock_module.resolve_direct_regular_file(
+            root, outside, label="checkpoint"
+        )
+
+
+def test_state_checkpoint_rejects_symlink_file_escape(tmp_path, fake_clock):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start()
+    model.num_timesteps = 100
+    callback.persist_checkpoint(status="running")
+    state = read_wall_clock_state(tmp_path / "run_state.json")
+    checkpoint = tmp_path / "checkpoints" / state.last_checkpoint_file
+    outside = tmp_path / "outside.sb3"
+    outside.write_bytes(checkpoint.read_bytes())
+    checkpoint.unlink()
+    try:
+        checkpoint.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows host")
+
+    with pytest.raises(ValueError, match="direct regular"):
+        resolve_state_checkpoint(tmp_path, state)
+
+
+def test_state_checkpoint_rejects_symlinked_checkpoint_directory(
+    tmp_path, fake_clock
+):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start()
+    model.num_timesteps = 100
+    callback.persist_checkpoint(status="running")
+    state = read_wall_clock_state(tmp_path / "run_state.json")
+    checkpoints = tmp_path / "checkpoints"
+    checkpoint = checkpoints / state.last_checkpoint_file
+    outside = tmp_path / "outside-checkpoints"
+    outside.mkdir()
+    (outside / checkpoint.name).write_bytes(checkpoint.read_bytes())
+    checkpoint.unlink()
+    checkpoints.rmdir()
+    try:
+        checkpoints.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is unavailable on this Windows host")
+
+    with pytest.raises(ValueError, match="direct regular"):
+        resolve_state_checkpoint(tmp_path, state)
+
+
 def test_progress_failure_is_repaired_from_authoritative_state_on_resume(
     tmp_path, fake_clock, monkeypatch
 ):

@@ -29,6 +29,7 @@ from comparison.artifact_manifest import (
     _boot_id,
     canonical_json_sha256,
     collect_environment,
+    read_environment_segments,
     read_json_object,
     sha256_file,
 )
@@ -173,6 +174,61 @@ def _validate_root_manifest(
 _COMPARISON_ARMS = ("raw_direct", "candidate_cnn")
 _CHECKPOINT_KINDS = ("selected", "final", "common")
 _CHECKPOINT_REF_KEYS = frozenset({"path", "label", "sha256", "timestep"})
+_COMPARABLE_ENVIRONMENT_KEYS = (
+    "gpu_name",
+    "gpu_total_memory_bytes",
+    "torch_version",
+    "cuda_version",
+    "cudnn_version",
+    "lock_sha256",
+    "comparison_git_sha",
+    "comparison_git_dirty",
+    "baseline_sha256",
+    "config_sha256",
+    "scenario_sha256",
+    "split_sha256",
+)
+
+
+def _environment_device_class(environment: Mapping[str, Any]) -> str:
+    return (
+        "cuda"
+        if str(environment["resolved_device"]).startswith("cuda:")
+        else "cpu"
+    )
+
+
+def _validate_comparable_environment(
+    observed: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    provenance: Mapping[str, str],
+    *,
+    production_loaded: bool,
+) -> None:
+    """Apply the same strict comparison to live and persisted captures."""
+    try:
+        _validate_root_environment(
+            expected, provenance, production_loaded=production_loaded
+        )
+        _validate_root_environment(
+            observed, provenance, production_loaded=production_loaded
+        )
+    except ExperimentIntegrityError as error:
+        raise ExperimentIntegrityError(
+            "current and root environments are not comparable"
+        ) from error
+    differing = [
+        key
+        for key in _COMPARABLE_ENVIRONMENT_KEYS
+        if observed[key] != expected[key]
+    ]
+    if _environment_device_class(observed) != _environment_device_class(expected):
+        differing.append("device_class")
+    if differing:
+        raise ExperimentIntegrityError(
+            "current and root environments are not comparable: "
+            + ", ".join(differing)
+        )
 
 
 def _safe_checkpoint_path(root: Path, arm: str, value: Any) -> Path:
@@ -362,38 +418,21 @@ def _validate_environment_segments(
 ) -> None:
     """Require every persisted arm/restart environment to equal the root facts."""
     _validate_root_environment(environment, provenance, production_loaded=production_loaded)
-    comparison_keys = (
-        "gpu_name", "gpu_total_memory_bytes", "torch_version", "cuda_version",
-        "cudnn_version", "lock_sha256", "comparison_git_sha", "comparison_git_dirty",
-        "baseline_sha256", "config_sha256", "scenario_sha256", "split_sha256",
-        "python_version", "platform", "cpu_count", "pip_freeze",
-    )
-    expected_device_class = (
-        "cuda" if str(environment["resolved_device"]).startswith("cuda:") else "cpu"
-    )
-    expected = tuple(environment[key] for key in comparison_keys)
     for arm in _COMPARISON_ARMS:
         path = root / arm / "environment_segments.jsonl"
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeDecodeError) as error:
+            records = read_environment_segments(path)
+        except (OSError, UnicodeDecodeError, ValueError, TypeError) as error:
             raise ExperimentIntegrityError(f"missing environment segments for {arm}") from error
-        records: list[dict[str, Any]] = []
-        try:
-            for line in lines:
-                if line.strip():
-                    records.append(_strict_json_line(line))
-        except (json.JSONDecodeError, ValueError, TypeError) as error:
-            raise ExperimentIntegrityError(f"invalid environment segment for {arm}") from error
         if not records:
             raise ExperimentIntegrityError(f"empty environment segments for {arm}")
         for record in records:
-            _validate_root_environment(record, provenance, production_loaded=production_loaded)
-            device_class = (
-                "cuda" if str(record["resolved_device"]).startswith("cuda:") else "cpu"
+            _validate_comparable_environment(
+                record,
+                environment,
+                provenance,
+                production_loaded=production_loaded,
             )
-            if device_class != expected_device_class or tuple(record[key] for key in comparison_keys) != expected:
-                raise ExperimentIntegrityError("arms must use comparable GPU/CPU/library environments")
 
 
 @dataclass(frozen=True)
@@ -684,6 +723,24 @@ class _Runner:
         if lease is None: return
         if lease.failure is not None: raise LeaseError(f"lease heartbeat failed: {lease.failure}")
         if hasattr(lease, "assert_owned"): lease.assert_owned()
+    def _validate_current_environment(
+        self,
+        argv: Sequence[str],
+        provenance: Mapping[str, str],
+    ) -> None:
+        try:
+            expected_environment = _json(self.root / "environment.json")
+        except (OSError, ValueError, TypeError) as error:
+            raise ExperimentIntegrityError(
+                "current and root environments are not comparable"
+            ) from error
+        current_environment = collect_environment(argv, provenance)
+        _validate_comparable_environment(
+            current_environment,
+            expected_environment,
+            provenance,
+            production_loaded=self.config.production_loaded,
+        )
     def command(self, stage: str, argv: Sequence[str]) -> None:
         logs=self.root/"logs"; logs.mkdir(parents=True, exist_ok=True); log=logs/f"{stage}.log"
         with log.open("a", encoding="utf-8", newline="\n") as stream:
@@ -732,7 +789,8 @@ class _Runner:
         root=self.root/arm; root.mkdir(parents=True,exist_ok=True); resume=None
         # A restarted process may legitimately skip the preflight journal entry;
         # recompute provenance here rather than retaining an invented/empty lock.
-        self.lock_sha = self.provenance()["lock_sha256"]
+        provenance = self.provenance()
+        self.lock_sha = provenance["lock_sha256"]
         state_path=root/"run_state.json"
         receipt_path=root/"training_completion.json"
         if receipt_path.exists():
@@ -746,6 +804,7 @@ class _Runner:
             resume=checkpoint
         builder = build_finalize_command if finalize_only else build_train_command
         argv=builder(arm,self.config,resume,output_root=self.root,python_executable=self.python,lock_sha256=self.lock_sha)
+        self._validate_current_environment(argv, provenance)
         self.command(f"train_{arm}",argv)
         try: self._training_completion(root)
         except (OSError, ValueError, TypeError, FileNotFoundError) as error:

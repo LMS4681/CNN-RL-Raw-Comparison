@@ -133,6 +133,93 @@ def test_selection_decision_uses_canonical_fallback_reason(
     assert decision.selection_tuple is None
 
 
+def test_selection_after_exact_final_budget_is_invalid_metadata(tmp_path):
+    from comparison import checkpoint_evaluator as evaluator
+
+    final = _selection_fixture(tmp_path, final_timestep=60_000)
+    (tmp_path / "holdout_selection.csv").write_text(
+        "timestep,mean_terminal_score,mean_dropout_rate,mean_delay_days,is_best\n"
+        "70000,1.25,0.2,3.0,1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "best_model.sb3").write_bytes(b"checkpoint:70000")
+
+    decision = evaluator.resolve_selection_decision(
+        tmp_path, model_loader=_text_loader
+    )
+
+    assert decision.reference == evaluator.CheckpointRef(
+        final, "fallback_final", 60_000, _sha256(final)
+    )
+    assert decision.fallback_reason == "selection_metadata_invalid"
+
+
+def test_nonregular_selection_metadata_is_invalid_not_absent(tmp_path):
+    from comparison import checkpoint_evaluator as evaluator
+
+    _selection_fixture(tmp_path)
+    (tmp_path / "holdout_selection.csv").mkdir()
+
+    decision = evaluator.resolve_selection_decision(
+        tmp_path, model_loader=_text_loader
+    )
+
+    assert decision.selection_outcome == "fallback_final"
+    assert decision.fallback_reason == "selection_metadata_invalid"
+
+
+def test_symlinked_selection_metadata_is_never_followed(tmp_path):
+    from comparison import checkpoint_evaluator as evaluator
+
+    _selection_fixture(tmp_path)
+    outside = tmp_path.parent / f"{tmp_path.name}-selection.csv"
+    outside.write_text(
+        "timestep,mean_terminal_score,mean_dropout_rate,mean_delay_days,is_best\n"
+        "50000,1.25,0.2,3.0,1\n",
+        encoding="utf-8",
+    )
+    selection = tmp_path / "holdout_selection.csv"
+    try:
+        selection.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows host")
+    (tmp_path / "best_model.sb3").write_bytes(b"checkpoint:50000")
+
+    decision = evaluator.resolve_selection_decision(
+        tmp_path, model_loader=_text_loader
+    )
+
+    assert decision.selection_outcome == "fallback_final"
+    assert decision.fallback_reason == "selection_metadata_invalid"
+
+
+def test_best_model_mutation_during_read_falls_back_as_unreadable(tmp_path):
+    from comparison import checkpoint_evaluator as evaluator
+
+    _selection_fixture(tmp_path)
+    best = tmp_path / "best_model.sb3"
+    best.write_bytes(b"checkpoint:50000")
+    (tmp_path / "holdout_selection.csv").write_text(
+        "timestep,mean_terminal_score,mean_dropout_rate,mean_delay_days,is_best\n"
+        "50000,1.25,0.2,3.0,1\n",
+        encoding="utf-8",
+    )
+
+    def mutate_after_read(path):
+        timestep = _text_timestep(Path(path))
+        Path(path).write_bytes(b"checkpoint:50000-mutated")
+        return timestep
+
+    decision = evaluator.resolve_selection_decision(
+        tmp_path,
+        model_loader=_text_loader,
+        archive_timestep_reader=mutate_after_read,
+    )
+
+    assert decision.selection_outcome == "fallback_final"
+    assert decision.fallback_reason == "best_model_unreadable"
+
+
 def test_common_step_uses_largest_verified_regular_intersection(tmp_path, monkeypatch):
     from comparison import checkpoint_evaluator as evaluator
 

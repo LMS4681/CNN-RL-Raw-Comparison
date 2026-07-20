@@ -24,6 +24,7 @@ from typing import Any, Literal
 
 from stable_baselines3.common.callbacks import BaseCallback
 from comparison.artifact_manifest import read_json_object
+from comparison.path_integrity import resolve_direct_regular_file
 
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -380,13 +381,18 @@ def resolve_state_checkpoint(
 ) -> Path:
     """Return the exact state-named checkpoint after verifying its SHA256."""
     validated = _validated_state(asdict(state))
-    checkpoint = (
-        Path(output_dir) / "checkpoints" / validated.last_checkpoint_file
-    ).resolve()
-    if not checkpoint.is_file():
-        raise FileNotFoundError(
-            f"wall-clock state checkpoint is absent: {checkpoint}"
+    checkpoint_root = Path(output_dir) / "checkpoints"
+    candidate = checkpoint_root / validated.last_checkpoint_file
+    try:
+        checkpoint = resolve_direct_regular_file(
+            checkpoint_root,
+            candidate,
+            label="wall-clock state checkpoint",
         )
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"wall-clock state checkpoint is absent: {candidate}"
+        ) from error
     actual_sha256 = _file_sha256(checkpoint)
     if actual_sha256 != validated.last_checkpoint_sha256:
         raise ValueError(

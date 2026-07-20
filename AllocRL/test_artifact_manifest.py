@@ -201,6 +201,67 @@ def test_runtime_writers_use_real_json_files(tmp_path):
     assert read_runtime_metrics(metrics) == payload
 
 
+def test_environment_segment_append_is_atomic_and_strict(tmp_path, monkeypatch):
+    path = tmp_path / "environment_segments.jsonl"
+    append_environment_segment(path, {"segment": 1})
+    original = path.read_bytes()
+    assert artifact_manifest_module.read_environment_segments(path) == [
+        {"segment": 1}
+    ]
+
+    monkeypatch.setattr(
+        artifact_manifest_module.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+    with pytest.raises(OSError, match="replace failed"):
+        append_environment_segment(path, {"segment": 2})
+    assert path.read_bytes() == original
+
+
+def test_environment_segment_append_guards_existing_path_before_reading(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "environment_segments.jsonl"
+    path.write_text('{"segment":1}\n', encoding="utf-8")
+    original = path.read_bytes()
+    monkeypatch.setattr(
+        artifact_manifest_module,
+        "resolve_direct_regular_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("environment segment must be a direct regular file")
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        artifact_manifest_module,
+        "read_environment_segments",
+        lambda *_args: pytest.fail("guard must run before external-path read"),
+    )
+
+    with pytest.raises(ValueError, match="direct regular"):
+        append_environment_segment(path, {"segment": 2})
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        b'{"segment":1}\n{"segment":',
+        b'{"segment":1,"segment":2}\n',
+        b'{"segment":1}\n\n',
+    ],
+)
+def test_environment_segment_append_rejects_invalid_existing_file_without_mutation(
+    tmp_path, invalid
+):
+    path = tmp_path / "environment_segments.jsonl"
+    path.write_bytes(invalid)
+    with pytest.raises(ValueError, match="environment segment"):
+        append_environment_segment(path, {"segment": 3})
+    assert path.read_bytes() == invalid
+
+
 def test_run_origin_is_atomic_exact_and_never_inferred(tmp_path):
     path = tmp_path / "run_origin.json"
     origin = write_run_origin(
@@ -221,6 +282,8 @@ def test_run_origin_is_atomic_exact_and_never_inferred(tmp_path):
     "updates",
     [
         {"start_timestep": 121, "end_timestep": 120},
+        {"selected_checkpoint_timestep": 121},
+        {"selected_checkpoint_timestep": 119},
         {"recorded_training_seconds": 0.0, "steps_per_second": 1.0},
         {"recorded_training_seconds": 10.0, "steps_per_second": 99.0},
         {
@@ -413,7 +476,7 @@ def test_comparison_runtime_metrics_use_wall_clock_state_and_model_counts(
 
 def test_runtime_metrics_uses_verified_holdout_best_checkpoint(tmp_path, tiny_policy, monkeypatch):
     (tmp_path / "best_model.sb3").write_bytes(b"best")
-    state_checkpoint = tmp_path / "checkpoints" / "model_40_g1.sb3"
+    state_checkpoint = tmp_path / "checkpoints" / "model_60_g1.sb3"
     state_checkpoint.parent.mkdir()
     state_checkpoint.write_bytes(b"state")
     (tmp_path / "holdout_selection.csv").write_text(
@@ -425,17 +488,74 @@ def test_runtime_metrics_uses_verified_holdout_best_checkpoint(tmp_path, tiny_po
     selected = train_module.runtime_selected_checkpoint(
         tmp_path,
         SimpleNamespace(
-            last_checkpoint_timestep=40,
+            last_checkpoint_timestep=60,
             last_checkpoint_file=state_checkpoint.name,
             last_checkpoint_sha256=hashlib.sha256(b"state").hexdigest(),
         ),
     )
     assert selected["selected_checkpoint_timestep"] == 50
     assert selected["checkpoint_identity"]["filename"] == "best_model.sb3"
-    assert selected["selection_count"] == 1
+    assert selected["selection_count"] == 5
     assert selected["selection_tuple"] == [10.0, -0.2, -3.0]
     assert selected["selection_outcome"] == "best_model"
     assert selected["fallback_reason"] is None
+
+
+def test_runtime_metrics_best_selection_count_is_exactly_five(
+    tmp_path, tiny_policy
+):
+    model = SimpleNamespace(policy=tiny_policy, num_timesteps=120)
+    state = SimpleNamespace(
+        target_training_seconds=10.0,
+        completed_training_seconds=10.0,
+        restart_count=0,
+        max_unrecorded_seconds=1.0,
+        last_checkpoint_timestep=120,
+        last_checkpoint_file="model_120_g1.sb3",
+        last_checkpoint_sha256="a" * 64,
+        started_at_utc="2026-07-21T00:00:00+00:00",
+    )
+    selected = {
+        "selected_checkpoint_timestep": 100,
+        "selection_count": 4,
+        "selection_tuple": [1.0, -0.2, -3.0],
+        "selection_outcome": "best_model",
+        "fallback_reason": None,
+        "checkpoint_identity": {
+            "filename": "best_model.sb3",
+            "sha256": "b" * 64,
+        },
+    }
+    metrics = train_module.comparison_runtime_metrics(
+        model,
+        state,
+        origin={"initial_timestep": 0},
+        metrics_recorded_at_utc="2026-07-21T00:00:10+00:00",
+        evaluation_seconds=0.0,
+        finalization_mode="in_process",
+        selected_checkpoint=selected,
+    )
+
+    with pytest.raises(ValueError, match="selection_count"):
+        write_runtime_metrics(tmp_path / "runtime_metrics.json", metrics)
+
+
+def test_runtime_selected_checkpoint_has_no_selection_count_override(
+    tmp_path
+):
+    checkpoint = tmp_path / "checkpoints" / "model_40_g1.sb3"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"state")
+    state = SimpleNamespace(
+        last_checkpoint_timestep=40,
+        last_checkpoint_file=checkpoint.name,
+        last_checkpoint_sha256=hashlib.sha256(b"state").hexdigest(),
+    )
+
+    with pytest.raises(TypeError):
+        train_module.runtime_selected_checkpoint(
+            tmp_path, state, selection_count=1
+        )
 
 
 def test_runtime_metrics_falls_back_to_verified_complete_state_checkpoint(tmp_path):

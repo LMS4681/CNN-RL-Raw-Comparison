@@ -14,10 +14,12 @@ from sb3_contrib import MaskablePPO
 import evaluation_runner
 from alloc_env.observation_state import ObservationScales
 from comparison.artifact_manifest import (
+    CANONICAL_SELECTION_COUNT,
     FALLBACK_REASON_CODES,
     read_json_object,
     sha256_file,
 )
+from comparison.path_integrity import resolve_direct_regular_file
 from comparison.wall_clock_callback import atomic_write_json, read_wall_clock_state, resolve_state_checkpoint
 from evaluation_runner import ModelActionPolicy
 
@@ -27,6 +29,8 @@ EXPECTED_HOLDOUT_SEEDS = tuple(range(1000, 1020))
 SELECTION_SEEDS = tuple(range(1000, 1005))
 PRIMARY_TEST_SEEDS = tuple(range(1005, 1020))
 ARMS = ("raw_direct", "candidate_cnn")
+if len(SELECTION_SEEDS) != CANONICAL_SELECTION_COUNT:
+    raise RuntimeError("selection protocol count differs from canonical metadata")
 EVALUATION_COLUMNS = (
     "source", "policy", "seed", "mean_reward", "mean_terminal_score",
     "mean_dropout_rate", "mean_delay_days", "mean_delayed_count",
@@ -128,12 +132,22 @@ def _selection_best_row(
         "mean_delay_days", "is_best",
     )
     try:
-        if not selection_path.is_file() or selection_path.stat().st_size == 0:
+        selected_file = resolve_direct_regular_file(
+            selection_path.parent,
+            selection_path,
+            label="holdout selection metadata",
+        )
+    except FileNotFoundError:
+        return None, "selection_not_run"
+    except (OSError, ValueError):
+        return None, "selection_metadata_invalid"
+    try:
+        if selected_file.stat().st_size == 0:
             return None, "selection_not_run"
     except OSError:
         return None, "selection_metadata_invalid"
     try:
-        with selection_path.open(encoding="utf-8", newline="") as stream:
+        with selected_file.open(encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream)
             if tuple(reader.fieldnames or ()) != required:
                 return None, "selection_metadata_invalid"
@@ -204,42 +218,64 @@ def resolve_selection_decision(
     metadata, reason = _selection_best_row(root / "holdout_selection.csv")
     if metadata is not None:
         selected_timestep, ranking = metadata
+        if selected_timestep > final.timestep:
+            metadata = None
+            reason = "selection_metadata_invalid"
+    if metadata is not None:
+        selected_timestep, ranking = metadata
         best = root / "best_model.sb3"
-        if not best.exists():
+        try:
+            verified_best = resolve_direct_regular_file(
+                root, best, label="best model"
+            )
+        except FileNotFoundError:
             reason = "best_model_missing"
-        elif best.is_symlink() or not best.is_file():
+        except (OSError, ValueError):
             reason = "best_model_unreadable"
         else:
             try:
+                digest_before = sha256_file(verified_best)
                 actual_timestep = (
-                    archive_timestep_reader(best)
+                    archive_timestep_reader(verified_best)
                     if archive_timestep_reader is not None
-                    else _archive_timestep(best, model_loader)
+                    else _archive_timestep(verified_best, model_loader)
                 )
+                digest_after = sha256_file(verified_best)
+                stable_best = resolve_direct_regular_file(
+                    root, best, label="best model"
+                )
+                digest_stable = sha256_file(stable_best)
+            except FileNotFoundError:
+                reason = "best_model_missing"
             except (OSError, RuntimeError, ValueError, TypeError):
                 actual_timestep = None
-            if actual_timestep is None:
+                reason = "best_model_unreadable"
+            if reason in {"best_model_missing", "best_model_unreadable"}:
+                pass
+            elif (
+                stable_best != verified_best
+                or digest_before != digest_after
+                or digest_after != digest_stable
+            ):
+                reason = "best_model_unreadable"
+            elif actual_timestep is None:
                 reason = "best_model_unreadable"
             elif actual_timestep != selected_timestep:
                 reason = "best_model_timestep_mismatch"
             else:
-                try:
-                    digest = sha256_file(best)
-                except FileNotFoundError:
-                    reason = "best_model_missing"
-                except OSError:
-                    reason = "best_model_unreadable"
-                else:
-                    reference = CheckpointRef(
-                        best, "best_model", selected_timestep, digest
-                    )
-                    return SelectionDecision(
-                        reference=reference,
-                        selection_outcome="best_model",
-                        fallback_reason=None,
-                        selection_count=5,
-                        selection_tuple=ranking,
-                    )
+                reference = CheckpointRef(
+                    verified_best,
+                    "best_model",
+                    selected_timestep,
+                    digest_stable,
+                )
+                return SelectionDecision(
+                    reference=reference,
+                    selection_outcome="best_model",
+                    fallback_reason=None,
+                    selection_count=len(SELECTION_SEEDS),
+                    selection_tuple=ranking,
+                )
     if reason not in FALLBACK_REASON_CODES:
         raise PartialResultError("selection fallback reason is not canonical")
     fallback = CheckpointRef(

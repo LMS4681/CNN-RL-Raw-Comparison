@@ -311,6 +311,43 @@ def test_run_config_requires_manifest_compatibility_fields(missing_key):
         )
 
 
+def test_resume_run_config_is_validated_without_rewriting_bytes(tmp_path):
+    output = tmp_path / "output"
+    config = complete_config()
+    train_module.write_run_config(output, config)
+    path = output / "run_config.json"
+    original = path.read_bytes()
+
+    train_module.persist_run_config(output, config, is_resume=True)
+    assert path.read_bytes() == original
+
+    changed = dict(config)
+    changed["batch_size"] = 128
+    with pytest.raises(ValueError, match="exact"):
+        train_module.persist_run_config(output, changed, is_resume=True)
+    assert path.read_bytes() == original
+
+
+def test_new_run_config_publication_failure_preserves_existing_bytes(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / "output"
+    config = complete_config()
+    train_module.write_run_config(output, config)
+    path = output / "run_config.json"
+    original = path.read_bytes()
+    monkeypatch.setattr(
+        train_module,
+        "atomic_write_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("replace failed")),
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="replace failed"):
+        train_module.write_run_config(output, config)
+    assert path.read_bytes() == original
+
+
 def test_config_mismatch_diagnostics_report_one_line_per_key():
     saved = complete_config()
     current = complete_config()

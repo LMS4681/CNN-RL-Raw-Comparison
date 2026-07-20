@@ -680,6 +680,9 @@ def test_train_complete_state_without_receipt_runs_finalize_only(tmp_path: Path,
                      python_executable="python", archive_timestep_reader=lambda _: 7)
     monkeypatch.setattr(runner, "provenance", lambda: {"lock_sha256": "a" * 64})
     monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
+    monkeypatch.setattr(
+        runner, "_validate_current_environment", lambda *_args: None
+    )
     runner.train("raw_direct")
     assert len(calls) == 1
     assert "--finalize-complete-state" in calls[0]
@@ -695,6 +698,9 @@ def test_train_valid_receipt_skips_subprocess(tmp_path: Path, monkeypatch):
                      python_executable="python", archive_timestep_reader=lambda _: 7)
     monkeypatch.setattr(runner, "provenance", lambda: {"lock_sha256": "a" * 64})
     monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
+    monkeypatch.setattr(
+        runner, "_validate_current_environment", lambda *_args: None
+    )
     runner.train("raw_direct")
     assert calls == []
 
@@ -714,6 +720,111 @@ def test_train_invalid_present_receipt_fails_closed_without_subprocess(tmp_path:
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("resolved_device", "cuda:0"),
+        ("gpu_name", "different-gpu"),
+        ("gpu_total_memory_bytes", 2048),
+        ("torch_version", "different-torch"),
+        ("cuda_version", "different-cuda"),
+        ("cudnn_version", "different-cudnn"),
+        ("lock_sha256", "f" * 64),
+        ("comparison_git_sha", "b" * 40),
+    ],
+)
+def test_train_rejects_current_environment_mismatch_before_subprocess(
+    tmp_path: Path, monkeypatch, field: str, value: object
+):
+    from comparison.experiment_runner import ExperimentIntegrityError
+    from comparison.wall_clock_callback import atomic_write_json
+
+    runner_module, runner = _preflight_runner(tmp_path, monkeypatch)
+    provenance = runner.provenance()
+    root_environment = _valid_root_environment(
+        provenance, command=runner.runner_command
+    )
+    atomic_write_json(runner.root / "environment.json", root_environment)
+    current = dict(root_environment)
+    current[field] = value
+    if field == "resolved_device":
+        current.update(
+            gpu_name="GPU", gpu_uuid="GPU-current", gpu_total_memory_bytes=1024
+        )
+    elif field in {"gpu_name", "gpu_total_memory_bytes"}:
+        root_environment.update(
+            resolved_device="cuda:0",
+            gpu_name="GPU",
+            gpu_uuid="GPU-root",
+            gpu_total_memory_bytes=1024,
+        )
+        atomic_write_json(runner.root / "environment.json", root_environment)
+        current = dict(root_environment)
+        current[field] = value
+    seen: list[tuple[list[str], dict[str, str]]] = []
+    monkeypatch.setattr(
+        runner_module,
+        "collect_environment",
+        lambda command, supplied: (
+            seen.append((list(command), dict(supplied))),
+            current,
+        )[1],
+    )
+    calls: list[list[str]] = []
+    runner.subprocess_runner = lambda argv, **_kwargs: calls.append(list(argv))
+
+    with pytest.raises(ExperimentIntegrityError, match="comparable"):
+        runner.train("raw_direct")
+    assert calls == []
+    assert len(seen) == 1
+
+
+def test_train_current_environment_allows_new_boot_gpu_uuid_and_process(
+    tmp_path: Path, monkeypatch
+):
+    from comparison.wall_clock_callback import atomic_write_json
+
+    runner_module, runner = _preflight_runner(tmp_path, monkeypatch)
+    provenance = runner.provenance()
+    root_environment = _valid_root_environment(
+        provenance, command=runner.runner_command
+    ) | {
+        "resolved_device": "cuda:0",
+        "gpu_name": "Same GPU",
+        "gpu_uuid": "GPU-root-instance",
+        "gpu_total_memory_bytes": 1024,
+    }
+    atomic_write_json(runner.root / "environment.json", root_environment)
+    current = dict(root_environment)
+    current.update(
+        vm_boot_id="new-boot",
+        gpu_uuid="GPU-new-instance",
+        process_id=999,
+        python_version="different-python",
+        platform="different-vm-platform",
+        cpu_count=999,
+        pip_freeze=["different-instance-package==1"],
+    )
+    seen: list[tuple[list[str], dict[str, str]]] = []
+    monkeypatch.setattr(
+        runner_module,
+        "collect_environment",
+        lambda command, supplied: (
+            seen.append((list(command), dict(supplied))),
+            current,
+        )[1],
+    )
+    calls: list[list[str]] = []
+    runner.subprocess_runner = lambda argv, **_kwargs: calls.append(list(argv))
+    monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
+
+    runner.train("raw_direct")
+    assert len(calls) == 1
+    assert len(seen) == 1
+    assert seen[0][0] == calls[0]
+    assert seen[0][1] == provenance
+
+
 def test_train_resume_uses_only_state_named_checkpoint_not_higher_orphan(tmp_path: Path, monkeypatch):
     from comparison.experiment_runner import ExperimentConfig, _Runner
     config = ExperimentConfig.for_test(target_training_seconds_per_arm=10)
@@ -727,6 +838,9 @@ def test_train_resume_uses_only_state_named_checkpoint_not_higher_orphan(tmp_pat
                      python_executable="python", archive_timestep_reader=lambda path: 7 if path == named else 999)
     monkeypatch.setattr(runner, "provenance", lambda: {"lock_sha256": "a" * 64})
     monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
+    monkeypatch.setattr(
+        runner, "_validate_current_environment", lambda *_args: None
+    )
     runner.train("raw_direct")
     assert commands[0][commands[0].index("--resume-from") + 1] == str(named)
     assert str(orphan) not in commands[0]

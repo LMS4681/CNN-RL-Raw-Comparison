@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+from comparison.training_log_validation import read_curve_log
 import torch
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import KVWriter
@@ -134,6 +135,12 @@ class TrainingMetricsCsvWriter(KVWriter):
             and self._csv_path.is_file()
             and self._csv_path.stat().st_size > 0
         )
+        if append_existing:
+            read_curve_log(
+                self._csv_path,
+                "loss_log",
+                repair_trailing_partial=True,
+            )
         expected_header = [
             "timestep", *[column for _, column in self.METRIC_COLUMNS]
         ]
@@ -283,6 +290,12 @@ class AllocationCallback(BaseCallback):
             and self._csv_path.is_file()
             and self._csv_path.stat().st_size > 0
         )
+        if append_existing:
+            read_curve_log(
+                self._csv_path,
+                "training_log",
+                repair_trailing_partial=True,
+            )
         if append_existing:
             with self._csv_path.open(
                 encoding="utf-8", newline=""

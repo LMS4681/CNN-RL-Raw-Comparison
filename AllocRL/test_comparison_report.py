@@ -251,6 +251,35 @@ def test_optional_curve_logs_are_strict_and_loss_is_rendered(tmp_path):
     assert (tmp_path / "comparison" / "learning_curves.png").stat().st_size > 0
 
 
+def test_report_uses_shared_curve_validator_without_repair(tmp_path, monkeypatch):
+    from comparison import report_builder, training_log_validation
+
+    write_complete_fixture(tmp_path)
+    (tmp_path / "raw_direct" / "loss_log.csv").write_text(
+        "timestep,policy_gradient_loss,value_loss,entropy_loss,approx_kl,"
+        "clip_fraction,loss,explained_variance,cnn_gradient_norm,"
+        "cnn_weight_change,workspace_feature_variance,"
+        "candidate_channel_sensitivity\n10000,,,,,,0.1,,,,,\n",
+        encoding="utf-8",
+    )
+    calls = []
+    original = training_log_validation.read_curve_log
+
+    def spy(path, kind, *, repair_trailing_partial=False):
+        calls.append((Path(path).name, kind, repair_trailing_partial))
+        return original(
+            path,
+            kind,
+            repair_trailing_partial=repair_trailing_partial,
+        )
+
+    monkeypatch.setattr(training_log_validation, "read_curve_log", spy)
+    report_builder.write_complete_report(tmp_path)
+
+    assert ("loss_log.csv", "loss_log", False) in calls
+    assert calls.count(("training_log.csv", "training_log", False)) == 2
+
+
 def test_plots_close_figures_when_save_fails(tmp_path, monkeypatch):
     import matplotlib.pyplot as plt
     from comparison import report_builder
@@ -364,14 +393,17 @@ def test_report_renders_all_actual_runtime_and_selection_fields(tmp_path):
     write_complete_fixture(tmp_path)
     for arm, tag, fallback in (("raw_direct", "11", False), ("candidate_cnn", "22", True)):
         path = tmp_path / arm / "runtime_metrics.json"; p = json.loads(path.read_text("utf-8")); digest = ("a" if arm == "raw_direct" else "b") * 64
-        p.update({"target_training_seconds": float(tag), "recorded_training_seconds": float(tag)+.1, "run_wall_span_seconds":float(tag)+.2, "metrics_recorded_at_utc":f"2026-07-21T00:00:{float(tag)+.2:04.1f}+00:00", "overrun_seconds":(float(tag)+.1)-float(tag), "restart_count":int(tag), "max_unrecorded_seconds":float(tag)+.4, "start_timestep":int(tag)*100, "end_timestep":int(tag)*100+1, "steps_per_second":1/(float(tag)+.1), "evaluation_seconds":float(tag)+.6, "parameter_counts":{"total":int(tag)*10,"feature_extractor":int(tag),"policy":int(tag)*2,"value":int(tag)*7}, "peak_cuda_memory_bytes":int(tag)*1000, "selection_count":0 if fallback else 5, "selection_tuple":None if fallback else [1.1,2.2,3.3], "selection_outcome":"fallback_final" if fallback else "best_model", "fallback_reason":"selection_not_run" if fallback else None, "selected_checkpoint_timestep":50000, "checkpoint_identity":{"filename":"fallback.sb3" if fallback else "best_model.sb3","sha256":digest}}); _json(path,p)
+        selected_step = int(tag) * 100 + 1
+        p.update({"target_training_seconds": float(tag), "recorded_training_seconds": float(tag)+.1, "run_wall_span_seconds":float(tag)+.2, "metrics_recorded_at_utc":f"2026-07-21T00:00:{float(tag)+.2:04.1f}+00:00", "overrun_seconds":(float(tag)+.1)-float(tag), "restart_count":int(tag), "max_unrecorded_seconds":float(tag)+.4, "start_timestep":int(tag)*100, "end_timestep":selected_step, "steps_per_second":1/(float(tag)+.1), "evaluation_seconds":float(tag)+.6, "parameter_counts":{"total":int(tag)*10,"feature_extractor":int(tag),"policy":int(tag)*2,"value":int(tag)*7}, "peak_cuda_memory_bytes":int(tag)*1000, "selection_count":0 if fallback else 5, "selection_tuple":None if fallback else [1.1,2.2,3.3], "selection_outcome":"fallback_final" if fallback else "best_model", "fallback_reason":"selection_not_run" if fallback else None, "selected_checkpoint_timestep":selected_step, "checkpoint_identity":{"filename":"fallback.sb3" if fallback else "best_model.sb3","sha256":digest}}); _json(path,p)
         origin_path=tmp_path/arm/"run_origin.json"; origin=json.loads(origin_path.read_text("utf-8")); origin["initial_timestep"]=int(tag)*100; _json(origin_path,origin)
         state_path=tmp_path/arm/"run_state.json"; state=json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds":float(tag),"completed_training_seconds":float(tag)+.1,"restart_count":int(tag),"max_unrecorded_seconds":float(tag)+.4,"last_checkpoint_timestep":int(tag)*100+1}); _json(state_path,state)
-        manifest=json.loads((tmp_path/"manifest.json").read_text("utf-8")); manifest["checkpoints"][arm]["selected"].update({"label":"fallback_final" if fallback else "best_model","path":f"{arm}/{'fallback.sb3' if fallback else 'best_model.sb3'}"}); _json(tmp_path/"manifest.json",manifest)
+        manifest=json.loads((tmp_path/"manifest.json").read_text("utf-8")); manifest["checkpoints"][arm]["selected"].update({"label":"fallback_final" if fallback else "best_model","path":f"{arm}/{'fallback.sb3' if fallback else 'best_model.sb3'}","timestep":selected_step}); _json(tmp_path/"manifest.json",manifest)
         for name in ("evaluation_scenarios.csv","evaluation_primary_test.csv"):
             file=tmp_path/arm/name
             with file.open(encoding="utf-8",newline="") as s: rows=list(csv.DictReader(s))
-            for row in rows: row["checkpoint"]="fallback_final" if fallback else "best_model"
+            for row in rows:
+                row["checkpoint"]="fallback_final" if fallback else "best_model"
+                row["checkpoint_timestep"] = str(selected_step)
             _write_csv(file,rows)
     text=write_complete_report(tmp_path).read_text("utf-8")
     for value in ("11.0","11.1","11.2","11.4","11.6","22.0","22.1","22.2","22.4","22.6","1100","1101","2200","2201","11000","22000","selection count 5","selection count 0","[1.1, 2.2, 3.3]","best_model","fallback_final","fallback 사유: 자료 없음"):
@@ -383,9 +415,17 @@ def test_zero_recorded_runtime_allows_null_steps_per_second_and_extra_manifest_m
     from comparison.report_builder import build_comparison_summary, write_complete_report
     write_complete_fixture(tmp_path)
     for arm in ("raw_direct", "candidate_cnn"):
-        path=tmp_path/arm/"runtime_metrics.json"; payload=json.loads(path.read_text("utf-8")); payload.update({"target_training_seconds":0.0,"recorded_training_seconds":0.0,"overrun_seconds":0.0,"start_timestep":7,"end_timestep":7,"steps_per_second":None}); _json(path,payload)
+        path=tmp_path/arm/"runtime_metrics.json"; payload=json.loads(path.read_text("utf-8")); payload.update({"target_training_seconds":0.0,"recorded_training_seconds":0.0,"overrun_seconds":0.0,"start_timestep":7,"end_timestep":7,"selected_checkpoint_timestep":7,"steps_per_second":None}); _json(path,payload)
         origin_path=tmp_path/arm/"run_origin.json"; origin=json.loads(origin_path.read_text("utf-8")); origin["initial_timestep"]=7; _json(origin_path,origin)
         state_path=tmp_path/arm/"run_state.json"; state=json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds":0.0,"completed_training_seconds":0.0,"last_checkpoint_timestep":7}); _json(state_path,state)
+        manifest_path=tmp_path/"manifest.json"; manifest_payload=json.loads(manifest_path.read_text("utf-8")); manifest_payload["checkpoints"][arm]["selected"]["timestep"]=7; _json(manifest_path,manifest_payload)
+        for name in ("evaluation_scenarios.csv", "evaluation_primary_test.csv"):
+            file = tmp_path / arm / name
+            with file.open(encoding="utf-8", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            for row in rows:
+                row["checkpoint_timestep"] = "7"
+            _write_csv(file, rows)
     manifest=tmp_path/"manifest.json"; payload=json.loads(manifest.read_text("utf-8")); payload["provenance"]={"run":"x"}; _json(manifest,payload)
     summary=build_comparison_summary(tmp_path); assert summary["raw_direct"]["runtime_metrics"]["steps_per_second"] is None and summary["manifest"]["provenance"] == {"run":"x"}
     assert "자료 없음" in write_complete_report(tmp_path).read_text("utf-8")

@@ -27,6 +27,7 @@ from comparison.artifact_manifest import (
 )
 from comparison.checkpoint_evaluator import ARMS, EVALUATION_COLUMNS, PRIMARY_TEST_SEEDS, SELECTION_SEEDS
 from comparison.wall_clock_callback import read_progress_timing, read_wall_clock_state
+from comparison import training_log_validation
 
 
 HEADLINE_COLUMNS = (
@@ -36,8 +37,8 @@ PAIR_COLUMNS = (
     "seed", "terminal_score_delta_cnn_minus_raw", "dropout_rate_delta_cnn_minus_raw",
     "mean_delay_days_delta_cnn_minus_raw", "delayed_count_delta_cnn_minus_raw",
 )
-TRAINING_LOG_COLUMNS = ("episode", "timestep", "resolved_reward", "terminal_residual", "terminal_score", "episode_reward", "delayed_count", "dropout_count", "total_delay_days", "success_rate")
-LOSS_LOG_COLUMNS = ("timestep", "policy_gradient_loss", "value_loss", "entropy_loss", "approx_kl", "clip_fraction", "loss", "explained_variance", "cnn_gradient_norm", "cnn_weight_change", "workspace_feature_variance", "candidate_channel_sensitivity")
+TRAINING_LOG_COLUMNS = training_log_validation.TRAINING_LOG_COLUMNS
+LOSS_LOG_COLUMNS = training_log_validation.LOSS_LOG_COLUMNS
 PROGRESS_TIMING_COLUMNS = ("generation", "timestep", "recorded_training_seconds", "updated_at_utc", "status", "checkpoint_file")
 JOURNAL_STAGES = ("preflight", "smoke_raw_direct", "smoke_candidate_cnn", "train_raw_direct", "evaluate_raw_direct", "train_candidate_cnn", "evaluate_candidate_cnn", "evaluate_common_step", "build_report", "integrity_verification")
 JOURNAL_STATUSES = frozenset({"pending", "in_progress", "interrupted", "failed", "complete"})
@@ -345,6 +346,8 @@ def _curve_rows(path: Path, columns: tuple[str, ...], name: str) -> list[dict[st
             {key: str(value) for key, value in vars(row).items()}
             for row in read_progress_timing(path)
         ]
+    if name in {"training_log", "loss_log"}:
+        return training_log_validation.read_curve_log(path, name)
     with path.open(encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
         if tuple(reader.fieldnames or ()) != columns: raise ValueError(f"{name} has incompatible header")
