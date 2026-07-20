@@ -6,11 +6,14 @@ Updated: 2026-07-20
 
 - Repository: `https://github.com/LMS4681/CNN-RL.git`
 - Working branch: `feature/schema3-state-correction`
-- Stage B implementation checkpoint: `d00e9ff`
-- Stage B integration-gate closure: this commit
+- Current implementation checkpoint before this handoff: `2b5b66a`
+- Stage B integration-gate closure: `c7aced7`
+- Stage C approved checkpoint through C3: `76d878c`
+- C4 implementation checkpoint: `2b5b66a` (review rejected; fixes remain)
 - Stage A base: `5aa39af`
 - Stage A contains nine implementation commits.
 - Stage B Tasks B1-B8 are complete and independently verified.
+- Stage C Tasks C1-C3 are complete and independently verified.
 
 Do not continue this work from `main` until the feature branch has been reviewed
 and merged. The feature branch is the source of truth for the remaining tasks.
@@ -76,6 +79,19 @@ The Stage B commit sequence after the handoff checkpoint is:
 6. `d94d4ab`, `702ca26` - shared extractor state and strict validation
 7. `ecaa5e1`, `9702a38` - schema-3 tools and fixed-scenario scale bounds
 8. `d00e9ff` - independent Stage B extractor workflow verification
+9. `c7aced7` - Stage B integration-gate closure
+
+Stage C completed work:
+
+1. `1840f65`, `cd481b6` - deterministic fixed-holdout model selection,
+   selected-model reporting, and deterministic environment/model cleanup
+2. `cfe2c60`, `4301aa6` - complete run compatibility and newest readable
+   training-state resume selection, including real corrupt-archive handling
+3. `1a28170`, `76d878c` - rollout-level candidate-CNN diagnostics with zero
+   diagnostic observation copies for non-CNN extractors
+
+C4 was implemented in `2b5b66a`, but its independent review rejected the task.
+Do not treat C4 as complete. The next worker must fix and re-review it before C5.
 
 ## Verification At Checkpoint
 
@@ -85,8 +101,9 @@ Run from `AllocRL` unless the command is a Git command:
 py -3.12 -m pytest -q
 ```
 
-Result after the Stage B integration-gate closure:
-`390 passed, 3 warnings, 54 subtests passed`.
+Result at the current C4 implementation checkpoint:
+`504 passed, 3 warnings, 54 subtests passed`.
+The passing suite does not supersede the unresolved C4 review findings below.
 The three warnings are pre-existing dependency deprecations.
 
 ```powershell
@@ -133,19 +150,38 @@ Stage B, State and Geometry Correction:
 
 Stage C, Training Operations and Ablation:
 
-- [ ] C1 Add deterministic fixed-holdout model selection.
-- [ ] C2 Complete run configuration and automatic resume selection.
-- [ ] C3 Reduce CNN diagnostics to one observation copy per rollout.
+- [x] C1 Add deterministic fixed-holdout model selection.
+- [x] C2 Complete run configuration and automatic resume selection.
+- [x] C3 Reduce CNN diagnostics to one observation copy per rollout.
 - [ ] C4 Generate exact smoke, screening, and final commands.
 - [ ] C5 Produce screening-selection and final-acceptance reports.
 - [ ] C6 Update the Colab schema-3 training workflow.
 - [ ] C7 Run end-to-end operational verification.
 
-The next task is C1 in
-`docs/superpowers/plans/2026-07-16-training-operations-ablation-implementation.md`:
-add deterministic fixed-holdout model selection. C1 must use the first five
-fixed scenarios for periodic selection and keep the full 20-scenario report
-separate from the one-shot original-CSV business reference.
+The next task is to repair C4 against the task definition in
+`docs/superpowers/plans/2026-07-16-training-operations-ablation-implementation.md`.
+Its independent review found these unresolved items:
+
+1. Reject argparse abbreviations in forwarded common arguments. For example,
+   `--final-holdout` currently bypasses the controlled-option check and is
+   accepted by `train.py` as `--final-holdout-report` in non-final stages.
+2. Remove the obsolete three-argument `build_ablation_commands` adapter. It can
+   still generate the old 20,000/100,000-step contract without the required
+   hyperparameter, checkpoint, and holdout flags. Update its stale test in
+   `test_evaluation_scenarios.py`.
+3. Require each exported builder call to use the exact frozen seed tuple for its
+   stage. Reject duplicate, missing, extra, or reordered seeds so output paths
+   remain collision-free and counts remain exactly 5/60/25.
+4. Reject repeated `--selected-gae-lambda` and `--selected-n-steps` CLI options
+   instead of silently using the last occurrence.
+5. Correct the `--dry-run` documentation or make dry-run suppress scenario
+   preparation and baseline evaluation consistently. The current documentation
+   incorrectly says it applies to any invocation.
+
+After these fixes, rerun the C4 focused and full suites, obtain a fresh C4
+review, and only then continue with C5. Local `.superpowers/sdd` task reports are
+ignored and are not transferred through Git; this tracked handoff and the
+tracked plan above are the authoritative continuation record.
 
 ## Continue On Another PC
 
