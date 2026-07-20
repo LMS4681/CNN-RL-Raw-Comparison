@@ -1,33 +1,28 @@
-"""
-작업장 점유 상태 → 3채널 정규화 그리드 렌더러.
-
-각 작업장의 블록 배치 상태를 128×128 의 3채널 이미지로 변환.
-- Ch0: 블록 점유 마스크       (0=빈 셀, 1=점유)
-- Ch1: 잔여 출고 공기         (0=빈 셀, 정규화된 잔여일수)
-- Ch2: 작업장 경계 마스크     (1=작업장 내부, 0=패딩)
-
-정규화 방식: 비율 유지 리사이즈 (Aspect-Ratio-Preserving Resize)
-  - 작업장의 큰 축을 GRID_SIZE에 맞추고, 작은 축은 비율에 따라 축소
-  - 패딩 영역은 Ch2=0으로 구분
-"""
+"""Physical workspace rasterization for base and candidate state."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Optional, Tuple
+import math
+from numbers import Integral
+from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .block import Block, PrePlacedBlock
+from .block import SAFETY_DISTANCE, Block
+from .observation_state import working_days_until
+from .strategy import BaseGridStrategy
 from .workspace import Workspace
 
 
-# ── 상수 ──────────────────────────────────────────────────────────
-
 GRID_SIZE = 64
+BASE_CHANNELS = 2
+CANDIDATE_CONTEXT_CHANNELS = 2
+MAX_REMAINING_DAYS = 60
+
+# Temporary B4 compatibility constant. B5 removes the legacy three-channel API.
 NUM_CHANNELS = 3
-MAX_REMAINING_DAYS = 60  # 잔여 공기 정규화 기준 (60일 이상은 1.0으로 클리핑)
 
 
 @dataclass(frozen=True)
@@ -41,66 +36,275 @@ class CandidatePlacement:
         return self.position is not None
 
 
+@dataclass(frozen=True)
+class CoordinateMap:
+    x_px_per_m: float
+    y_px_per_m: float
+
+
 class OccupancyGridRenderer:
-    """
-    작업장 점유 상태를 3채널 정규화 그리드로 렌더링.
-
-    비율 유지 리사이즈를 통해 모든 작업장이 동일한 GRID_SIZE×GRID_SIZE에 수용되며,
-    CNN 가중치 공유가 가능하다.
-    """
-
     def __init__(self, grid_size: int = GRID_SIZE):
-        self.grid_size = grid_size
+        if (
+            isinstance(grid_size, bool)
+            or not isinstance(grid_size, Integral)
+            or grid_size <= 0
+        ):
+            raise ValueError("grid_size must be a positive integer")
+        self.grid_size = int(grid_size)
 
-    # ── 공개 API ──────────────────────────────────────────────────
+    def coordinate_map(self, ws: Workspace) -> CoordinateMap:
+        self._validate_workspace_geometry(ws)
+        return CoordinateMap(
+            x_px_per_m=self.grid_size / ws.length,
+            y_px_per_m=self.grid_size / ws.breadth,
+        )
 
+    def rectangle_bounds(
+        self,
+        ws: Workspace,
+        center_x: float,
+        center_y: float,
+        length: float,
+        breadth: float,
+    ) -> tuple[int, int, int, int]:
+        mapping = self.coordinate_map(ws)
+        self._validate_rectangle_geometry(
+            center_x, center_y, length, breadth
+        )
+
+        left = center_x - length / 2.0
+        right = center_x + length / 2.0
+        bottom = center_y - breadth / 2.0
+        top = center_y + breadth / 2.0
+
+        x0, x1 = self._axis_bounds(
+            left,
+            right,
+            ws.origin_x,
+            ws.length,
+            mapping.x_px_per_m,
+        )
+        y0, y1 = self._axis_bounds(
+            bottom,
+            top,
+            ws.origin_y,
+            ws.breadth,
+            mapping.y_px_per_m,
+        )
+        return x0, y0, x1, y1
+
+    def render_base(self, ws: Workspace, env_date: date) -> np.ndarray:
+        self.coordinate_map(ws)
+        grid = np.zeros(
+            (BASE_CHANNELS, self.grid_size, self.grid_size),
+            dtype=np.float32,
+        )
+        for block in ws.blocks:
+            self._render_existing_exclusion(
+                grid,
+                ws,
+                block.ref_x,
+                block.ref_y,
+                block.length,
+                block.breadth,
+                block.out_date,
+                env_date,
+            )
+        for placed in ws.get_active_pre_placements(env_date):
+            self._render_existing_exclusion(
+                grid,
+                ws,
+                placed.pos_x,
+                placed.pos_y,
+                placed.length,
+                placed.breadth,
+                placed.end_date,
+                env_date,
+            )
+        return grid
+
+    def render_candidate_context(
+        self,
+        ws: Workspace,
+        candidate: CandidatePlacement,
+        current_block: Block,
+        env_date: date,
+    ) -> np.ndarray:
+        self.coordinate_map(ws)
+        context = np.zeros(
+            (CANDIDATE_CONTEXT_CHANNELS, self.grid_size, self.grid_size),
+            dtype=np.float32,
+        )
+        preview = ws.deep_copy()
+
+        if candidate.position is not None:
+            center_x, center_y = candidate.position
+            block = current_block.clone()
+            block.move(center_x - block.ref_x, center_y - block.ref_y)
+            preview.add_block(block, env_date)
+            self._render_rectangle(
+                context[1],
+                ws,
+                center_x,
+                center_y,
+                block.length + 2 * SAFETY_DISTANCE,
+                block.breadth + 2 * SAFETY_DISTANCE,
+                value=1.0,
+            )
+
+        if not preview.has_lots:
+            context[0].fill(0.25)
+            return context
+
+        strategy = preview.strategy or BaseGridStrategy()
+        occupied = strategy.occupied_lot_ids(
+            preview, current_block.in_date, current_block.out_date
+        )
+        for lot in preview.lots:
+            self._render_rectangle(
+                context[0],
+                preview,
+                lot.origin_x + lot.length / 2.0,
+                lot.origin_y + lot.breadth / 2.0,
+                lot.length,
+                lot.breadth,
+                value=1.0 if lot.lot_id in occupied else 0.25,
+            )
+        return context
+
+    def _render_existing_exclusion(
+        self,
+        grid: np.ndarray,
+        ws: Workspace,
+        center_x: float,
+        center_y: float,
+        length: float,
+        breadth: float,
+        out_date: date,
+        env_date: date,
+    ) -> None:
+        x0, y0, x1, y1 = self.rectangle_bounds(
+            ws,
+            center_x,
+            center_y,
+            length + 2 * SAFETY_DISTANCE,
+            breadth + 2 * SAFETY_DISTANCE,
+        )
+        if x1 <= x0 or y1 <= y0:
+            return
+
+        grid[0, y0:y1, x0:x1] = 1.0
+        lifetime = min(
+            working_days_until(env_date, out_date) / MAX_REMAINING_DAYS,
+            1.0,
+        )
+        lifetime_slice = grid[1, y0:y1, x0:x1]
+        np.maximum(lifetime_slice, lifetime, out=lifetime_slice)
+
+    def _render_rectangle(
+        self,
+        channel: np.ndarray,
+        ws: Workspace,
+        center_x: float,
+        center_y: float,
+        length: float,
+        breadth: float,
+        value: float,
+    ) -> None:
+        x0, y0, x1, y1 = self.rectangle_bounds(
+            ws, center_x, center_y, length, breadth
+        )
+        if x1 <= x0 or y1 <= y0:
+            return
+        rectangle = channel[y0:y1, x0:x1]
+        np.maximum(rectangle, value, out=rectangle)
+
+    def _axis_bounds(
+        self,
+        low: float,
+        high: float,
+        origin: float,
+        extent: float,
+        px_per_m: float,
+    ) -> tuple[int, int]:
+        axis_end = origin + extent
+        clipped_low = max(low, origin)
+        clipped_high = min(high, axis_end)
+        if clipped_high <= clipped_low:
+            boundary = 0 if high <= origin else self.grid_size
+            return boundary, boundary
+
+        lower = math.floor((clipped_low - origin) * px_per_m)
+        upper = math.ceil((clipped_high - origin) * px_per_m)
+        lower = min(max(lower, 0), self.grid_size)
+        upper = min(max(upper, 0), self.grid_size)
+        if upper <= lower:
+            if lower >= self.grid_size:
+                lower = self.grid_size - 1
+                upper = self.grid_size
+            else:
+                upper = lower + 1
+        return lower, upper
+
+    @staticmethod
+    def _validate_workspace_geometry(ws: Workspace) -> None:
+        values = {
+            "origin_x": ws.origin_x,
+            "origin_y": ws.origin_y,
+            "length": ws.length,
+            "breadth": ws.breadth,
+        }
+        for name, value in values.items():
+            try:
+                finite = math.isfinite(value)
+            except TypeError as error:
+                raise ValueError(
+                    f"workspace {name} must be finite"
+                ) from error
+            if not finite:
+                raise ValueError(f"workspace {name} must be finite")
+        if ws.length <= 0 or ws.breadth <= 0:
+            raise ValueError("workspace length and breadth must be positive")
+
+    @staticmethod
+    def _validate_rectangle_geometry(
+        center_x: float,
+        center_y: float,
+        length: float,
+        breadth: float,
+    ) -> None:
+        values = {
+            "center_x": center_x,
+            "center_y": center_y,
+            "length": length,
+            "breadth": breadth,
+        }
+        for name, value in values.items():
+            try:
+                finite = math.isfinite(value)
+            except TypeError as error:
+                raise ValueError(
+                    f"rectangle {name} must be finite"
+                ) from error
+            if not finite:
+                raise ValueError(f"rectangle {name} must be finite")
+        if length <= 0 or breadth <= 0:
+            raise ValueError("rectangle length and breadth must be positive")
+
+    # Temporary B4 compatibility methods. B5 switches alloc_env.py to the
+    # four-channel APIs above and removes these adapters.
     def render(
         self,
         ws: Workspace,
         env_date: date,
         max_remaining_days: int = MAX_REMAINING_DAYS,
     ) -> np.ndarray:
-        """
-        단일 작업장 → (3, grid_size, grid_size) float32 그리드.
-
-        Args:
-            ws: 렌더링할 작업장
-            env_date: 현재 환경 날짜 (잔여 공기 계산 기준)
-            max_remaining_days: 잔여 공기 정규화 최대값
-
-        Returns:
-            (3, H, W) float32 ndarray, 값 범위 [0, 1]
-        """
-        G = self.grid_size
-        grid = np.zeros((NUM_CHANNELS, G, G), dtype=np.float32)
-
-        # ── 스케일 계산 (비율 유지) ───────────────────────────────
-        scale_info = self._compute_scale(ws)
-        grid_l, grid_b = scale_info["grid_l"], scale_info["grid_b"]
-        offset_x, offset_y = scale_info["offset_x"], scale_info["offset_y"]
-
-        # ── Ch2: 작업장 경계 마스크 ───────────────────────────────
-        grid[2, offset_y : offset_y + grid_b, offset_x : offset_x + grid_l] = 1.0
-
-        # ── 배치된 블록 렌더링 (Ch0, Ch1) ─────────────────────────
-        for blk in ws.blocks:
-            self._render_block(
-                grid, blk, ws, scale_info, env_date, max_remaining_days,
-                pos_x=blk.ref_x, pos_y=blk.ref_y,
-                length=blk.length, breadth=blk.breadth,
-                out_date=blk.out_date,
-            )
-
-        # ── 기배치 블록 렌더링 (Ch0, Ch1) ─────────────────────────
-        for pp in ws.get_active_pre_placements(env_date):
-            self._render_block(
-                grid, None, ws, scale_info, env_date, max_remaining_days,
-                pos_x=pp.pos_x, pos_y=pp.pos_y,
-                length=pp.length, breadth=pp.breadth,
-                out_date=pp.end_date,
-            )
-
-        return grid
+        del max_remaining_days
+        base = self.render_base(ws, env_date)
+        workspace_mask = np.ones(
+            (1, self.grid_size, self.grid_size), dtype=np.float32
+        )
+        return np.concatenate([base, workspace_mask], axis=0)
 
     def render_all(
         self,
@@ -108,15 +312,13 @@ class OccupancyGridRenderer:
         env_date: date,
         max_remaining_days: int = MAX_REMAINING_DAYS,
     ) -> np.ndarray:
-        """
-        전체 작업장 → (N, 3, grid_size, grid_size) float32 텐서.
-        """
-        N = len(workspaces)
-        grids = np.zeros((N, NUM_CHANNELS, self.grid_size, self.grid_size),
-                         dtype=np.float32)
-        for i, ws in enumerate(workspaces):
-            grids[i] = self.render(ws, env_date, max_remaining_days)
-        return grids
+        return np.stack(
+            [
+                self.render(ws, env_date, max_remaining_days)
+                for ws in workspaces
+            ],
+            axis=0,
+        )
 
     def render_candidate_mask(
         self,
@@ -128,177 +330,101 @@ class OccupancyGridRenderer:
         )
         if candidate.position is None:
             return mask
-
         center_x, center_y = candidate.position
         self._render_rectangle(
             mask[0],
             ws,
-            self._compute_scale(ws),
             center_x,
             center_y,
-            candidate.length,
-            candidate.breadth,
+            candidate.length + 2 * SAFETY_DISTANCE,
+            candidate.breadth + 2 * SAFETY_DISTANCE,
             value=1.0,
         )
         return mask
 
     def compute_scale_value(self, ws: Workspace) -> float:
-        """
-        작업장의 1px당 미터 수 (정규화용).
-
-        Returns:
-            scale (m/px), 정규화 시 max_scale로 나눌 수 있음.
-        """
-        max_dim = max(ws.length, ws.breadth, 1.0)
-        return max_dim / self.grid_size
-
-    # ── 내부 헬퍼 ─────────────────────────────────────────────────
-
-    def _compute_scale(self, ws: Workspace) -> Dict[str, int]:
-        """비율 유지 리사이즈를 위한 스케일 정보 계산."""
-        G = self.grid_size
-        ws_l = max(ws.length, 1.0)
-        ws_b = max(ws.breadth, 1.0)
-        max_dim = max(ws_l, ws_b)
-
-        scale = G / max_dim  # px/m
-        grid_l = max(1, min(G, round(ws_l * scale)))
-        grid_b = max(1, min(G, round(ws_b * scale)))
-
-        # 센터링 오프셋
-        offset_x = (G - grid_l) // 2
-        offset_y = (G - grid_b) // 2
-
-        return {
-            "scale": scale,
-            "grid_l": grid_l,
-            "grid_b": grid_b,
-            "offset_x": offset_x,
-            "offset_y": offset_y,
-            "ws_length": ws_l,
-            "ws_breadth": ws_b,
-        }
-
-    def _world_to_pixel(
-        self,
-        wx: float,
-        wy: float,
-        scale_info: Dict[str, int],
-        ws: Workspace,
-    ) -> Tuple[int, int]:
-        """물리 좌표(m, 센터 기준) → 픽셀 좌표."""
-        scale = scale_info["scale"]
-        offset_x = scale_info["offset_x"]
-        offset_y = scale_info["offset_y"]
-
-        # 작업장 원점 기준 상대 좌표
-        rel_x = wx - ws.origin_x
-        rel_y = wy - ws.origin_y
-
-        px = int(rel_x * scale) + offset_x
-        py = int(rel_y * scale) + offset_y
-
-        return px, py
-
-    def _render_block(
-        self,
-        grid: np.ndarray,
-        blk: Optional[Block],
-        ws: Workspace,
-        scale_info: Dict,
-        env_date: date,
-        max_remaining_days: int,
-        *,
-        pos_x: float,
-        pos_y: float,
-        length: float,
-        breadth: float,
-        out_date: date,
-    ) -> None:
-        """단일 블록을 그리드에 렌더링 (Ch0, Ch1)."""
-        self._render_rectangle(
-            grid[0], ws, scale_info,
-            pos_x, pos_y, length, breadth, value=1.0,
-        )
-
-        # Ch1: 잔여 출고 공기 (정규화)
-        remaining = (out_date - env_date).days
-        remaining = max(0, remaining)
-        norm_remaining = min(remaining / max_remaining_days, 1.0)
-        self._render_rectangle(
-            grid[1], ws, scale_info,
-            pos_x, pos_y, length, breadth, value=norm_remaining,
-        )
-
-    def _render_rectangle(
-        self,
-        channel: np.ndarray,
-        ws: Workspace,
-        scale_info: Dict,
-        center_x: float,
-        center_y: float,
-        length: float,
-        breadth: float,
-        value: float,
-    ) -> None:
-        scale = scale_info["scale"]
-        offset_x = scale_info["offset_x"]
-        offset_y = scale_info["offset_y"]
-        x0 = center_x - length / 2.0 - ws.origin_x
-        y0 = center_y - breadth / 2.0 - ws.origin_y
-        px0 = max(0, int(x0 * scale) + offset_x)
-        py0 = max(0, int(y0 * scale) + offset_y)
-        px1 = min(
-            self.grid_size,
-            int((x0 + length) * scale) + offset_x,
-        )
-        py1 = min(
-            self.grid_size,
-            int((y0 + breadth) * scale) + offset_y,
-        )
-        if px1 > px0 and py1 > py0:
-            channel[py0:py1, px0:px1] = value
+        self.coordinate_map(ws)
+        return max(ws.length, ws.breadth) / self.grid_size
 
 
-class GridCache:
-    """
-    그리드 캐싱 — 변경된 작업장만 재렌더링.
-
-    step() 시 action이 지정된 작업장만 무효화하고,
-    나머지는 캐시된 그리드를 재사용하여 렌더링 비용 절감.
-    """
-
+class BaseGridCache:
     def __init__(self, renderer: OccupancyGridRenderer, n_workspaces: int):
+        if (
+            isinstance(n_workspaces, bool)
+            or not isinstance(n_workspaces, Integral)
+            or n_workspaces < 0
+        ):
+            raise ValueError("n_workspaces must be a non-negative integer")
         self._renderer = renderer
-        self._n_ws = n_workspaces
-        G = renderer.grid_size
+        self._n_ws = int(n_workspaces)
         self._cache = np.zeros(
-            (n_workspaces, NUM_CHANNELS, G, G), dtype=np.float32
+            (
+                self._n_ws,
+                BASE_CHANNELS,
+                renderer.grid_size,
+                renderer.grid_size,
+            ),
+            dtype=np.float32,
         )
-        self._dirty = [True] * n_workspaces  # 초기에는 전부 dirty
+        self._dirty = [True] * self._n_ws
+        self._env_date: Optional[date] = None
 
     def invalidate(self, ws_index: int) -> None:
-        """특정 작업장을 dirty로 표시."""
         self._dirty[ws_index] = True
 
     def invalidate_all(self) -> None:
-        """전체 작업장을 dirty로 표시 (reset 시)."""
         self._dirty = [True] * self._n_ws
+
+    def get_base_grids(
+        self,
+        workspaces: List[Workspace],
+        env_date: date,
+    ) -> np.ndarray:
+        self._prepare_refresh(workspaces, env_date)
+        for index, workspace in enumerate(workspaces):
+            if self._dirty[index]:
+                self._cache[index] = self._renderer.render_base(
+                    workspace, env_date
+                )
+                self._dirty[index] = False
+        return self._cache.copy()
+
+    def _prepare_refresh(
+        self,
+        workspaces: List[Workspace],
+        env_date: date,
+    ) -> None:
+        if len(workspaces) != self._n_ws:
+            raise ValueError(
+                "workspace count does not match cache construction"
+            )
+        if env_date != self._env_date:
+            self.invalidate_all()
+            self._env_date = env_date
 
     def get_grids(
         self,
         workspaces: List[Workspace],
         env_date: date,
     ) -> np.ndarray:
-        """
-        캐시 기반 전체 그리드 반환.
+        self._prepare_refresh(workspaces, env_date)
+        for index, workspace in enumerate(workspaces):
+            if self._dirty[index]:
+                self._cache[index] = self._renderer.render(
+                    workspace, env_date
+                )[:BASE_CHANNELS]
+                self._dirty[index] = False
+        workspace_masks = np.ones(
+            (
+                self._n_ws,
+                1,
+                self._renderer.grid_size,
+                self._renderer.grid_size,
+            ),
+            dtype=np.float32,
+        )
+        return np.concatenate([self._cache.copy(), workspace_masks], axis=1)
 
-        dirty 상태인 작업장만 재렌더링하고 캐시 업데이트.
-        """
-        for i in range(self._n_ws):
-            if self._dirty[i]:
-                self._cache[i] = self._renderer.render(
-                    workspaces[i], env_date
-                )
-                self._dirty[i] = False
-        return self._cache.copy()
+
+# Temporary compatibility alias for alloc_env.py during B4.
+GridCache = BaseGridCache

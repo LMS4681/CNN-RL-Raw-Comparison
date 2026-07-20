@@ -169,6 +169,16 @@ class BaseGridStrategy:
 
         return occupied
 
+    def occupied_lot_ids(
+        self,
+        workspace: Workspace,
+        block_in: date,
+        block_out: date,
+    ) -> set[str]:
+        return set(
+            self._build_occupied_lot_set(workspace, block_in, block_out)
+        )
+
 
 # ── 유틸리티 함수 (모듈 레벨) ──────────────────────────────────────
 
