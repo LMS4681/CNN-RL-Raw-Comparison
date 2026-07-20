@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +13,7 @@ from sb3_contrib import MaskablePPO
 import evaluation_runner
 from alloc_env.observation_state import ObservationScales
 from comparison.artifact_manifest import sha256_file
+from comparison.wall_clock_callback import read_wall_clock_state, resolve_state_checkpoint
 from evaluation_runner import ModelActionPolicy
 
 
@@ -21,6 +21,7 @@ REGULAR_INTERVAL = 10_000
 EXPECTED_HOLDOUT_SEEDS = tuple(range(1000, 1020))
 SELECTION_SEEDS = tuple(range(1000, 1005))
 PRIMARY_TEST_SEEDS = tuple(range(1005, 1020))
+ARMS = ("raw_direct", "candidate_cnn")
 EVALUATION_COLUMNS = (
     "source", "policy", "seed", "mean_reward", "mean_terminal_score",
     "mean_dropout_rate", "mean_delay_days", "mean_delayed_count",
@@ -42,25 +43,14 @@ class CheckpointRef:
 
 
 def _archive_timestep(path: Path, loader=MaskablePPO.load) -> int | None:
-    """Return a readable archive's stored timestep, without a training env."""
-    try:
-        model = loader(str(path), device="cpu")
-        timestep = getattr(model, "num_timesteps", None)
-        return int(timestep) if timestep is not None else None
-    except (EOFError, OSError, RuntimeError, ValueError, AssertionError):
-        return None
+    """Use train's canonical, corruption-tolerant archive reader lazily."""
+    from train import model_num_timesteps
+    return model_num_timesteps(path, loader=loader)
 
 
 def _archive_candidates(output_dir: Path) -> list[Path]:
-    roots = [output_dir / "checkpoints", output_dir]
-    candidates: set[Path] = set()
-    for root in roots:
-        if root.is_dir():
-            candidates.update(
-                path for path in root.iterdir()
-                if path.is_file() and path.suffix.lower() in {".sb3", ".zip"}
-            )
-    return sorted(candidates, key=lambda path: path.as_posix())
+    root = output_dir / "checkpoints"
+    return sorted(root.glob("*.sb3"), key=lambda path: path.as_posix()) if root.is_dir() else []
 
 
 def readable_checkpoint_inventory(
@@ -74,11 +64,16 @@ def readable_checkpoint_inventory(
         raise ValueError("regular_interval must be positive")
     inventory: dict[int, Path] = {}
     for path in _archive_candidates(Path(output_dir)):
-        timestep = _archive_timestep(path, model_loader)
+        try:
+            timestep = _archive_timestep(path, model_loader)
+            digest = sha256_file(path)
+            mtime = path.stat().st_mtime_ns
+        except (OSError, FileNotFoundError):
+            continue
         if timestep is None or timestep < 0 or timestep % regular_interval:
             continue
         prior = inventory.get(timestep)
-        if prior is None or (path.stat().st_mtime_ns, path.as_posix()) > (
+        if prior is None or (mtime, path.as_posix()) > (
             prior.stat().st_mtime_ns, prior.as_posix()
         ):
             inventory[timestep] = path
@@ -142,20 +137,15 @@ def resolve_final_checkpoint(
     """Return only the readable archive named and verified by complete state."""
     root = Path(output_dir)
     try:
-        state = json.loads((root / "run_state.json").read_text(encoding="utf-8"))
-        if not isinstance(state, dict) or state.get("status") != "complete":
+        state = read_wall_clock_state(root / "run_state.json")
+        if state.status != "complete":
             raise ValueError("run_state is not complete")
-        filename = state["last_checkpoint_file"]
-        timestep = int(state["last_checkpoint_timestep"])
-        expected_sha = state["last_checkpoint_sha256"]
-        if not isinstance(filename, str) or Path(filename).name != filename:
-            raise ValueError("run_state checkpoint filename is unsafe")
-        checkpoint = root / "checkpoints" / filename
-        final = _verified_ref(checkpoint, "final", timestep, model_loader)
-        if final is None or final.sha256 != expected_sha:
+        checkpoint = resolve_state_checkpoint(root, state)
+        final = _verified_ref(checkpoint, "final", state.last_checkpoint_timestep, model_loader)
+        if final is None or final.sha256 != state.last_checkpoint_sha256:
             raise ValueError("run_state checkpoint is unreadable or does not match")
         return final
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+    except (OSError, ValueError, KeyError, TypeError) as error:
         raise PartialResultError("no exact complete final checkpoint") from error
 
 
@@ -179,13 +169,20 @@ def evaluate_checkpoint(
     """Evaluate one archive and attach truthful checkpoint provenance."""
     selection, primary = split_holdout_records(scenarios)
     ordered = [*selection, *primary]
-    scales = ObservationScales.from_dict(run_config["observation_scales"])
-    workspace_codes = list(run_config["active_workspace_codes"])
-    state_context = run_config["state_context"]
-    model = model_loader(str(model_path), device="cpu")
-    timestep = _archive_timestep(Path(model_path), model_loader)
-    if timestep is None:
-        raise PartialResultError(f"checkpoint is unreadable: {model_path}")
+    if arm not in ARMS:
+        raise ValueError("unknown comparison arm")
+    try:
+        from train import load_model_run_config
+        adjacent_config = load_model_run_config(model_path)
+        if dict(adjacent_config) != dict(run_config):
+            raise ValueError("provided run_config does not match adjacent run_config.json")
+        scales = ObservationScales.from_dict(adjacent_config["observation_scales"])
+        workspace_codes = list(adjacent_config["active_workspace_codes"])
+        state_context = adjacent_config["state_context"]
+        model = model_loader(str(model_path), device="cpu")
+        timestep = int(getattr(model, "num_timesteps"))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise PartialResultError(f"checkpoint/config is not evaluable: {model_path}") from error
     digest = sha256_file(model_path)
     base_rows = evaluation_runner.evaluate_scenarios(
         lambda _seed: ModelActionPolicy(model, name=arm), list(ordered),
@@ -207,6 +204,30 @@ def evaluate_checkpoint(
     return rows
 
 
+def _validated_rows(rows: Sequence[Mapping[str, Any]], *, arm: str | None = None, common: bool = False) -> list[dict]:
+    if arm is not None and arm not in ARMS:
+        raise ValueError("unknown comparison arm")
+    normalized = [dict(row) for row in rows]
+    if not normalized or any(tuple(row) != EVALUATION_COLUMNS for row in normalized):
+        raise ValueError("evaluation rows must have the exact stable columns")
+    by_arm = {row["arm"] for row in normalized}
+    expected_arms = set(ARMS) if common else {arm}
+    if by_arm != expected_arms:
+        raise ValueError("evaluation rows have wrong arm identifiers")
+    for arm_name in by_arm:
+        group = [row for row in normalized if row["arm"] == arm_name]
+        split_holdout_records(group)
+        if any(row["evaluation_partition"] != ("selection" if int(row["seed"]) in SELECTION_SEEDS else "primary_test") for row in group):
+            raise ValueError("evaluation partition is inconsistent")
+        if common and any(row["checkpoint"] != "common_step" for row in group):
+            raise ValueError("common rows must be labelled common_step")
+        if len({(row["checkpoint"], row["checkpoint_timestep"], row["checkpoint_sha256"]) for row in group}) != 1:
+            raise ValueError("checkpoint provenance is inconsistent")
+    if common and len({row["checkpoint_timestep"] for row in normalized}) != 1:
+        raise ValueError("common rows must share a timestep")
+    return sorted(normalized, key=lambda row: ((ARMS.index(row["arm"]) if common else 0), int(row["seed"])))
+
+
 def _write_rows(path: Path, rows: Sequence[Mapping[str, Any]]) -> Path:
     if not rows:
         raise ValueError("evaluation rows are required")
@@ -219,7 +240,7 @@ def _write_rows(path: Path, rows: Sequence[Mapping[str, Any]]) -> Path:
 
 
 def write_arm_evaluations(root: Path, arm: str, rows: Sequence[Mapping[str, Any]]) -> tuple[Path, Path]:
-    split_holdout_records(rows)
+    rows = _validated_rows(rows, arm=arm)
     arm_dir = Path(root) / arm
     all_path = _write_rows(arm_dir / "evaluation_scenarios.csv", rows)
     primary = [row for row in rows if int(row["seed"]) in PRIMARY_TEST_SEEDS]
@@ -227,7 +248,7 @@ def write_arm_evaluations(root: Path, arm: str, rows: Sequence[Mapping[str, Any]
 
 
 def write_common_step_evaluation(root: Path, rows: Sequence[Mapping[str, Any]]) -> Path:
-    return _write_rows(Path(root) / "comparison" / "common_step_evaluation.csv", rows)
+    return _write_rows(Path(root) / "comparison" / "common_step_evaluation.csv", _validated_rows(rows, common=True))
 
 
 def merge_checkpoint_manifest(
@@ -249,9 +270,49 @@ def merge_checkpoint_manifest(
 
 def update_checkpoint_manifest(path: Path, arm: str, checkpoints: Mapping[str, CheckpointRef]) -> dict[str, Any]:
     manifest_path = Path(path)
+    import json
     existing = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(existing, dict):
         raise ValueError("manifest must be a JSON object")
     merged = merge_checkpoint_manifest(existing, arm, checkpoints)
     manifest_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return merged
+
+
+def evaluate_comparison_artifacts(
+    root: Path, raw_dir: Path, cnn_dir: Path, scenarios: Sequence[dict],
+    raw_config: Mapping[str, Any], cnn_config: Mapping[str, Any], *,
+    regular_interval: int = REGULAR_INTERVAL, model_loader=MaskablePPO.load,
+) -> dict[str, dict[str, CheckpointRef]]:
+    """Evaluate both arms only when an existing root manifest is present."""
+    root = Path(root)
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        raise PartialResultError("root manifest.json must already exist")
+    common_step = select_common_timestep(raw_dir, cnn_dir, regular_interval)
+    inventories = {
+        "raw_direct": readable_checkpoint_inventory(raw_dir, regular_interval, model_loader=model_loader),
+        "candidate_cnn": readable_checkpoint_inventory(cnn_dir, regular_interval, model_loader=model_loader),
+    }
+    refs: dict[str, dict[str, CheckpointRef]] = {}
+    configs = {"raw_direct": raw_config, "candidate_cnn": cnn_config}
+    directories = {"raw_direct": Path(raw_dir), "candidate_cnn": Path(cnn_dir)}
+    common_rows: list[dict] = []
+    for arm in ARMS:
+        final = resolve_final_checkpoint(directories[arm], model_loader=model_loader)
+        selected = resolve_selected_or_fallback(directories[arm], model_loader=model_loader)
+        common_path = inventories[arm][common_step]
+        common = _verified_ref(common_path, "common_step", common_step, model_loader)
+        if common is None:
+            raise PartialResultError("common checkpoint became unreadable")
+        refs[arm] = {"selected": selected, "final": final, "common": common}
+        selected_rows = evaluate_checkpoint(selected.path, configs[arm], scenarios, selected.label, arm, model_loader)
+        write_arm_evaluations(root, arm, selected_rows)
+        common_rows.extend(evaluate_checkpoint(common.path, configs[arm], scenarios, "common_step", arm, model_loader))
+        relative_refs = {
+            name: CheckpointRef(ref.path.relative_to(root), ref.label, ref.timestep, ref.sha256)
+            for name, ref in refs[arm].items()
+        }
+        update_checkpoint_manifest(manifest_path, arm, relative_refs)
+    write_common_step_evaluation(root, common_rows)
+    return refs

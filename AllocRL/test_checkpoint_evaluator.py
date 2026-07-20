@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -53,7 +54,8 @@ def test_common_step_uses_newest_verified_duplicate_and_rejects_partial(tmp_path
     os.utime(older, (now - 60, now - 60))
     os.utime(newer, (now + 60, now + 60))
 
-    assert evaluator.readable_checkpoint_inventory(raw, 10_000)[10_000] == newer
+    assert evaluator.readable_checkpoint_inventory(raw, 10_000)[10_000] == older
+    assert newer not in evaluator.readable_checkpoint_inventory(raw, 10_000).values()
     assert evaluator.select_common_timestep(raw, cnn, 10_000) == 20_000
 
     (cnn / "checkpoints" / "cnn.sb3").unlink()
@@ -81,6 +83,8 @@ def test_missing_best_uses_exact_complete_state_checkpoint(tmp_path, monkeypatch
         "last_checkpoint_sha256": _sha256(checkpoint),
     }), encoding="utf-8")
     monkeypatch.setattr(evaluator, "_archive_timestep", lambda path, loader: 12_345)
+    monkeypatch.setattr(evaluator, "read_wall_clock_state", lambda _path: SimpleNamespace(status="complete", last_checkpoint_timestep=12_345, last_checkpoint_sha256=_sha256(checkpoint)))
+    monkeypatch.setattr(evaluator, "resolve_state_checkpoint", lambda _root, _state: checkpoint)
 
     selected = evaluator.resolve_selected_or_fallback(tmp_path)
     assert selected.path == checkpoint
@@ -103,6 +107,8 @@ def test_best_requires_selection_proof(tmp_path, monkeypatch):
         "50000,1,0,0,1\n", encoding="utf-8"
     )
     monkeypatch.setattr(evaluator, "_archive_timestep", lambda path, loader: 50_000 if path == best else 60_000)
+    monkeypatch.setattr(evaluator, "read_wall_clock_state", lambda _path: SimpleNamespace(status="complete", last_checkpoint_timestep=60_000, last_checkpoint_sha256=_sha256(final)))
+    monkeypatch.setattr(evaluator, "resolve_state_checkpoint", lambda _root, _state: final)
 
     assert evaluator.resolve_selected_or_fallback(tmp_path).label == "best_model"
     (tmp_path / "holdout_selection.csv").write_text("timestep,is_best\n50000,1\n", encoding="utf-8")
@@ -118,6 +124,8 @@ def test_final_reference_uses_only_the_complete_state_checkpoint(tmp_path, monke
         "last_checkpoint_timestep": 60_000, "last_checkpoint_sha256": _sha256(final),
     }), encoding="utf-8")
     monkeypatch.setattr(evaluator, "_archive_timestep", lambda path, loader: 60_000)
+    monkeypatch.setattr(evaluator, "read_wall_clock_state", lambda _path: SimpleNamespace(status="complete", last_checkpoint_timestep=60_000, last_checkpoint_sha256=_sha256(final)))
+    monkeypatch.setattr(evaluator, "resolve_state_checkpoint", lambda _root, _state: final)
 
     reference = evaluator.resolve_final_checkpoint(tmp_path)
     assert (reference.path, reference.label, reference.timestep) == (final, "final", 60_000)
@@ -139,11 +147,12 @@ def test_evaluate_checkpoint_labels_rows_and_writes_partitions(tmp_path, monkeyp
         "active_workspace_codes": ["PE001"], "state_context": "full",
     }
     scenarios = [{"seed": seed} for seed in range(1000, 1020)]
-    fake_model = object()
+    (tmp_path / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+    fake_model = SimpleNamespace(num_timesteps=20_000)
     captured = {}
     monkeypatch.setattr(evaluator, "_archive_timestep", lambda path, loader: 20_000)
     monkeypatch.setattr(evaluator.evaluation_runner, "evaluate_scenarios", lambda policy_factory, received, **kwargs: [
-        {"source": "holdout_fixed20", "policy": policy_factory(row["seed"]).name, "seed": row["seed"], "mean_reward": 1.0}
+            {"source": "holdout_fixed20", "policy": policy_factory(row["seed"]).name, "seed": row["seed"], "mean_reward": 1.0, "mean_terminal_score": 1.0, "mean_dropout_rate": 0.0, "mean_delay_days": 0.0, "mean_delayed_count": 0.0, "mean_retained_choice_ratio": 1.0}
         for row in received
     ])
 
