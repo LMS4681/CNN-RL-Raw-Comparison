@@ -32,6 +32,8 @@ Date: 2026-07-21
 repository: https://github.com/LMS4681/CNN-RL.git
 baseline commit: cd4e14fc1725a4ff159e59d6874d3602f3b65a06
 observation schema: 3
+fixed scenarios SHA256: 6125f53939a1b8eef8662b2628c0da2f1d0f26b5b541a99252858326b38cd814
+split manifest SHA256: d3df1d0076248b4bcbddb4c910a3cb81481da65c7415c6b3cacf9e055cc3f9df
 ```
 
 새 저장소는 `UPSTREAM_BASELINE.md`와 실행 manifest에 기준 URL, 전체 SHA,
@@ -43,7 +45,10 @@ TensorBoard event, ONNX 및 대형 체크포인트는 Git에 커밋하지 않고
 
 ### 3.1 Candidate CNN arm
 
-기준 모델은 현재 구현 그대로 사용한다.
+기준 모델의 candidate-CNN feature extractor는 현재 구현 그대로 사용한다.
+SB3 2.9.0에서 현재 코드가 암묵적으로 생성하던 policy/value MLP 기본값을 두
+arm 모두에 명시적으로 고정하므로, 이를 보고서에서는 `comparison-CNN arm`으로
+부른다.
 
 ```text
 extractor: candidate-cnn
@@ -81,6 +86,11 @@ pending_summary
 정규화 값은 별도의 learned block encoder를 통과하지 않는다. invalid future
 및 pending slot 값은 mask로 0으로 만든다.
 
+공정한 단일 observation schema를 유지하기 위해 환경은 raw arm에서도 grid
+배열을 생성하지만 extractor가 읽지 않는다. 따라서 처리속도 비교는 CNN forward
+제거 효과를 포함하되 grid 생성 자체를 없앤 별도 환경 최적화 효과는 측정하지
+않는다.
+
 이 비교 모델에도 PPO가 행동 logits와 value를 계산하기 위해 사용하는 기본
 policy/value MLP와 최종 선형 head는 남는다. 두 arm 모두 동일한 PPO 기본
 policy/value MLP를 사용한다. 제거 대상은 CNN과 custom structured/fusion
@@ -112,15 +122,18 @@ seed, PPO 하이퍼파라미터, holdout scenario와 런타임이다.
 
 ## 4. Overnight Colab Workflow
 
-노트북 하나가 같은 Colab Pro 런타임에서 아래 순서를 자동 수행한다.
+노트북 하나가 같은 Colab Pro 런타임과 동일한 dependency lock 아래에서 arm별
+격리 subprocess를 순차 실행한다. 각 subprocess가 기록한 VM boot ID, GPU UUID,
+Torch/CUDA 버전과 lock hash가 일치하지 않으면 완결 결과로 표시하지 않는다.
+실행 순서는 아래와 같다.
 
 1. Drive mount 및 저장소 clone/정확한 비교 SHA checkout
 2. 고정 dependency 설치와 GPU/CUDA/CPU/RAM 환경 기록
 3. scenario 및 split-manifest hash 검증
 4. 두 arm 각각 1,024-step save/load/evaluate smoke
-5. `raw-direct/full`, seed 0을 누적 active-training 10,800초까지 학습
+5. `raw-direct/full`, seed 0을 기록 training-subprocess wall time 10,800초까지 학습
 6. raw arm 선택 checkpoint 평가와 중간 보고서 저장
-7. `candidate-cnn/full`, seed 0을 누적 active-training 10,800초까지 학습
+7. `candidate-cnn/full`, seed 0을 기록 training-subprocess wall time 10,800초까지 학습
 8. CNN arm 선택 checkpoint 평가
 9. 공통 timestep checkpoint 평가, 그래프 및 한국어 보고서 생성
 10. artifact manifest와 `COMPLETE.json` 기록
@@ -131,31 +144,48 @@ seed, PPO 하이퍼파라미터, holdout scenario와 런타임이다.
 
 ## 5. Time Budget and Fairness
 
-각 arm의 목표 누적 active-training 시간은 정확히 10,800초다. 모델 학습과
-주기적 holdout 선택에 사용된 시간을 포함하며 초기 clone, dependency 설치,
-두 smoke와 최종 보고서 생성 시간은 제외한다.
+각 arm의 목표 기록 training-subprocess wall time은 10,800초다. PPO rollout과
+update, 주기적 holdout 선택, training callback 및 checkpoint I/O를 포함하며
+초기 clone, dependency 설치, 두 smoke와 최종 평가는 제외한다. Colab 강제
+종료 뒤에는 마지막 검증 checkpoint 이후 구간을 복원할 수 없으므로 이는
+`정확히 3시간`이 아니라 checkpoint/heartbeat 간격만큼 오차가 생길 수 있는
+best-effort 누적 예산이다. 목표, 기록 시간, end-to-end 시간, 재시작 횟수,
+최대 미기록 가능 구간과 실제 초과분을 모두 보고한다.
 
 시간 제한은 callback에서 monotonic clock으로 측정한다. 10,800초가 지난 뒤
 처음 실행되는 environment callback에서 학습을 정상 종료한다. 진행 중인
-holdout 평가가 있으면 그 평가를 강제로 중단하지 않으므로 소규모 wall-clock
-초과분을 별도로 기록한다. 다음 값을 `run_state.json`에 기록한다.
+holdout 평가가 있으면 그 평가를 강제로 중단하지 않으므로 wall-clock 초과분과
+원인을 별도로 기록한다. timestep 10,000 또는 wall time 300초 중 먼저 도달한
+시점마다 versioned checkpoint와 state를 갱신한다. 장시간 명령은 3시간보다 먼저
+`learn()`이 끝나지 않도록 timestep ceiling `2,000,000,000`을 명시하며, callback
+완료 전에 이 ceiling에 도달하면 실패로 처리한다. 다음 값을 `run_state.json`에
+기록한다.
 
 ```text
 target_training_seconds
 completed_training_seconds
 last_checkpoint_timestep
+last_regular_checkpoint_timestep
+last_checkpoint_file
+last_checkpoint_sha256
+config_sha256
+generation
+restart_count
+max_unrecorded_seconds
 status
 started_at_utc
 updated_at_utc
 completed_at_utc
 ```
 
-readable checkpoint가 durable storage에 기록된 것을 확인한 뒤 state JSON을
-temporary file과 atomic replace 방식으로 갱신한다. Colab runtime이 강제
-종료되면 마지막 durable checkpoint 이후 일부 시간과 timestep만 손실될 수
-있다. 노트북을
-다시 실행하면 저장된 모델과 누적 완료 시간을 읽어 남은 시간만 학습한다.
-완료된 arm은 다시 학습하지 않는다.
+checkpoint는 로컬 unique temporary 파일에 저장하고 flush한 뒤 새 generation
+이름으로 Drive에 복사한다. Drive에서 다시 열어 stored timestep과 SHA256을
+검증한 뒤에만 unique temporary state와 replace로 `run_state.json`을 갱신한다.
+Google Drive FUSE가 crash durability나 POSIX atomic rename을 보장한다고
+가정하지 않으며, 검증 완료 generation만 재개 대상으로 인정한다. 재실행 시
+`run_state.json`이 가리키는 exact checkpoint만 `--resume-from`으로 전달한다.
+더 최신인 orphan archive는 자동 선택하지 않는다. 완료된 arm은 다시 학습하지
+않는다.
 
 동일 wall-clock 결과가 운영상 주 비교다. 표현 효과를 분리하기 위한 보조
 비교는 두 arm이 모두 보유한 가장 큰 공통 10,000-step checkpoint에서
@@ -188,7 +218,9 @@ manifest에 별도 기록한다. 위 두 값은 서로 맞추지 않는다.
 비교 저장소는 `requirements-comparison.txt`에 SB3, sb3-contrib, Gymnasium과
 비GPU dependency를 정확한 버전으로 고정한다. Colab CUDA와 호환되는 사전 설치
 Torch는 교체하지 않고 실제 Torch/CUDA/cuDNN 버전을 environment manifest에
-기록한다. 두 arm은 같은 Python process와 dependency set을 사용한다.
+기록한다. 두 arm은 같은 Colab VM에서 별도 Python subprocess로 실행하되 같은
+dependency set을 사용한다. subprocess 격리는 첫 arm의 CUDA allocator와 Python
+전역 상태가 둘째 arm에 남지 않게 한다.
 
 검증 기준 버전은 `stable-baselines3==2.9.0`, `sb3-contrib==2.9.0`,
 `gymnasium==1.3.0`이다. 나머지 non-GPU direct/transitive dependency는 구현
@@ -219,6 +251,13 @@ scenario로 계산한다. 20개 전체 holdout 결과도 보조 표로 제공하
 - 총 timestep, steps/second, 평가 시간, peak GPU memory;
 - best/final/common-step checkpoint 식별자와 SHA256.
 
+3시간 주 결과는 best model이 있으면 `3시간 budget 안에서 validation 5개로
+선택된 checkpoint`라고 표현하고, 없으면 `주기적 선택 전에 종료되어 마지막
+검증 checkpoint를 사용한 fallback`이라고 표현한다. checkpoint timestep,
+선택 횟수와 선택 점수 또는 fallback 사유를 함께 쓴다.
+scenario paired CSV에는 terminal score뿐 아니라 dropout, mean delay와 delayed
+count의 CNN-minus-raw 차이를 모두 기록한다.
+
 한 arm에 `best_model`이 생성되기 전에 시간 제한에 도달하면 마지막 readable
 training checkpoint를 평가하고 보고서에 fallback 사실을 표시한다.
 
@@ -235,14 +274,19 @@ training checkpoint를 평가하고 보고서에 fallback 사실을 표시한다
 ```text
 manifest.json
 environment.json
+stage_journal.json
 raw_direct/
   run_state.json
   run_config.json
+  environment_segments.jsonl
+  runtime_metrics.json
+  progress_timing.csv
   checkpoints/
   best_model.sb3
   block_placement_ppo.sb3
   holdout_selection.csv
   evaluation_scenarios.csv
+  evaluation_primary_test.csv
   training_log.csv
   loss_log.csv
 candidate_cnn/
@@ -258,8 +302,14 @@ COMPLETE.json
 ```
 
 `COMPLETE.json`은 두 smoke, 두 time budget, 두 평가와 report generation이 모두
-성공한 뒤에만 생성한다. 중간 실패 시 `PARTIAL_REPORT.md`와 마지막 성공 단계,
-재개 명령을 남긴다.
+성공하고 다음 무결성 gate를 통과한 뒤에만 생성한다: baseline/comparison/config/
+scenario/split/lock hash 일치, 두 arm의 VM boot ID와 GPU UUID 일치, state가
+가리키는 checkpoint의 hash와 stored timestep 일치, selection seed 5개와
+primary-test seed 15개의 정확한 분리 및 row 중복 없음. 중간 실패 시 가능한
+stage 경계에서 `PARTIAL_REPORT.md`와 마지막 성공 단계, 재개 명령을 남긴다.
+VM 강제 종료로 파일을 쓸 기회가 없었던 경우 다음 실행 시작 시 stale
+`in_progress` 단계를 `interrupted`로 바꾸고 같은 입력 hash의 완료 stage만
+건너뛴다.
 
 ## 9. Korean Preliminary Report
 
@@ -268,7 +318,7 @@ COMPLETE.json
 1. 실험 목적과 두 pipeline 설명
 2. 통제 변수와 의도적으로 다른 변수
 3. Colab 하드웨어 및 실행 시간
-4. 3시간 종료 성능 비교
+4. 3시간 budget 내 validation-selected checkpoint 성능 비교
 5. 공통 timestep 성능 비교
 6. 학습곡선, 처리속도와 parameter 수 비교
 7. 15개 미사용 holdout scenario의 paired 결과
@@ -277,30 +327,35 @@ COMPLETE.json
 10. 제한: seed 1개, 순차 실행 순서, 동적 Colab 자원, parameter mismatch
 11. 다음 실험: paired seeds 1~4 및 parameter-matched control
 
-보고서 표현은 “승패 확정”이 아니라 “seed 0의 약 3시간 예비 결과”로 제한한다.
+보고서 표현은 “승패 확정”이 아니라 “seed 0의 3시간 budget 내 validation-selected
+checkpoint 예비 결과”로 제한한다. UTF-8로 생성하고 replacement character가
+포함되면 완결 보고서 생성을 실패시킨다.
 원자료가 불완전하면 수치를 추정하지 않고 누락 원인과 재개 방법을 쓴다.
 
 ## 10. Repository Layout
 
 ```text
 CNN-RL-Raw-Comparison/
-  AllocRL/                         # pinned baseline snapshot + comparator
+  AllocRL/                         # pinned baseline snapshot
+    comparison/
+      raw_direct_extractor.py
+      wall_clock_callback.py
+      experiment_runner.py
+      report_builder.py
+      artifact_manifest.py
+    configs/overnight_seed0.json
+    test_raw_direct_extractor.py
+    test_wall_clock_callback.py
+    test_comparison_experiment.py
+    test_comparison_report.py
   notebooks/overnight_compare.ipynb
-  comparison/
-    raw_direct_extractor.py
-    wall_clock_callback.py
-    experiment_runner.py
-    report_builder.py
-    artifact_manifest.py
-  configs/overnight_seed0.json
   reports/README.md
   UPSTREAM_BASELINE.md
   README.md
-  tests/
   .gitignore
 ```
 
-비교 관련 새 코드는 `comparison/`에 경계를 두고 기존 환경·평가 contract를
+비교 관련 새 코드는 `AllocRL/comparison/`에 경계를 두고 기존 환경·평가 contract를
 재사용한다. 기존 baseline 동작을 비교 편의를 위해 바꾸지 않는다.
 
 ## 11. Verification
@@ -311,7 +366,9 @@ CNN-RL-Raw-Comparison/
 - raw extractor 내부에 `Conv2d` 또는 `Linear`가 없음;
 - 두 arm의 PPO policy/value MLP contract가 동일;
 - fake clock에서 누적 10,800초에 정지하고 resume 시 남은 시간만 실행;
-- 완료된 arm 재실행 방지와 corrupt checkpoint fallback;
+- selection 평가 시간이 동일 예산에 포함됨;
+- state가 가리키는 exact archive 재개, orphan/corrupt checkpoint 처리;
+- 300초 heartbeat, 완료된 arm 재실행 방지와 stage별 중단 복구;
 - selection seed와 final test seed 분리;
 - parameter/runtime/environment manifest 기록;
 - 보고서가 실제 CSV만 사용하고 누락값을 만들어내지 않음;
@@ -325,8 +382,9 @@ CNN-RL-Raw-Comparison/
 ## 12. Operational Limitations
 
 Colab은 GPU 종류, runtime lifetime과 사용 한도를 보장하지 않는다. 이 설계는
-정상적인 한 런타임 완주와 중단 후 수동 재실행 복구를 모두 지원하지만,
-사용자가 자는 동안 강제 종료된 런타임을 자동으로 다시 연결할 수는 없다.
+정상적인 한 런타임 완주와 마지막 검증 generation부터의 수동 재실행 복구를
+지원하지만, 마지막 heartbeat 이후 사용 시간은 복구할 수 없고 사용자가 자는
+동안 강제 종료된 런타임을 자동으로 다시 연결할 수도 없다.
 따라서 다음 날 `COMPLETE.json`이 없으면 `PARTIAL_REPORT.md`의 재개 셀을 한 번
 실행해야 한다.
 
