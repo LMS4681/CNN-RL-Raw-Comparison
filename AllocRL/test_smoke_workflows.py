@@ -43,6 +43,17 @@ def test_smoke_contract_lists_all_extractors_and_schema3_shapes():
     smoke_test.validate_schema3_observation_space(build_observation_space())
 
 
+def test_all_extractors_help_lists_raw_direct():
+    parser = smoke_test.build_argument_parser()
+    action = next(
+        action
+        for action in parser._actions
+        if action.dest == "all_extractors"
+    )
+
+    assert action.help == "run structured, fixed-grid, candidate-cnn, and raw-direct"
+
+
 def test_schema3_validation_rejects_legacy_grid_shape():
     spaces = dict(build_observation_space().spaces)
     spaces["grids"] = gym.spaces.Box(

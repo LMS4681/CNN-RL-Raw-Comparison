@@ -232,7 +232,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--all-extractors",
         action="store_true",
-        help="run structured, fixed-grid, and candidate-cnn",
+        help="run structured, fixed-grid, candidate-cnn, and raw-direct",
     )
     parser.add_argument(
         "--timesteps",
