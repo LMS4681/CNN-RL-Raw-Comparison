@@ -73,6 +73,16 @@ class WallClockState:
     completed_at_utc: str | None
 
 
+@dataclass(frozen=True)
+class ProgressTimingRow:
+    generation: int
+    timestep: int
+    recorded_training_seconds: float
+    updated_at_utc: str
+    status: Literal["running", "complete"]
+    checkpoint_file: str
+
+
 def _is_nonnegative_number(value: object) -> bool:
     return (
         isinstance(value, (int, float))
@@ -150,6 +160,166 @@ def read_wall_clock_state(path: str | Path) -> WallClockState:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as error:
         raise ValueError(f"wall-clock state invalid JSON: {error}") from error
     return _validated_state(payload)
+
+
+def _parse_utc(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"progress timing {field} must be UTC text")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"progress timing {field} must be UTC text") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError(f"progress timing {field} must be UTC text")
+    return value
+
+
+def _progress_row(payload: Mapping[str, object]) -> ProgressTimingRow:
+    if set(payload) != set(_PROGRESS_FIELDS):
+        raise ValueError("progress timing row fields differ")
+    try:
+        generation = int(payload["generation"])
+        timestep = int(payload["timestep"])
+        seconds = float(payload["recorded_training_seconds"])
+    except (TypeError, ValueError) as error:
+        raise ValueError("progress timing numeric field is invalid") from error
+    if str(generation) != payload["generation"] or generation <= 0:
+        raise ValueError("progress timing generation must be a positive integer")
+    if str(timestep) != payload["timestep"] or timestep < 0:
+        raise ValueError("progress timing timestep must be a non-negative integer")
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("progress timing seconds must be finite and non-negative")
+    status = payload["status"]
+    if status not in {"running", "complete"}:
+        raise ValueError("progress timing status is invalid")
+    checkpoint = payload["checkpoint_file"]
+    if (
+        not isinstance(checkpoint, str)
+        or not checkpoint
+        or Path(checkpoint).name != checkpoint
+        or "/" in checkpoint
+        or "\\" in checkpoint
+    ):
+        raise ValueError("progress timing checkpoint must be a basename")
+    return ProgressTimingRow(
+        generation=generation,
+        timestep=timestep,
+        recorded_training_seconds=seconds,
+        updated_at_utc=_parse_utc(payload["updated_at_utc"], "updated_at_utc"),
+        status=status,
+        checkpoint_file=checkpoint,
+    )
+
+
+def _validate_progress_rows(
+    rows: list[ProgressTimingRow],
+) -> list[ProgressTimingRow]:
+    prior_generation = 0
+    prior_timestep = 0
+    prior_seconds = 0.0
+    complete_seen = False
+    for row in rows:
+        if row.generation <= prior_generation:
+            raise ValueError("progress timing generations must strictly increase")
+        if row.timestep < prior_timestep:
+            raise ValueError("progress timing timesteps must not decrease")
+        if row.recorded_training_seconds < prior_seconds:
+            raise ValueError("progress timing seconds must not decrease")
+        if complete_seen:
+            raise ValueError("progress timing cannot contain rows after complete")
+        complete_seen = row.status == "complete"
+        prior_generation = row.generation
+        prior_timestep = row.timestep
+        prior_seconds = row.recorded_training_seconds
+    return rows
+
+
+def read_progress_timing(path: str | Path) -> list[ProgressTimingRow]:
+    """Read the exact progress CSV contract and validate its whole sequence."""
+    source = Path(path)
+    if not source.exists():
+        return []
+    try:
+        with source.open(encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if tuple(reader.fieldnames or ()) != _PROGRESS_FIELDS:
+                raise ValueError("progress timing header differs")
+            rows = [_progress_row(row) for row in reader]
+    except (OSError, UnicodeDecodeError, csv.Error, ValueError, TypeError) as error:
+        if isinstance(error, ValueError) and str(error).startswith("progress timing"):
+            raise
+        raise ValueError(f"progress timing CSV is invalid: {error}") from error
+    return _validate_progress_rows(rows)
+
+
+def _state_progress_row(state: WallClockState) -> ProgressTimingRow:
+    return ProgressTimingRow(
+        generation=state.generation,
+        timestep=state.last_checkpoint_timestep,
+        recorded_training_seconds=float(state.completed_training_seconds),
+        updated_at_utc=_parse_utc(state.updated_at_utc, "updated_at_utc"),
+        status=state.status,
+        checkpoint_file=state.last_checkpoint_file,
+    )
+
+
+def atomic_write_progress_timing(
+    path: str | Path, rows: list[ProgressTimingRow]
+) -> None:
+    """Publish the entire validated ledger with one atomic replacement."""
+    destination = Path(path)
+    validated = _validate_progress_rows(list(rows))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="",
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as stream:
+        writer = csv.DictWriter(stream, fieldnames=_PROGRESS_FIELDS)
+        writer.writeheader()
+        for row in validated:
+            writer.writerow(asdict(row))
+        stream.flush()
+        os.fsync(stream.fileno())
+        temporary = Path(stream.name)
+    try:
+        os.replace(temporary, destination)
+        if read_progress_timing(destination) != validated:
+            raise ValueError("progress timing reread differs from publication")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def reconcile_progress_timing(
+    path: str | Path, state: WallClockState | None
+) -> list[ProgressTimingRow]:
+    """Reconcile a valid crash tail against the authoritative state commit."""
+    destination = Path(path)
+    rows = read_progress_timing(destination)
+    if state is None:
+        if rows:
+            atomic_write_progress_timing(destination, [])
+        return []
+    projection = _state_progress_row(state)
+    matching = [row for row in rows if row.generation == state.generation]
+    if matching and matching[0] != projection:
+        raise ValueError("progress timing same-generation row conflicts with state")
+    committed = [row for row in rows if row.generation < state.generation]
+    if matching:
+        committed.append(matching[0])
+    else:
+        committed.append(projection)
+    committed = _validate_progress_rows(committed)
+    if rows != committed:
+        atomic_write_progress_timing(destination, committed)
+    final = read_progress_timing(destination)
+    if not final or final[-1] != projection:
+        raise ValueError("progress timing final row does not match state")
+    return final
 
 
 def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -307,7 +477,13 @@ class WallClockBudgetCallback(BaseCallback):
             self._restart_count = state.restart_count + 1
             self._max_unrecorded_seconds = state.max_unrecorded_seconds
             self._started_at_utc = state.started_at_utc
+            reconcile_progress_timing(
+                self._output_dir / "progress_timing.csv", state
+            )
         else:
+            reconcile_progress_timing(
+                self._output_dir / "progress_timing.csv", None
+            )
             self._started_at_utc = started_at
         self._segment_started = now
         self._last_persisted_monotonic = now
@@ -329,29 +505,6 @@ class WallClockBudgetCallback(BaseCallback):
     @staticmethod
     def _flush_file(path: Path) -> None:
         with path.open("rb+") as stream:
-            stream.flush()
-            os.fsync(stream.fileno())
-
-    def _append_progress(self, state: WallClockState) -> None:
-        path = self._output_dir / "progress_timing.csv"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_header = not path.exists() or path.stat().st_size == 0
-        with path.open("a", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(stream, fieldnames=_PROGRESS_FIELDS)
-            if write_header:
-                writer.writeheader()
-            writer.writerow(
-                {
-                    "generation": state.generation,
-                    "timestep": state.last_checkpoint_timestep,
-                    "recorded_training_seconds": (
-                        state.completed_training_seconds
-                    ),
-                    "updated_at_utc": state.updated_at_utc,
-                    "status": state.status,
-                    "checkpoint_file": state.last_checkpoint_file,
-                }
-            )
             stream.flush()
             os.fsync(stream.fileno())
 
@@ -437,11 +590,15 @@ class WallClockBudgetCallback(BaseCallback):
                 updated_at_utc if effective_status == "complete" else None
             ),
         )
-        self._append_progress(state)
         atomic_write_json(self._state_path, asdict(state))
         verified_state = read_wall_clock_state(self._state_path)
         if verified_state != state:
             raise ValueError("wall-clock state reread differs from written state")
+        progress_path = self._output_dir / "progress_timing.csv"
+        rows = read_progress_timing(progress_path)
+        atomic_write_progress_timing(
+            progress_path, [*rows, _state_progress_row(verified_state)]
+        )
 
         self._generation = generation
         self._last_checkpoint_timestep = timestep

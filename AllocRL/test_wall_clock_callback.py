@@ -11,7 +11,9 @@ import pytest
 from comparison import wall_clock_callback as wall_clock_module
 from comparison.wall_clock_callback import (
     WallClockBudgetCallback,
+    read_progress_timing,
     read_wall_clock_state,
+    reconcile_progress_timing,
     resolve_state_checkpoint,
 )
 
@@ -194,6 +196,109 @@ def test_archive_verified_before_state_crash_keeps_prior_generation(
         "_g2.sb3" in path.name
         for path in (tmp_path / "checkpoints").iterdir()
     )
+    assert [row.generation for row in read_progress_timing(
+        tmp_path / "progress_timing.csv"
+    )] == [1]
+
+
+def test_progress_failure_is_repaired_from_authoritative_state_on_resume(
+    tmp_path, fake_clock, monkeypatch
+):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start()
+    model.num_timesteps = 100
+    callback.persist_checkpoint(status="running")
+
+    original = wall_clock_module.atomic_write_progress_timing
+    monkeypatch.setattr(
+        wall_clock_module,
+        "atomic_write_progress_timing",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("progress write failed")
+        ),
+    )
+    model.num_timesteps = 200
+    fake_clock.advance(5)
+    with pytest.raises(OSError, match="progress write failed"):
+        callback.persist_checkpoint(status="running")
+
+    state = read_wall_clock_state(tmp_path / "run_state.json")
+    assert state.generation == 2
+    assert [row.generation for row in read_progress_timing(
+        tmp_path / "progress_timing.csv"
+    )] == [1]
+
+    monkeypatch.setattr(
+        wall_clock_module, "atomic_write_progress_timing", original
+    )
+    resumed, _ = prepared_callback(tmp_path, fake_clock, model=model)
+    resumed._on_training_start()
+    assert [row.generation for row in read_progress_timing(
+        tmp_path / "progress_timing.csv"
+    )] == [1, 2]
+
+
+def test_reconcile_removes_only_valid_future_tail(tmp_path, fake_clock):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start()
+    model.num_timesteps = 100
+    state = callback.persist_checkpoint(status="running")
+    path = tmp_path / "progress_timing.csv"
+    with path.open("a", encoding="utf-8", newline="") as stream:
+        stream.write(
+            "2,200,1.0,2026-07-21T00:00:01+00:00,running,"
+            "model_200_g2.sb3\n"
+        )
+
+    rows = reconcile_progress_timing(path, state)
+    assert [row.generation for row in rows] == [1]
+    assert read_progress_timing(path) == rows
+
+
+def test_reconcile_without_state_removes_wholly_valid_orphan_sequence(tmp_path):
+    path = tmp_path / "progress_timing.csv"
+    path.write_text(
+        "generation,timestep,recorded_training_seconds,updated_at_utc,status,checkpoint_file\n"
+        "2,200,1.0,2026-07-21T00:00:01+00:00,running,model_200_g2.sb3\n",
+        encoding="utf-8",
+    )
+    assert reconcile_progress_timing(path, None) == []
+    assert read_progress_timing(path) == []
+
+
+def test_reconcile_rejects_same_generation_conflict(tmp_path, fake_clock):
+    callback, model = prepared_callback(tmp_path, fake_clock)
+    callback._on_training_start()
+    model.num_timesteps = 100
+    state = callback.persist_checkpoint(status="running")
+    path = tmp_path / "progress_timing.csv"
+    text = path.read_text(encoding="utf-8").replace(
+        "model_100_g1.sb3", "different.sb3"
+    )
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="same-generation"):
+        reconcile_progress_timing(path, state)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "1,100,nan,2026-07-21T00:00:00+00:00,running,model.sb3",
+        "1,100,1.0,not-utc,running,model.sb3",
+        "1,100,1.0,2026-07-21T00:00:00+00:00,running,../model.sb3",
+        "1,100,1.0,2026-07-21T00:00:00+00:00,unknown,model.sb3",
+    ],
+)
+def test_progress_reader_fails_closed_on_malformed_rows(tmp_path, row):
+    path = tmp_path / "progress_timing.csv"
+    path.write_text(
+        "generation,timestep,recorded_training_seconds,updated_at_utc,status,checkpoint_file\n"
+        + row
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="progress timing"):
+        read_progress_timing(path)
 
 
 def test_selection_elapsed_time_is_charged_to_same_budget(
