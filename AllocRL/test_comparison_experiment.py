@@ -145,3 +145,55 @@ def test_malformed_completed_journal_is_rejected_before_it_is_trusted(tmp_path: 
                      clock=lambda: 0.0, python_executable=None, archive_timestep_reader=None)
     with pytest.raises(ExperimentIntegrityError, match="invalid stage journal"):
         runner.journal()
+
+
+@pytest.mark.parametrize("timestep", [None, 1])
+def test_smoke_zero_exit_without_a_valid_requested_archive_fails(tmp_path: Path, timestep: int | None):
+    from comparison.experiment_runner import ExperimentConfig, ExperimentStageError, _Runner
+
+    config = ExperimentConfig.for_test(smoke_timesteps=2)
+    def process(argv, **_kwargs):
+        path = tmp_path / "smoke" / "raw_direct" / "raw-direct.sb3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if timestep is not None:
+            path.write_bytes(b"archive")
+    runner = _Runner(config, tmp_path, subprocess_runner=process, clock=lambda: 0,
+                     python_executable="python", archive_timestep_reader=lambda _: timestep)
+    with pytest.raises(ExperimentStageError, match="readable"):
+        runner.smoke("raw_direct")
+
+
+def test_smoke_marker_records_verified_archive_identity(tmp_path: Path):
+    from comparison.artifact_manifest import sha256_file
+    from comparison.experiment_runner import ExperimentConfig, _Runner
+
+    config = ExperimentConfig.for_test(smoke_timesteps=2)
+    def process(argv, **_kwargs):
+        path = tmp_path / "smoke" / "raw_direct" / "raw-direct.sb3"
+        path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"archive")
+    runner = _Runner(config, tmp_path, subprocess_runner=process, clock=lambda: 0,
+                     python_executable="python", archive_timestep_reader=lambda _: 2)
+    runner.smoke("raw_direct")
+    marker = json.loads((tmp_path / "smoke" / "raw_direct" / "runner_verified.json").read_text())
+    assert marker == {"arm": "raw_direct", "config_sha256": config.config_sha256,
+                      "path": "raw-direct.sb3", "sha256": sha256_file(tmp_path / "smoke" / "raw_direct" / "raw-direct.sb3"), "timestep": 2}
+
+
+def test_run_entrypoint_orders_both_smokes_before_raw_training(tmp_path: Path, monkeypatch):
+    """Cheap harness: exercise the public entrypoint while model work is injected."""
+    from comparison import experiment_runner as runner_module
+
+    config = runner_module.ExperimentConfig.for_test()
+    observed: list[str] = []
+    monkeypatch.setattr(runner_module._Runner, "run_stage", lambda self, name, action: (observed.append(name), action()))
+    monkeypatch.setattr(runner_module._Runner, "preflight", lambda self: None)
+    monkeypatch.setattr(runner_module._Runner, "smoke", lambda self, arm: None)
+    monkeypatch.setattr(runner_module._Runner, "train", lambda self, arm: None)
+    monkeypatch.setattr(runner_module._Runner, "evaluate_arm", lambda self, arm: None)
+    monkeypatch.setattr(runner_module._Runner, "common_evaluation", lambda self: None)
+    monkeypatch.setattr(runner_module, "write_complete_report", lambda root: None)
+    monkeypatch.setattr(runner_module._Runner, "integrity", lambda self: None)
+    monkeypatch.setattr(runner_module._Runner, "provenance", lambda self: {"lock_sha256": "a" * 64})
+    runner_module.run_overnight_experiment(config, tmp_path, lease_interval_seconds=999)
+    assert observed == list(runner_module.JOURNAL_STAGES)
+    assert observed.index("smoke_candidate_cnn") < observed.index("train_raw_direct")
