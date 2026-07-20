@@ -6,14 +6,15 @@ Updated: 2026-07-20
 
 - Repository: `https://github.com/LMS4681/CNN-RL.git`
 - Working branch: `feature/schema3-state-correction`
-- Current implementation checkpoint before this handoff: `2b5b66a`
+- Current handoff checkpoint: `26a5be3`
 - Stage B integration-gate closure: `c7aced7`
 - Stage C approved checkpoint through C3: `76d878c`
-- C4 implementation checkpoint: `2b5b66a` (review rejected; fixes remain)
+- C4 completion repair: `f55496e`
+- Historical rejected C4 implementation: `2b5b66a`
 - Stage A base: `5aa39af`
 - Stage A contains nine implementation commits.
 - Stage B Tasks B1-B8 are complete and independently verified.
-- Stage C Tasks C1-C3 are complete and independently verified.
+- Stage C Tasks C1-C4 are complete and independently verified.
 
 Do not continue this work from `main` until the feature branch has been reviewed
 and merged. The feature branch is the source of truth for the remaining tasks.
@@ -90,8 +91,14 @@ Stage C completed work:
 3. `1a28170`, `76d878c` - rollout-level candidate-CNN diagnostics with zero
    diagnostic observation copies for non-CNN extractors
 
-C4 was implemented in `2b5b66a`, but its independent review rejected the task.
-Do not treat C4 as complete. The next worker must fix and re-review it before C5.
+4. `2b5b66a` was the rejected initial C4 implementation; `f55496e` repaired
+   its five review findings: controlled-option abbreviation rejection, legacy
+   builder removal, frozen stage seeds, repeated selected-option rejection,
+   and accurate dry-run documentation. The follow-up review also confirmed
+   duplicate-option validation runs before utility-mode dispatch.
+
+C4 is complete. C5, screening-selection and final-acceptance reporting, is
+the next task.
 
 ## Verification At Checkpoint
 
@@ -101,10 +108,9 @@ Run from `AllocRL` unless the command is a Git command:
 py -3.12 -m pytest -q
 ```
 
-Result at the current C4 implementation checkpoint:
-`504 passed, 3 warnings, 54 subtests passed`.
-The passing suite does not supersede the unresolved C4 review findings below.
-The three warnings are pre-existing dependency deprecations.
+Current verification result: `519 passed, 2 warnings, 54 subtests passed`.
+The two warnings are pre-existing ONNX-export dependency deprecations. The C4
+focused command contract suite also passed with `99 passed, 6 subtests`.
 
 ```powershell
 py -B -m compileall -q alloc_env baseline_policies.py evaluation_runner.py evaluation_scenarios.py evaluate_baselines.py run_ablation.py train.py
