@@ -260,7 +260,7 @@ class AllocationCallback(BaseCallback):
         # 에피소드 카운터
         self._episode_count = 0
         self._diagnostic_tracker: Optional[CnnDiagnosticTracker] = None
-        self._last_observation: Optional[Dict[str, np.ndarray]] = None
+        self._diagnostic_observation: Optional[Dict[str, np.ndarray]] = None
         self._rollout_count = 0
 
         # 지표 히스토리 (학습 후 시각화용)
@@ -321,13 +321,6 @@ class AllocationCallback(BaseCallback):
             print(f"[Callback] CSV 로그: {self._csv_path}")
 
     def _on_step(self) -> bool:
-        latest_observation = self.locals.get("new_obs")
-        if isinstance(latest_observation, dict):
-            self._last_observation = {
-                key: np.array(value, copy=True)
-                for key, value in latest_observation.items()
-            }
-
         infos = self.locals.get("infos", [])
         dones = self.locals.get("dones", [])
 
@@ -363,25 +356,41 @@ class AllocationCallback(BaseCallback):
 
         return True
 
+    def _on_rollout_end(self) -> None:
+        latest_observation = getattr(self.model, "_last_obs", None)
+        if (
+            self._diagnostic_tracker is None
+            or not isinstance(latest_observation, dict)
+        ):
+            self._diagnostic_observation = None
+            return
+        self._diagnostic_observation = {
+            key: np.array(value, copy=True)
+            for key, value in latest_observation.items()
+        }
+
     def _on_rollout_start(self) -> None:
         tracker = self._diagnostic_tracker
         if tracker is None:
+            self._diagnostic_observation = None
             return
 
-        if self._rollout_count > 0:
-            for key, value in tracker.record_update().items():
-                self.logger.record(f"diagnostics/{key}", value)
-
-            if self._last_observation is not None:
-                obs_tensor, _ = self.model.policy.obs_to_tensor(
-                    self._last_observation
-                )
-                for key, value in tracker.measure_features(
-                    obs_tensor
-                ).items():
+        try:
+            if self._rollout_count > 0:
+                for key, value in tracker.record_update().items():
                     self.logger.record(f"diagnostics/{key}", value)
 
-        self._rollout_count += 1
+                if self._diagnostic_observation is not None:
+                    obs_tensor, _ = self.model.policy.obs_to_tensor(
+                        self._diagnostic_observation
+                    )
+                    for key, value in tracker.measure_features(
+                        obs_tensor
+                    ).items():
+                        self.logger.record(f"diagnostics/{key}", value)
+        finally:
+            self._diagnostic_observation = None
+            self._rollout_count += 1
 
     def _log_episode(
         self,
@@ -449,6 +458,7 @@ class AllocationCallback(BaseCallback):
                   f"success={success_rate:.1%}")
 
     def _on_training_end(self):
+        self._diagnostic_observation = None
         if self._diagnostic_tracker is not None:
             self._diagnostic_tracker.close()
         if self._csv_file:

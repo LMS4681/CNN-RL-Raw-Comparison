@@ -1,10 +1,13 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import gymnasium as gym
 import numpy as np
+import pytest
 import torch
 
-from alloc_env.callbacks import CnnDiagnosticTracker
+from alloc_env.callbacks import AllocationCallback, CnnDiagnosticTracker
 from alloc_env.cnn_extractor import (
     CandidateCnnExtractor,
     FixedGridExtractor,
@@ -52,6 +55,154 @@ def observation() -> dict[str, torch.Tensor]:
         "pending_mask": torch.ones(2, N_WORKSPACES, 32),
         "pending_summary": torch.rand(2, N_WORKSPACES, 4),
     }
+
+
+def numpy_observation() -> dict[str, np.ndarray]:
+    return {
+        key: value.numpy()
+        for key, value in observation().items()
+    }
+
+
+class RecordingLogger:
+    def __init__(self):
+        self.records: dict[str, float] = {}
+
+    def record(self, key: str, value: float) -> None:
+        self.records[key] = value
+
+
+class TensorPolicy:
+    def __init__(self):
+        self.observations: dict[str, np.ndarray] | None = None
+
+    def obs_to_tensor(self, observations: dict[str, np.ndarray]):
+        self.observations = observations
+        return {
+            key: torch.as_tensor(value)
+            for key, value in observations.items()
+        }, False
+
+
+def prepared_allocation_callback(
+    tmp_path,
+    extractor_class=CandidateCnnExtractor,
+) -> tuple[AllocationCallback, TensorPolicy, RecordingLogger]:
+    callback = AllocationCallback(tmp_path, verbose=0)
+    policy = TensorPolicy()
+    logger = RecordingLogger()
+    callback.model = SimpleNamespace(
+        policy=policy,
+        _last_obs=None,
+        logger=logger,
+    )
+    callback._diagnostic_tracker = CnnDiagnosticTracker(
+        extractor_class(space(), features_dim=32)
+    )
+    return callback, policy, logger
+
+
+def diagnostic_copy_calls(array_mock) -> int:
+    return sum(
+        call.kwargs.get("copy") is True
+        for call in array_mock.call_args_list
+    )
+
+
+EXPECTED_CNN_DIAGNOSTICS = {
+    "cnn_gradient_norm",
+    "cnn_weight_change",
+    "workspace_feature_variance",
+    "candidate_channel_sensitivity",
+}
+EXPECTED_CNN_DIAGNOSTIC_LOGS = {
+    f"diagnostics/{key}"
+    for key in EXPECTED_CNN_DIAGNOSTICS
+}
+
+
+def test_diagnostic_observation_is_not_copied_on_steps(tmp_path):
+    callback, _, _ = prepared_allocation_callback(tmp_path)
+
+    with patch.object(np, "array", wraps=np.array) as array_mock:
+        for _ in range(10):
+            callback.locals = {
+                "new_obs": numpy_observation(),
+                "dones": [],
+                "infos": [],
+            }
+            callback._on_step()
+
+    assert diagnostic_copy_calls(array_mock) == 0
+
+
+def test_diagnostic_observation_is_copied_once_at_rollout_end(tmp_path):
+    callback, _, _ = prepared_allocation_callback(tmp_path)
+    latest = numpy_observation()
+    callback.model._last_obs = latest
+
+    with patch.object(np, "array", wraps=np.array) as array_mock:
+        callback._on_rollout_end()
+
+    assert diagnostic_copy_calls(array_mock) == len(latest)
+
+
+def test_rollout_start_records_all_cnn_diagnostics_from_rollout_copy(tmp_path):
+    callback, policy, logger = prepared_allocation_callback(tmp_path)
+    latest = numpy_observation()
+    callback.model._last_obs = latest
+    callback._rollout_count = 1
+    callback._on_rollout_end()
+    latest["grids"].fill(0.0)
+
+    callback._on_rollout_start()
+
+    assert EXPECTED_CNN_DIAGNOSTIC_LOGS <= logger.records.keys()
+    assert policy.observations is not None
+    assert np.any(policy.observations["grids"])
+    assert callback._diagnostic_observation is None
+
+
+@pytest.mark.parametrize("extractor_class", (StructuredExtractor, FixedGridExtractor))
+def test_rollout_start_omits_cnn_diagnostics_for_non_cnn_extractors(
+    tmp_path,
+    extractor_class,
+):
+    callback, _, logger = prepared_allocation_callback(tmp_path, extractor_class)
+    callback.model._last_obs = numpy_observation()
+    callback._rollout_count = 1
+    callback._on_rollout_end()
+
+    callback._on_rollout_start()
+
+    assert EXPECTED_CNN_DIAGNOSTIC_LOGS.isdisjoint(logger.records)
+
+
+def test_rollout_end_clears_stale_observation_without_a_dict_last_obs(tmp_path):
+    callback, _, _ = prepared_allocation_callback(tmp_path)
+    callback._diagnostic_observation = numpy_observation()
+    callback.model._last_obs = np.zeros(1, dtype=np.float32)
+
+    callback._on_rollout_end()
+
+    assert callback._diagnostic_observation is None
+
+
+def test_rollout_start_clears_observation_when_feature_measurement_fails(tmp_path):
+    callback, _, _ = prepared_allocation_callback(tmp_path)
+
+    class FailingPolicy:
+        def obs_to_tensor(self, observations):
+            raise RuntimeError("diagnostic conversion failed")
+
+    callback.model.policy = FailingPolicy()
+    callback._diagnostic_observation = numpy_observation()
+    callback._rollout_count = 1
+
+    with pytest.raises(RuntimeError, match="diagnostic conversion failed"):
+        callback._on_rollout_start()
+
+    assert callback._diagnostic_observation is None
 
 
 class CnnDiagnosticTrackerTests(unittest.TestCase):
