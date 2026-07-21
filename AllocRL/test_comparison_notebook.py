@@ -26,7 +26,7 @@ COLAB_BADGE = (
     "CNN-RL-Raw-Comparison/blob/overnight-v1/notebooks/overnight_compare.ipynb)"
 )
 DATA_TREE_OID = "0140dfe704c607045da2f20faa32a0141e7bcc9b"
-LOCK_SHA256 = "2098a1d132dde6e3255b0e7be6193edb3b09f758565aa319837afd53dbdf4bd7"
+LOCK_SHA256 = "37634576e34043d169cf24bfc0cc2261818dc65b9358d4b9b2e46ab614d0bdda"
 
 
 def load_notebook() -> dict[str, object]:
@@ -80,6 +80,11 @@ def test_notebook_installs_hashed_lock_without_mutating_colab_torch_stack():
     assert "requirements-comparison.txt" in install and "--require-hashes" in install
     assert '"--no-deps"' in install
     assert '"pip", "check"' in install
+    assert "def pip_check_conflicts" in install
+    assert "before_pip_conflicts" in install and "after_pip_conflicts" in install
+    assert "new_pip_conflicts = after_pip_conflicts - before_pip_conflicts" in install
+    assert "if new_pip_conflicts:" in install and "raise RuntimeError" in install
+    assert 'subprocess.run([sys.executable, "-m", "pip", "check"], check=True)' not in install
     assert "def child_torch_snapshot" in install
     assert "sys.executable" in install and '"-c"' in install and "json.loads" in install
     assert all(term in install for term in (
@@ -129,7 +134,9 @@ def test_direct_requirements_are_exact_and_lock_is_hashed_without_colab_gpu_pack
     direct_lines = [line.strip() for line in direct.splitlines() if line.strip() and not line.lstrip().startswith("#")]
     assert direct_lines == [
         "gymnasium==1.3.0", "stable-baselines3==2.9.0", "sb3-contrib==2.9.0",
-        "matplotlib", "numpy", "pandas", "tensorboard", "tqdm", "rich",
+        "matplotlib==3.10.0", "numpy==2.0.2", "pandas==2.2.2",
+        "protobuf==5.29.5", "tensorboard==2.20.0", "tqdm==4.67.1",
+        "rich==13.9.4", "setuptools==80.9.0",
     ]
     lock = (ALLOC_RL / "requirements-comparison.txt").read_text(encoding="utf-8")
     blocks = re.findall(r"(?ms)^[a-z0-9][a-z0-9-]+==.*?(?=^[a-z0-9][a-z0-9-]+==|\Z)", lock)

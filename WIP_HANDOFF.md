@@ -109,7 +109,7 @@ coverage ran separately in the preceding persistence work.
 5. Run the complete pytest suite in a fresh checkout. The old Windows worktree
    still held a CRLF working copy of `requirements-comparison.txt`; a fresh
    checkout obeys `.gitattributes`, has LF bytes and SHA-256
-   `2098a1d132dde6e3255b0e7be6193edb3b09f758565aa319837afd53dbdf4bd7`.
+   `37634576e34043d169cf24bfc0cc2261818dc65b9358d4b9b2e46ab614d0bdda`.
 6. Run the real local end-to-end test with 30 seconds per arm and verify both
    model archives, receipts, exact row counts, common marker, report,
    integrity record and `COMPLETE.json`.

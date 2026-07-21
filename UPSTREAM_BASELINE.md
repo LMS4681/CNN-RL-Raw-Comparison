@@ -5,7 +5,7 @@
 - Fixed scenarios SHA-256: `6125f53939a1b8eef8662b2628c0da2f1d0f26b5b541a99252858326b38cd814`
 - Split manifest SHA-256: `d3df1d0076248b4bcbddb4c910a3cb81481da65c7415c6b3cacf9e055cc3f9df`
 - Public comparison immutable tag: `overnight-v1`
-- Dependency lock SHA256: `2098a1d132dde6e3255b0e7be6193edb3b09f758565aa319837afd53dbdf4bd7`
+- Dependency lock SHA256: `37634576e34043d169cf24bfc0cc2261818dc65b9358d4b9b2e46ab614d0bdda`
 - Inherited `AllocRL/data` tree OID: `0140dfe704c607045da2f20faa32a0141e7bcc9b`
 
 The tracked `AllocRL/data` tree is inherited unchanged from the same owner's
