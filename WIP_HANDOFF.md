@@ -1,6 +1,6 @@
 # Raw observation vs CNN comparison: code and experiment handoff
 
-Updated: 2026-07-21 17:00 (Asia/Seoul)
+Updated: 2026-07-21 17:56 (Asia/Seoul)
 
 ## Release state
 
@@ -240,19 +240,81 @@ docs/superpowers/plans/2026-07-21-scale-aware-cnn-six-hour-colab-implementation.
 ```
 
 Read that focused plan before the broader four-arm stabilization plan above.
-It does not change reward, actions, episode order, data generation, workspace
-order, or the no-rotation rule. It appends four workspace-relative current
+It does not change reward, actions, episode order, production block generation,
+workspace order, or the no-rotation rule. It appends four workspace-relative current
 block fields to `ws_meta`, appends maximum future length and breadth to each
 future-demand window, and bumps observation schema 3 to schema 4. Existing
 schema-3 checkpoints must not be resumed.
 
-The CNN and structured/fusion MLP remain trainable end to end. Do not replace
-their weights with fixed all-one kernels. The actual executable candidate-CNN
-also retains its current four grid channels. The previously prepared report's
-three-channel explanation is not a request to remove the candidate channel
-from the new training code.
+The latest provisional candidate stdout extended to about 133,440 timesteps
+with `ep_rew_mean=-0.123`, `approx_kl` near `0.955`, and
+`explained_variance=-0.345`. CNN gradient, weight-change, feature-variance,
+and candidate-channel sensitivity diagnostics remained non-zero. This shows
+that the feature path is active, but joint PPO learning from random extractor
+weights is unstable and does not establish candidate-CNN superiority.
 
-The approved production settings are:
+The approved replacement is a strict two-stage learning flow. There is no
+unique correct CNN feature vector, so Stage 1 predicts simulator-derived
+future-quality targets instead of assigning labels to hidden features. Stage 2
+then transfers the verified extractor into PPO:
+
+```text
+Stage 1: simulator-supervised feature pretraining
+  schema-4 grids + structured/future observations
+  -> candidate CNN + structured/fusion MLP
+  -> temporary auxiliary prediction heads
+  -> exact geometry/feasibility targets + bounded future replay targets
+  -> best extractor checkpoint + PRETRAINING_COMPLETE.json
+
+Stage 2: PPO warm-up and joint fine-tuning
+  verified Stage 1 extractor
+  -> freeze complete extractor for first 50,000 cumulative PPO timesteps
+  -> train PPO policy/value heads
+  -> unfreeze extractor at 0.1 * policy learning rate
+  -> jointly fine-tune extractor and policy for six cumulative PPO hours
+  -> final SB3 policy checkpoint
+```
+
+Stage 1 exact targets cover current placeability, future fit, optionality after
+placement and its delta, largest free rectangle ratio, and normalized free
+component count. A bounded eight-block replay additionally estimates replay
+success, dropout, and delay under a deterministic future-optionality teacher.
+These replay values are teacher-relative diagnostics, not globally optimal
+placement labels. Target generation must run only on isolated simulator clones
+and must never mutate the production episode.
+
+The Stage 1 acceptance gate requires all finite metrics, held-out improvement
+over scalar-only/constant baselines, shuffled-grid degradation, and a
+counterfactual geometry response. `PRETRAINING_COMPLETE.json` is published
+last and records hashes for the accepted checkpoint, manifest, config, and
+gate results. Stage 2 fails closed when this marker is missing, failed, or
+hash-mismatched; random extractor initialization is not allowed for the new
+production run.
+
+The CNN and structured/fusion MLP are therefore learned twice: first through
+direct simulator supervision, then through PPO reward after the temporary
+freeze. Do not replace convolution kernels with fixed all-one filters and do
+not freeze the extractor permanently. The executable candidate-CNN retains
+its current four grid channels. The previously prepared report's three-channel
+explanation is not a request to remove the candidate channel from new code.
+
+The approved Stage 1 settings are:
+
+```text
+training states:         5,000 from seeds 20000..20039
+validation states:       1,000 from seeds 30000..30009
+bounded replay:          every fourth state
+replay horizon:          next 8 blocks, at most 32 decisions
+storage:                 sharded compressed NPZ, float16 grids
+training dtype:          float32
+optimizer:               AdamW
+learning rate:           1e-4
+batch size:              8
+maximum epochs:          30
+early-stop patience:     5
+```
+
+The approved Stage 2 production settings are:
 
 ```text
 Colab GPU:             L4 (high-memory system profile if offered)
@@ -264,15 +326,20 @@ n_epochs:               5
 initial LR:             1e-4
 final LR:               1e-5
 LR decay horizon:       1,000,000 cumulative timesteps
-training budget:        21,600 cumulative seconds (6 hours)
+extractor warm-up:      frozen through cumulative PPO timestep 50,000
+extractor LR scale:     0.1 after unfreezing
+PPO training budget:    21,600 cumulative seconds (6 hours)
 checkpoint interval:    10,000 timesteps
-Drive output root:       /content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0
+Drive experiment root:  /content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0
+Stage 1 output:          <experiment-root>/pretraining
+Stage 2 output:          <experiment-root>/ppo
 ```
 
 The LR schedule must use absolute cumulative `model.num_timesteps`; SB3's
 per-`learn()` progress value is insufficient because it can reset its horizon
 on resume. The schedule and wall-clock budget must both continue from their
-saved state after a Colab disconnect.
+saved state after a Colab disconnect. The six-hour timer starts only after
+Stage 1 passes and applies only to Stage 2 PPO.
 
 Use `n_steps=120`, not 960, with eight environments. This preserves the old
 960-transition PPO update size and prevents an eightfold rollout-buffer
@@ -297,10 +364,17 @@ https://research.google.com/colaboratory/faq.html
 https://www.nvidia.com/en-us/data-center/l4/
 ```
 
+Implementation must include a tiny real two-stage rehearsal: generate a small
+dataset, pretrain and publish the marker, start eight-environment PPO with a
+reduced test-only freeze boundary, then save/resume on both sides of that
+boundary. It must prove zero extractor gradients while frozen, non-zero
+gradients after unfreezing, and the exact `0.1` optimizer LR ratio after resume.
+
 The future implementation creates a new immutable tag
 `scale-aware-cnn-6h-v1`. Do not create or move that tag during planning; create
-it only after schema-4 tests, full pytest, and a short real eight-environment
-resume rehearsal pass. Its eventual notebook URL will be:
+it only after schema-4 tests, Stage 1 gate tests, transfer/freeze tests, full
+pytest, and the real two-stage resume rehearsal pass. Its eventual notebook
+URL will be:
 
 ```text
 https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/scale-aware-cnn-6h-v1/notebooks/improved_cnn_6h.ipynb
