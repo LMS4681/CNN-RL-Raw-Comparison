@@ -14,10 +14,10 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 N_WORKSPACES = 10
 EXPECTED_OBSERVATION_SHAPES = {
     "block": (8,),
-    "ws_meta": (N_WORKSPACES, 4),
+    "ws_meta": (N_WORKSPACES, 8),
     "future_blocks": (16, 6),
     "future_mask": (16,),
-    "future_demand": (3, 4),
+    "future_demand": (3, 6),
     "pending_blocks": (N_WORKSPACES, 32, 7),
     "pending_mask": (N_WORKSPACES, 32),
     "pending_summary": (N_WORKSPACES, 4),
@@ -58,7 +58,7 @@ def validate_observation_space(
         if unexpected:
             details.append(f"unexpected {', '.join(unexpected)}")
         raise ValueError(
-            "Schema-3 extractors require exactly nine keys: "
+            "Schema-4 extractors require exactly nine keys: "
             + "; ".join(details)
         )
 
@@ -66,29 +66,29 @@ def validate_observation_space(
         actual_shape = observation_space[key].shape
         if actual_shape != expected_shape:
             raise ValueError(
-                f"Schema-3 {key} must have shape {expected_shape}, "
+                f"Schema-4 {key} must have shape {expected_shape}, "
                 f"got {actual_shape}."
             )
 
     grid_shape = observation_space["grids"].shape
     if len(grid_shape) != 4:
         raise ValueError(
-            "Schema-3 grids must have rank 4 and shape "
+            "Schema-4 grids must have rank 4 and shape "
             f"({N_WORKSPACES}, 4, height, width), got {grid_shape}."
         )
     n_workspaces, grid_channels, grid_height, grid_width = grid_shape
     if n_workspaces != N_WORKSPACES:
         raise ValueError(
-            "Schema-3 grids workspace count must be "
+            "Schema-4 grids workspace count must be "
             f"{N_WORKSPACES}, got {n_workspaces}."
         )
     if grid_channels != 4:
         raise ValueError(
-            f"Schema-3 grids channel count must be 4, got {grid_channels}."
+            f"Schema-4 grids channel count must be 4, got {grid_channels}."
         )
     if grid_height < 1 or grid_width < 1:
         raise ValueError(
-            "Schema-3 grids spatial dimensions must be positive, "
+            "Schema-4 grids spatial dimensions must be positive, "
             f"got {(grid_height, grid_width)}."
         )
     return ValidatedObservationSchema(
@@ -117,7 +117,7 @@ class StructuredStateEncoder(nn.Module):
             nn.ReLU(),
         )
         self.demand = nn.Sequential(
-            nn.Linear(12, 64),
+            nn.Linear(18, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
@@ -190,7 +190,7 @@ class _WorkspaceExtractor(BaseFeaturesExtractor):
             + 32
             + 64
             + 4
-            + 4
+            + 8
             + grid_feature_dim
         )
         self.workspace_fusion = nn.Sequential(

@@ -734,6 +734,8 @@ def current_run_config(
     source_manifest: Mapping[str, object],
     observation_scales: ObservationScales,
 ) -> dict:
+    from comparison.raw_direct_extractor import RAW_DIRECT_FEATURE_DIM
+
     if len(active_workspace_codes) != N_WORKSPACES:
         raise ValueError(
             f"run configuration requires exactly {N_WORKSPACES} active "
@@ -755,7 +757,9 @@ def current_run_config(
         "extractor": args.extractor,
         "features_dim": args.features_dim,
         "extractor_output_dim": (
-            2772 if args.extractor == "raw-direct" else args.features_dim
+            RAW_DIRECT_FEATURE_DIM
+            if args.extractor == "raw-direct"
+            else args.features_dim
         ),
         "policy_net_arch": explicit_policy_net_arch(),
         "policy_activation": "ReLU",

@@ -58,7 +58,7 @@ REQUIRED_COMPATIBILITY_KEYS = {
 }
 
 
-def complete_config(observation_schema_version=3):
+def complete_config(observation_schema_version=4):
     return {
         "training_data_schema_version": 2,
         "observation_schema_version": observation_schema_version,
@@ -275,7 +275,7 @@ def test_raw_direct_run_config_records_fixed_output_dimension():
         source_manifest(),
         ObservationScales.from_dict(complete_config()["observation_scales"]),
     )
-    assert config["extractor_output_dim"] == 2772
+    assert config["extractor_output_dim"] == 2818
     assert config["policy_net_arch"] == {"pi": [64, 64], "vf": [64, 64]}
     assert config["policy_activation"] == "ReLU"
 
@@ -679,7 +679,7 @@ def test_wall_clock_state_requires_explicit_exact_resume_archive(tmp_path):
 
 class TrainResumeCliTest(unittest.TestCase):
     @staticmethod
-    def _run_config(observation_schema_version=3):
+    def _run_config(observation_schema_version=4):
         return complete_config(observation_schema_version)
 
     def test_raw_direct_extractor_argument_is_accepted(self):
@@ -939,7 +939,7 @@ class TrainResumeCliTest(unittest.TestCase):
             {"training_data_schema_version": 2}, source="test"
         )
 
-    def test_model_tools_require_observation_schema3(self):
+    def test_model_tools_require_observation_schema4(self):
         validator = getattr(
             train_module, "require_current_observation_schema", None
         )
@@ -947,14 +947,14 @@ class TrainResumeCliTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "observation_schema_version"):
             validator({}, source="test")
-        with self.assertRaisesRegex(ValueError, "schema-3"):
+        with self.assertRaisesRegex(ValueError, "[Ss]chema-3"):
             validator(
-                {"observation_schema_version": 2}, source="test"
+                {"observation_schema_version": 3}, source="test"
             )
 
-        validator({"observation_schema_version": 3}, source="test")
+        validator({"observation_schema_version": 4}, source="test")
 
-    def test_model_contract_reconstructs_saved_schema3_observation_values(self):
+    def test_model_contract_reconstructs_saved_schema4_observation_values(self):
         parser = getattr(
             train_module, "observation_contract_from_run_config", None
         )

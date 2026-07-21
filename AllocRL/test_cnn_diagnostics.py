@@ -25,10 +25,10 @@ def space() -> gym.spaces.Dict:
         "grids": gym.spaces.Box(
             0, 1, (N_WORKSPACES, 4, GRID_SIZE, GRID_SIZE), np.float32
         ),
-        "ws_meta": gym.spaces.Box(0, 1, (N_WORKSPACES, 4), np.float32),
+        "ws_meta": gym.spaces.Box(0, 1, (N_WORKSPACES, 8), np.float32),
         "future_blocks": gym.spaces.Box(0, 1, (16, 6), np.float32),
         "future_mask": gym.spaces.Box(0, 1, (16,), np.float32),
-        "future_demand": gym.spaces.Box(0, 1, (3, 4), np.float32),
+        "future_demand": gym.spaces.Box(0, 1, (3, 6), np.float32),
         "pending_blocks": gym.spaces.Box(
             0, 1, (N_WORKSPACES, 32, 7), np.float32
         ),
@@ -47,10 +47,10 @@ def observation() -> dict[str, torch.Tensor]:
         "grids": torch.rand(
             2, N_WORKSPACES, 4, GRID_SIZE, GRID_SIZE
         ),
-        "ws_meta": torch.rand(2, N_WORKSPACES, 4),
+        "ws_meta": torch.rand(2, N_WORKSPACES, 8),
         "future_blocks": torch.rand(2, 16, 6),
         "future_mask": torch.ones(2, 16),
-        "future_demand": torch.rand(2, 3, 4),
+        "future_demand": torch.rand(2, 3, 6),
         "pending_blocks": torch.rand(2, N_WORKSPACES, 32, 7),
         "pending_mask": torch.ones(2, N_WORKSPACES, 32),
         "pending_summary": torch.rand(2, N_WORKSPACES, 4),

@@ -1,4 +1,4 @@
-"""Short schema-3 train/save/load/evaluate workflows for every extractor."""
+"""Short schema-4 train/save/load/evaluate workflows for every extractor."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ from train import (
 BASE_DIR = Path(__file__).resolve().parent
 EXTRACTORS = ("structured", "fixed-grid", "candidate-cnn", "raw-direct")
 SMOKE_ROLLOUT_STEPS = 32
-SCHEMA3_OBSERVATION_SHAPES = {
+SCHEMA4_OBSERVATION_SHAPES = {
     "block": (CURRENT_BLOCK_FEATURE_DIM,),
     "grids": (N_WORKSPACES, 4, GRID_SIZE, GRID_SIZE),
     "ws_meta": (N_WORKSPACES, WORKSPACE_META_FEATURE_DIM),
@@ -64,20 +64,20 @@ SCHEMA3_OBSERVATION_SHAPES = {
 }
 
 
-def validate_schema3_observation_space(
+def validate_schema4_observation_space(
     observation_space: gym.spaces.Dict,
 ) -> None:
-    """Fail early if a smoke environment does not expose exact schema 3."""
+    """Fail early if a smoke environment does not expose exact schema 4."""
     assert isinstance(observation_space, gym.spaces.Dict), (
-        "schema-3 observation space must be gym.spaces.Dict"
+        "schema-4 observation space must be gym.spaces.Dict"
     )
     actual_keys = set(observation_space.spaces)
-    expected_keys = set(SCHEMA3_OBSERVATION_SHAPES)
+    expected_keys = set(SCHEMA4_OBSERVATION_SHAPES)
     assert actual_keys == expected_keys, (
-        "schema-3 keys differ: "
+        "schema-4 keys differ: "
         f"expected {sorted(expected_keys)}, got {sorted(actual_keys)}"
     )
-    for key, expected_shape in SCHEMA3_OBSERVATION_SHAPES.items():
+    for key, expected_shape in SCHEMA4_OBSERVATION_SHAPES.items():
         space = observation_space.spaces[key]
         assert space.shape == expected_shape, (
             f"{key} must have shape {expected_shape}, got {space.shape}"
@@ -120,7 +120,7 @@ def _build_smoke_environment(seed: int = 0):
         state_context_mode="full",
         seed=seed,
     )
-    validate_schema3_observation_space(env.observation_space)
+    validate_schema4_observation_space(env.observation_space)
     return env
 
 
@@ -222,7 +222,7 @@ def _positive_timesteps(value: str) -> int:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run schema-3 extractor train/save/load/evaluate smoke checks"
+        description="Run schema-4 extractor train/save/load/evaluate smoke checks"
     )
     parser.add_argument(
         "--extractor",
@@ -271,7 +271,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    with tempfile.TemporaryDirectory(prefix="allocrl-schema3-smoke-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="allocrl-schema4-smoke-") as tmp:
         _run_selected_extractors(
             extractors, Path(tmp), args.timesteps, args.device
         )

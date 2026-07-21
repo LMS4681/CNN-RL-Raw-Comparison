@@ -31,8 +31,8 @@ def test_raw_direct_feature_dimension_and_order():
     values = observation(batch_size=1)
     extractor = RawDirectExtractor(observation_space())
     output = extractor(values)
-    assert extractor.features_dim == 2772
-    assert output.shape == (1, 2772)
+    assert extractor.features_dim == 2818
+    assert output.shape == (1, 2818)
     torch.testing.assert_close(output, expected_raw_concat(values))
 
 

@@ -11,13 +11,13 @@ import smoke_test
 from alloc_env.observation_state import build_observation_space
 
 
-EXPECTED_SCHEMA3_SHAPES = {
+EXPECTED_SCHEMA4_SHAPES = {
     "block": (8,),
     "grids": (10, 4, 64, 64),
-    "ws_meta": (10, 4),
+    "ws_meta": (10, 8),
     "future_blocks": (16, 6),
     "future_mask": (16,),
-    "future_demand": (3, 4),
+    "future_demand": (3, 6),
     "pending_blocks": (10, 32, 7),
     "pending_mask": (10, 32),
     "pending_summary": (10, 4),
@@ -32,15 +32,15 @@ class FakeModel:
         self.saved_paths.append(path)
 
 
-def test_smoke_contract_lists_all_extractors_and_schema3_shapes():
+def test_smoke_contract_lists_all_extractors_and_schema4_shapes():
     assert smoke_test.EXTRACTORS == (
         "structured",
         "fixed-grid",
         "candidate-cnn",
         "raw-direct",
     )
-    assert smoke_test.SCHEMA3_OBSERVATION_SHAPES == EXPECTED_SCHEMA3_SHAPES
-    smoke_test.validate_schema3_observation_space(build_observation_space())
+    assert smoke_test.SCHEMA4_OBSERVATION_SHAPES == EXPECTED_SCHEMA4_SHAPES
+    smoke_test.validate_schema4_observation_space(build_observation_space())
 
 
 def test_all_extractors_help_lists_raw_direct():
@@ -54,14 +54,14 @@ def test_all_extractors_help_lists_raw_direct():
     assert action.help == "run structured, fixed-grid, candidate-cnn, and raw-direct"
 
 
-def test_schema3_validation_rejects_legacy_grid_shape():
+def test_schema4_validation_rejects_legacy_grid_shape():
     spaces = dict(build_observation_space().spaces)
     spaces["grids"] = gym.spaces.Box(
         0, 1, shape=(10, 3, 128, 128), dtype=np.float32
     )
 
     with pytest.raises(AssertionError, match="grids"):
-        smoke_test.validate_schema3_observation_space(
+        smoke_test.validate_schema4_observation_space(
             gym.spaces.Dict(spaces)
         )
 

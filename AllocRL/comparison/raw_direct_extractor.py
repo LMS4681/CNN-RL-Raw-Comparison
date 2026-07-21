@@ -17,7 +17,7 @@ RAW_DIRECT_KEYS = (
     "pending_mask",
     "pending_summary",
 )
-RAW_DIRECT_FEATURE_DIM = 2772
+RAW_DIRECT_FEATURE_DIM = 2818
 
 
 class RawDirectExtractor(BaseFeaturesExtractor):

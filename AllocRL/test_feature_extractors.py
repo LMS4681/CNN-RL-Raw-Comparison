@@ -27,10 +27,10 @@ def observation_space(grid_size: int = 64) -> gym.spaces.Dict:
         "grids": gym.spaces.Box(
             0, 1, (N_WORKSPACES, 4, grid_size, grid_size), np.float32
         ),
-        "ws_meta": gym.spaces.Box(0, 1, (N_WORKSPACES, 4), np.float32),
+        "ws_meta": gym.spaces.Box(0, 1, (N_WORKSPACES, 8), np.float32),
         "future_blocks": gym.spaces.Box(0, 1, (16, 6), np.float32),
         "future_mask": gym.spaces.Box(0, 1, (16,), np.float32),
-        "future_demand": gym.spaces.Box(0, 1, (3, 4), np.float32),
+        "future_demand": gym.spaces.Box(0, 1, (3, 6), np.float32),
         "pending_blocks": gym.spaces.Box(
             0, 1, (N_WORKSPACES, 32, 7), np.float32
         ),
@@ -52,10 +52,10 @@ def observation(
         "grids": torch.rand(
             batch_size, N_WORKSPACES, 4, grid_size, grid_size
         ),
-        "ws_meta": torch.rand(batch_size, N_WORKSPACES, 4),
+        "ws_meta": torch.rand(batch_size, N_WORKSPACES, 8),
         "future_blocks": torch.rand(batch_size, 16, 6),
         "future_mask": torch.ones(batch_size, 16),
-        "future_demand": torch.rand(batch_size, 3, 4),
+        "future_demand": torch.rand(batch_size, 3, 6),
         "pending_blocks": torch.rand(
             batch_size, N_WORKSPACES, 32, 7
         ),
@@ -135,6 +135,7 @@ def capture_structured_inputs(
         ("missing", "nine keys.*missing grids"),
         ("extra", "nine keys.*unexpected extra"),
         ("workspace_count", "grids.*10"),
+        ("legacy_ws_meta", "ws_meta.*10, 8"),
         ("structured_trailing", "pending_blocks.*7"),
         ("grid_rank", "grids.*shape"),
         ("grid_channels", "grids.*4"),
@@ -153,6 +154,10 @@ def test_every_extractor_rejects_malformed_schema_with_value_error(
     elif malformed_case == "workspace_count":
         space.spaces["grids"] = gym.spaces.Box(
             0, 1, (9, 4, 16, 16), np.float32
+        )
+    elif malformed_case == "legacy_ws_meta":
+        space.spaces["ws_meta"] = gym.spaces.Box(
+            0, 1, (N_WORKSPACES, 4), np.float32
         )
     elif malformed_case == "structured_trailing":
         space.spaces["pending_blocks"] = gym.spaces.Box(
@@ -198,7 +203,7 @@ class FeatureExtractorTests(unittest.TestCase):
         expected = {
             "current": [(8, 64), (64, 32)],
             "future": [(112, 128), (128, 64)],
-            "demand": [(12, 64), (64, 32)],
+            "demand": [(18, 64), (64, 32)],
             "pending": [(256, 128), (128, 64)],
         }
         for name, dimensions in expected.items():
@@ -217,9 +222,9 @@ class FeatureExtractorTests(unittest.TestCase):
                 )
 
         for extractor_class, workspace_input_dim in (
-            (StructuredExtractor, 200),
-            (FixedGridExtractor, 456),
-            (CandidateCnnExtractor, 328),
+            (StructuredExtractor, 204),
+            (FixedGridExtractor, 460),
+            (CandidateCnnExtractor, 332),
         ):
             with self.subTest(fusion=extractor_class.__name__):
                 extractor = extractor_class(self.space, features_dim=64)
@@ -247,14 +252,14 @@ class FeatureExtractorTests(unittest.TestCase):
         space = observation_space(grid_size=16)
         observations = zero_observation()
         current_values = torch.linspace(0.1, 0.8, 8)
-        demand_values = torch.linspace(0.05, 0.6, 12)
+        demand_values = torch.linspace(0.05, 0.9, 18)
         future_first = torch.linspace(0.1, 0.6, 6)
         future_third = torch.linspace(0.2, 0.7, 6)
         pending_first = torch.linspace(0.1, 0.7, 7)
         pending_second_workspace = torch.linspace(0.2, 0.8, 7)
 
         observations["block"][0] = current_values
-        observations["future_demand"][0] = demand_values.reshape(3, 4)
+        observations["future_demand"][0] = demand_values.reshape(3, 6)
 
         observations["future_blocks"][0, 0] = future_first
         observations["future_mask"][0, 0] = 1.0
@@ -276,7 +281,7 @@ class FeatureExtractorTests(unittest.TestCase):
         torch.testing.assert_close(captured["current"], observations["block"])
         torch.testing.assert_close(
             captured["demand"],
-            demand_values.reshape(1, 12),
+            demand_values.reshape(1, 18),
         )
 
         expected_future = torch.zeros(1, 112)
@@ -320,8 +325,8 @@ class FeatureExtractorTests(unittest.TestCase):
             0.0, 0.975, 40
         ).reshape(10, 4)
         observations["ws_meta"][0] = torch.linspace(
-            0.025, 1.0, 40
-        ).reshape(10, 4)
+            0.0125, 1.0, 80
+        ).reshape(10, 8)
 
         for extractor_class in EXTRACTOR_CLASSES:
             extractor = extractor_class(
@@ -384,7 +389,7 @@ class FeatureExtractorTests(unittest.TestCase):
                     fusion[:, :, 192:196], observations["pending_summary"]
                 )
                 torch.testing.assert_close(
-                    fusion[:, :, 196:200], observations["ws_meta"]
+                    fusion[:, :, 196:204], observations["ws_meta"]
                 )
                 torch.testing.assert_close(
                     captured["global"],
