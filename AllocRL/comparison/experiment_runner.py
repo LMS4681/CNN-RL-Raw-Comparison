@@ -48,9 +48,9 @@ from holdout_model_selection import validate_fixed_holdout_scenarios
 
 PRODUCTION_CONFIG = {
     "schema_version": 1, "baseline_commit": "cd4e14fc1725a4ff159e59d6874d3602f3b65a06",
-    "fixed_scenarios_sha256": "6125f53939a1b8eef8662b2628c0da2f1d0f26b5b541a99252858326b38cd814",
+    "fixed_scenarios_sha256": "913cac9046dec8164ef65da60275522f7127de5ea775b1c5a6b6aac255716271",
     "split_manifest_path": "data/data_split_manifest.json",
-    "split_manifest_sha256": "d3df1d0076248b4bcbddb4c910a3cb81481da65c7415c6b3cacf9e055cc3f9df",
+    "split_manifest_sha256": "601bd6143ed8890577e5ff34921241d36fd6a0e99c4bdab4e26152ab168178f8",
     "seed": 0, "state_context": "full", "target_training_seconds_per_arm": 10800,
     "timesteps_ceiling": 2_000_000_000, "learning_rate": 0.0003, "n_steps": 960,
     "batch_size": 64, "n_epochs": 10, "gamma": 1.0, "gae_lambda": 0.98,

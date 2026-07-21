@@ -1,1 +1,3 @@
 AllocRL/requirements-comparison.txt text eol=lf
+AllocRL/data/fixed_eval_scenarios.json text eol=lf
+AllocRL/data/data_split_manifest.json text eol=lf

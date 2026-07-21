@@ -32,8 +32,8 @@ Date: 2026-07-21
 repository: https://github.com/LMS4681/CNN-RL.git
 baseline commit: cd4e14fc1725a4ff159e59d6874d3602f3b65a06
 observation schema: 3
-fixed scenarios SHA256: 6125f53939a1b8eef8662b2628c0da2f1d0f26b5b541a99252858326b38cd814
-split manifest SHA256: d3df1d0076248b4bcbddb4c910a3cb81481da65c7415c6b3cacf9e055cc3f9df
+fixed scenarios SHA256: 913cac9046dec8164ef65da60275522f7127de5ea775b1c5a6b6aac255716271
+split manifest SHA256: 601bd6143ed8890577e5ff34921241d36fd6a0e99c4bdab4e26152ab168178f8
 ```
 
 새 저장소는 `UPSTREAM_BASELINE.md`와 실행 manifest에 기준 URL, 전체 SHA,
