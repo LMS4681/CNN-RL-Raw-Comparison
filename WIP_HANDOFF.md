@@ -1,14 +1,15 @@
-# Raw observation vs CNN comparison: final handoff
+# Raw observation vs CNN comparison: code and experiment handoff
 
-Updated: 2026-07-21 (Asia/Seoul)
+Updated: 2026-07-21 15:00 (Asia/Seoul)
 
 ## Release state
 
 - Final implementation branch: `feature/common-step-finish`.
 - Reviewed implementation commits run through `17dea28`.
-- The release commit adds only this final handoff update.
-- The immutable release tag is `overnight-v1` and must resolve to the same
-  commit as the published `main` branch.
+- The immutable execution release tag is `overnight-v1` at commit
+  `4867f4e6e9f7425a8c438b6403493a097e2e58cb`.
+- `main` may advance beyond that tag with handoff, plan, report, and future
+  implementation commits. Never move the release tag to follow `main`.
 - Repository: `https://github.com/LMS4681/CNN-RL-Raw-Comparison`.
 
 The final comparison keeps the original sequential study design:
@@ -79,7 +80,9 @@ another notebook against the same Drive root:
 ```
 
 That preview predates the final dependency-lock config field, so its config SHA
-is intentionally different from `overnight-v1`. Let it finish under r4. Resume
+is intentionally different from `overnight-v1`; the running log recorded
+`ca0a8e4b0411551dd3330dd80fce34155fc680cabfd1cc0a208a4a2fa91b40dc`.
+Let it finish under r4. Resume
 that same Drive root only with the same r4 notebook/code. Do not attempt to
 resume it with `overnight-v1`; use a new output root for any fresh final-release
 run.
@@ -98,14 +101,131 @@ For new work from the final release:
 git clone https://github.com/LMS4681/CNN-RL-Raw-Comparison.git
 cd CNN-RL-Raw-Comparison
 git switch main
-git describe --tags --exact-match
+git rev-parse HEAD
+git rev-parse "overnight-v1^{}"
+git merge-base --is-ancestor overnight-v1 main
 ```
 
-The last command must print `overnight-v1` when the checkout is the immutable
-release commit.
+The tag command must print
+`4867f4e6e9f7425a8c438b6403493a097e2e58cb`, and the ancestor check must exit
+zero. `HEAD` is expected to be newer after this handoff commit.
 
 Final Colab URL for a fresh output root:
 
 ```text
 https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/overnight-v1/notebooks/overnight_compare.ipynb
 ```
+
+## Current live experiment snapshot
+
+The r4 Colab job was still running when this handoff was written. The values
+below are provisional stdout observations, not the final holdout result and not
+an integrity-verified comparison:
+
+```text
+raw-direct:   199,680 timesteps, ep_rew_mean=0.358, about 18.99 steps/s
+candidate-CNN  74,880 timesteps, ep_rew_mean=-0.166, about 12.50 steps/s
+```
+
+At the shared observed point near 49,920 timesteps, raw-direct had
+`ep_rew_mean=0.175` and candidate-CNN had `ep_rew_mean=-0.176`. The candidate
+diagnostics at 74,880 were `approx_kl=0.47678187`, `clip_fraction=0.671`, and
+`explained_variance=-0.184`. These values indicate active but unstable joint
+CNN/PPO learning; they do not support a current empirical CNN-superiority
+claim. The candidate path is active: CNN gradient norm, weight change,
+workspace-feature variance, and candidate-channel sensitivity are all
+non-zero.
+
+The downloaded candidate stdout snapshot was stored outside this repository at
+`D:\Sub\Allocation\CNN-RL\docs\train_candidate_cnn.log`. The downloaded raw
+stdout file was later removed; only sampled values and a local plot were
+retained. Neither local log is authoritative or committed. The complete Drive
+root, CSVs, model receipts, stage markers, and `COMPLETE.json` are the evidence
+source for the report.
+
+## Required report question and exact terminology
+
+The report must address this request:
+
+> CNN과 MLP를 거쳐서 강화학습을 하는 것이, CNN과 MLP를 거치지 않고
+> 강화학습을 하는 것과 효과상으로 어떤 차이가 있을지에 대한 설명 또는
+> 비교 데이터
+
+The literal phrase "without MLP" is not the current implementation. Both arms
+use the same trainable PPO actor/critic MLP:
+
+```text
+pi=[64,64], vf=[64,64], ReLU
+```
+
+The controlled comparison is therefore:
+
+```text
+raw-direct
+  normalized non-grid observation
+  -> mask + deterministic concatenation (no learned feature extractor)
+  -> shared PPO actor/critic MLP
+  -> workspace action
+
+candidate-CNN
+  10 x 4 x 64 x 64 workspace grids + structured/future observations
+  -> shared CNN + structured/fusion MLPs -> 256 learned features
+  -> the same PPO actor/critic MLP
+  -> workspace action
+```
+
+Use the phrase **"학습형 CNN/MLP 특징추출 전처리 없음"** for raw-direct,
+not **"신경망/MLP가 전혀 없음"**. A PPO neural policy cannot produce learned
+actions in this project without a trainable policy/value mapping.
+
+The expected effect must be explained separately from measured performance:
+
+- raw-direct is faster and more sample-efficient early because it does not
+  learn a spatial representation and ignores `grids`;
+- candidate-CNN can distinguish layouts with identical scalar occupancy but
+  different contiguous free space, lifetime geometry, lot use, and candidate
+  footprint;
+- the CNN advantage is indirect because reward schema 2 scores compliance,
+  delay, and dropout, not fragmentation itself, so spatial credit may arrive
+  many decisions later in a 913-step episode;
+- more information and parameters do not guarantee better finite-budget PPO
+  performance; throughput, optimization stability, and generalization must be
+  reported independently.
+
+## Reporting decision after Colab completion
+
+Do not edit or restart the running r4 job. After it finishes:
+
+1. Preserve the entire Drive output root before generating any new artifacts.
+2. Require `COMPLETE.json` and validate all stage and model receipts. If it is
+   partial, report only the verified subset and the exact missing stages.
+3. If candidate-CNN is favorable on the unselected primary holdout and at the
+   common timestep, publish the complete comparison with single-seed limits.
+4. If candidate-CNN is unfavorable, an explanation-focused report may center
+   on the information difference, active CNN diagnostics, computational cost,
+   and identified optimization limits. It must say that performance superiority
+   was not demonstrated. If the deliverable is explicitly a comparison report,
+   adverse comparison data cannot be silently omitted; place it in the results
+   or limitations/appendix rather than claiming CNN superiority.
+5. CNN-only diagnostics may support the claim that the CNN path is active and
+   responsive. They cannot by themselves support the claim that CNN placement
+   performance is better than raw-direct.
+
+## Next implementation plan
+
+No source code was changed for the diagnostic conclusions above. The next-PC
+work is defined in:
+
+```text
+docs/superpowers/plans/2026-07-21-cnn-feature-effect-and-stabilization-plan.md
+```
+
+The plan first finalizes the current report, then decomposes the professor's
+question with four arms: `raw-direct`, `structured`, `fixed-grid`, and
+`candidate-cnn`. This separates deterministic direct observation, learned
+structured compression, grid-information value, and learned convolution. PPO
+stabilization is attempted one variable at a time only after that diagnostic.
+
+For another PC, clone `main`, read this handoff and the plan, and do not move the
+immutable `overnight-v1` tag. The tag remains the released execution baseline;
+new documentation and future implementation commits advance `main` only.
