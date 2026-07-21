@@ -122,9 +122,9 @@ Artifact output: `20 673 240`.
 Pinned artifact hashes:
 
 - `data/fixed_eval_scenarios.json`:
-  `6125F53939A1B8EEF8662B2628C0DA2F1D0F26B5B541A99252858326B38CD814`
+  `913CAC9046DEC8164EF65DA60275522F7127DE5EA775B1C5A6B6AAC255716271`
 - `data/data_split_manifest.json`:
-  `D3DF1D0076248B4BCBDDB4C910A3CB81481DA65C7415C6B3CACF9E055CC3F9DF`
+  `601BD6143ED8890577E5FF34921241D36FD6A0E99C4BDAB4E26152AB168178F8`
 
 The scenario bundle was regenerated after enforcing the full-source
 `2025-12-04` scale lower bound. The split manifest remained byte-identical.

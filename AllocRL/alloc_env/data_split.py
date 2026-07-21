@@ -93,4 +93,5 @@ def write_split_manifest(path: str | Path, manifest: Mapping) -> None:
     destination.write_text(
         json.dumps(dict(manifest), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
+        newline="\n",
     )
