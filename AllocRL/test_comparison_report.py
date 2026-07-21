@@ -9,7 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from comparison.artifact_manifest import REQUIRED_ENVIRONMENT_KEYS
+from comparison.artifact_manifest import (
+    REQUIRED_ENVIRONMENT_KEYS,
+    canonical_json_sha256,
+)
 from comparison.checkpoint_evaluator import EVALUATION_COLUMNS
 
 
@@ -46,6 +49,9 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 def _write_evaluation_marker(root: Path, arm: str) -> None:
     arm_root = root / arm
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    runtime = json.loads(
+        (arm_root / "runtime_metrics.json").read_text(encoding="utf-8")
+    )
     _json(
         arm_root / "evaluation_stage.json",
         {
@@ -68,25 +74,85 @@ def _write_evaluation_marker(root: Path, arm: str) -> None:
             },
             "evaluation_seed_count": 20,
             "primary_test_seed_count": 15,
-            "selection_outcome": "best_model",
-            "fallback_reason": None,
+            "selection_outcome": runtime["selection_outcome"],
+            "fallback_reason": runtime["fallback_reason"],
         },
     )
+
+
+def _set_fallback_final(root: Path, arm: str, reason: str) -> None:
+    arm_root = root / arm
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    final = manifest["checkpoints"][arm]["final"]
+    manifest["checkpoints"][arm]["selected"] = {
+        **final,
+        "label": "fallback_final",
+    }
+    _json(manifest_path, manifest)
+
+    runtime_path = arm_root / "runtime_metrics.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    runtime.update(
+        {
+            "selected_checkpoint_timestep": final["timestep"],
+            "selection_count": 0,
+            "selection_tuple": None,
+            "selection_outcome": "fallback_final",
+            "fallback_reason": reason,
+            "checkpoint_identity": {
+                "filename": Path(final["path"]).name,
+                "sha256": final["sha256"],
+            },
+        }
+    )
+    _json(runtime_path, runtime)
+    for name in ("evaluation_scenarios.csv", "evaluation_primary_test.csv"):
+        path = arm_root / name
+        with path.open(encoding="utf-8", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        for row in rows:
+            row["checkpoint"] = "fallback_final"
+            row["checkpoint_timestep"] = str(final["timestep"])
+            row["checkpoint_sha256"] = final["sha256"]
+        _write_csv(path, rows)
+
+    _refresh_evaluation_contract(root, arm)
+
+
+def _refresh_evaluation_contract(root: Path, arm: str) -> None:
+    arm_root = root / arm
+    runtime_path = arm_root / "runtime_metrics.json"
+    receipt_path = arm_root / "training_completion.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["artifact_sha256"]["runtime_metrics.json"] = hashlib.sha256(
+        runtime_path.read_bytes()
+    ).hexdigest()
+    _json(receipt_path, receipt)
+    _write_evaluation_marker(root, arm)
 
 
 def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary: float = 0.5) -> None:
     selected_sha: dict[str, str] = {}
     final_sha: dict[str, str] = {}
+    common_sha: dict[str, str] = {}
+    run_config_sha: dict[str, str] = {}
     for arm in ("raw_direct", "candidate_cnn"):
         arm_root = root / arm
         arm_root.mkdir(parents=True, exist_ok=True)
         selected_path = arm_root / "best_model.sb3"
         final_path = arm_root / "checkpoints" / "model_50000_g1.sb3"
+        common_path = arm_root / "checkpoints" / "common_50000.sb3"
         selected_path.write_bytes(f"{arm}:selected".encode("utf-8"))
         final_path.parent.mkdir(exist_ok=True)
         final_path.write_bytes(f"{arm}:final".encode("utf-8"))
+        common_path.write_bytes(f"{arm}:common".encode("utf-8"))
+        run_config = {"arm": arm, "fixture": True}
+        _json(arm_root / "run_config.json", run_config)
         selected_sha[arm] = hashlib.sha256(selected_path.read_bytes()).hexdigest()
         final_sha[arm] = hashlib.sha256(final_path.read_bytes()).hexdigest()
+        common_sha[arm] = hashlib.sha256(common_path.read_bytes()).hexdigest()
+        run_config_sha[arm] = canonical_json_sha256(run_config)
     raw = {seed: (raw_primary, 0.10, 4.0, 3.0) for seed in range(1005, 1020)}
     cnn = {seed: (cnn_primary, 0.04, 2.5, 1.0) for seed in range(1005, 1020)}
     raw.update({seed: (0.99, 0.01, 1.0, 0.0) for seed in range(1000, 1005)})
@@ -95,7 +161,15 @@ def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary:
     _write_csv(root / "raw_direct" / "evaluation_primary_test.csv", _rows("raw_direct", raw, checkpoint_sha256=selected_sha["raw_direct"])[5:])
     _write_csv(root / "candidate_cnn" / "evaluation_scenarios.csv", _rows("candidate_cnn", cnn, checkpoint_sha256=selected_sha["candidate_cnn"]))
     _write_csv(root / "candidate_cnn" / "evaluation_primary_test.csv", _rows("candidate_cnn", cnn, checkpoint_sha256=selected_sha["candidate_cnn"])[5:])
-    common = _rows("raw_direct", raw, "common_step", selected_sha["raw_direct"]) + _rows("candidate_cnn", cnn, "common_step", selected_sha["candidate_cnn"])
+    common_rows = {
+        "raw_direct": _rows(
+            "raw_direct", raw, "common_step", common_sha["raw_direct"]
+        ),
+        "candidate_cnn": _rows(
+            "candidate_cnn", cnn, "common_step", common_sha["candidate_cnn"]
+        ),
+    }
+    common = common_rows["raw_direct"] + common_rows["candidate_cnn"]
     _write_csv(root / "comparison" / "common_step_evaluation.csv", common)
     for arm, total, feature in (("raw_direct", 100, 0), ("candidate_cnn", 200, 80)):
         _json(root / arm / "runtime_metrics.json", {
@@ -147,9 +221,14 @@ def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary:
         checkpoints[arm] = {
             "selected": {"path": f"{arm}/best_model.sb3", "label": "best_model", "sha256": selected_sha[arm], "timestep": 50000},
             "final": {"path": f"{arm}/checkpoints/model_50000_g1.sb3", "label": "final", "sha256": final_sha[arm], "timestep": 50000},
-            "common": {"path": f"{arm}/common.sb3", "label": "common_step", "sha256": selected_sha[arm], "timestep": 50000},
+            "common": {"path": f"{arm}/checkpoints/common_50000.sb3", "label": "common_step", "sha256": common_sha[arm], "timestep": 50000},
         }
-    _json(root / "manifest.json", {"schema_version": 1, "checkpoints": checkpoints})
+    _json(root / "manifest.json", {
+        "schema_version": 1,
+        "config_sha256": "b" * 64,
+        "scenario_sha256": "c" * 64,
+        "checkpoints": checkpoints,
+    })
     from comparison.training_completion import ARTIFACT_KEYS
     for arm in ("raw_direct", "candidate_cnn"):
         artifacts = {name: "0" * 64 for name in ARTIFACT_KEYS}
@@ -174,6 +253,37 @@ def write_complete_fixture(root: Path, *, raw_primary: float = 0.4, cnn_primary:
         )
     for arm in ("raw_direct", "candidate_cnn"):
         _write_evaluation_marker(root, arm)
+    common_artifacts = {}
+    for arm in ("raw_direct", "candidate_cnn"):
+        name = f"common_step_{arm}.cache.json"
+        _json(root / "comparison" / name, {
+            "schema_version": 1,
+            "arm": arm,
+            "config_sha256": "b" * 64,
+            "run_config_sha256": run_config_sha[arm],
+            "scenario_sha256": "c" * 64,
+            "checkpoint": checkpoints[arm]["common"],
+            "rows": common_rows[arm],
+        })
+        common_artifacts[name] = hashlib.sha256(
+            (root / "comparison" / name).read_bytes()
+        ).hexdigest()
+    common_artifacts["common_step_evaluation.csv"] = hashlib.sha256(
+        (root / "comparison" / "common_step_evaluation.csv").read_bytes()
+    ).hexdigest()
+    _json(root / "comparison" / "common_step_stage.json", {
+        "schema_version": 1,
+        "config_sha256": "b" * 64,
+        "run_config_sha256": run_config_sha,
+        "scenario_sha256": "c" * 64,
+        "common_timestep": 50000,
+        "checkpoints": {
+            arm: checkpoints[arm]["common"]
+            for arm in ("raw_direct", "candidate_cnn")
+        },
+        "artifacts": common_artifacts,
+        "evaluation_seed_count_per_arm": 20,
+    })
     for arm in ("raw_direct", "candidate_cnn"):
         arm_root = root / arm
         (arm_root / "progress_timing.csv").write_text("generation,timestep,recorded_training_seconds,updated_at_utc,status,checkpoint_file\n1,50000,10800,2026-07-21T03:00:00+00:00,complete,model_50000_g1.sb3\n", encoding="utf-8")
@@ -262,6 +372,62 @@ def test_partial_report_rejects_orphan_evaluation_csvs_without_stage_marker(
     assert "raw-direct runtime=없음" in text
 
 
+@pytest.mark.parametrize(
+    ("relative", "mutation"),
+    [
+        ("raw_direct/evaluation_stage.json", "missing"),
+        ("candidate_cnn/evaluation_stage.json", "malformed"),
+        ("raw_direct/evaluation_stage.json", "provenance"),
+        ("comparison/common_step_stage.json", "missing"),
+        ("comparison/common_step_stage.json", "malformed"),
+        ("comparison/common_step_stage.json", "provenance"),
+    ],
+)
+def test_complete_report_requires_valid_stage_markers(
+    tmp_path: Path, relative: str, mutation: str
+):
+    from comparison.report_builder import write_complete_report
+
+    write_complete_fixture(tmp_path)
+    marker = tmp_path / relative
+    if mutation == "missing":
+        marker.unlink()
+    elif mutation == "malformed":
+        marker.write_text("not-json", encoding="utf-8")
+    else:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload["config_sha256"] = "f" * 64
+        _json(marker, payload)
+
+    with pytest.raises(ValueError):
+        write_complete_report(tmp_path)
+    assert not (tmp_path / "comparison" / "preliminary_comparison_ko.md").exists()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["raw_direct/evaluation_stage.json", "comparison/common_step_stage.json"],
+)
+def test_complete_report_rejects_symlinked_stage_markers(
+    tmp_path: Path, relative: str
+):
+    from comparison.report_builder import write_complete_report
+
+    write_complete_fixture(tmp_path)
+    marker = tmp_path / relative
+    outside = tmp_path.parent / f"{tmp_path.name}-{marker.name}"
+    outside.write_bytes(marker.read_bytes())
+    marker.unlink()
+    try:
+        marker.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows host")
+
+    with pytest.raises(ValueError):
+        write_complete_report(tmp_path)
+    assert not (tmp_path / "comparison" / "preliminary_comparison_ko.md").exists()
+
+
 def test_korean_report_is_utf8_and_has_no_replacement_character(tmp_path):
     from comparison.report_builder import write_complete_report
     write_complete_fixture(tmp_path)
@@ -272,6 +438,21 @@ def test_korean_report_is_utf8_and_has_no_replacement_character(tmp_path):
     assert "wall span" in text
     assert "end-to-end" not in text
     assert "scope=training_process" in text
+
+
+@pytest.mark.parametrize("reason", ["selection_not_run", "best_model_missing"])
+def test_fallback_final_report_prints_exact_canonical_reason(
+    tmp_path: Path, reason: str
+):
+    from comparison.report_builder import write_complete_report
+
+    write_complete_fixture(tmp_path)
+    _set_fallback_final(tmp_path, "candidate_cnn", reason)
+
+    text = write_complete_report(tmp_path).read_text(encoding="utf-8")
+
+    assert f"fallback 사유: {reason}" in text
+    assert "fallback 사유: 자료 없음" not in text
 
 
 def test_missing_runtime_value_is_json_null_not_a_guessed_zero(tmp_path):
@@ -328,18 +509,12 @@ def test_dynamic_timings_fallback_and_partial_failure_safety(tmp_path):
     write_complete_fixture(tmp_path)
     for arm in ("raw_direct", "candidate_cnn"):
         path = tmp_path / arm / "runtime_metrics.json"; payload = json.loads(path.read_text(encoding="utf-8"))
-        manifest_path = tmp_path / "manifest.json"; manifest = json.loads(manifest_path.read_text(encoding="utf-8")); digest = manifest["checkpoints"][arm]["selected"]["sha256"]
-        payload.update({"target_training_seconds": 15.0, "recorded_training_seconds": 16.0, "run_wall_span_seconds": 18.0, "metrics_recorded_at_utc": "2026-07-21T00:00:18+00:00", "steps_per_second": 50000 / 16, "overrun_seconds": 1.0, "selection_count": 0, "selection_tuple": None, "selection_outcome": "fallback_final", "fallback_reason": "selection_not_run", "checkpoint_identity": {"filename": "fallback.sb3", "sha256": digest}})
+        payload.update({"target_training_seconds": 15.0, "recorded_training_seconds": 16.0, "run_wall_span_seconds": 18.0, "metrics_recorded_at_utc": "2026-07-21T00:00:18+00:00", "steps_per_second": 50000 / 16, "overrun_seconds": 1.0})
         _json(path, payload)
         state_path = tmp_path / arm / "run_state.json"; state = json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds": 15.0, "completed_training_seconds": 16.0}); _json(state_path, state)
-        manifest["checkpoints"][arm]["selected"].update({"path": f"{arm}/fallback.sb3", "label": "fallback_final"}); _json(manifest_path, manifest)
-        for name in ("evaluation_scenarios.csv", "evaluation_primary_test.csv"):
-            file = tmp_path / arm / name
-            with file.open(encoding="utf-8", newline="") as stream: rows = list(csv.DictReader(stream))
-            for row in rows: row["checkpoint"] = "fallback_final"
-            _write_csv(file, rows)
+        _set_fallback_final(tmp_path, arm, "selection_not_run")
     text = write_complete_report(tmp_path).read_text(encoding="utf-8")
-    assert "15.0" in text and "fallback 사유: 자료 없음" in text and "10,800" not in text
+    assert "15.0" in text and "fallback 사유: selection_not_run" in text and "10,800" not in text
     with pytest.raises(ValueError, match="replacement"):
         write_partial_report(tmp_path, "bad\ufffdfailure")
 
@@ -498,20 +673,23 @@ def test_report_renders_all_actual_runtime_and_selection_fields(tmp_path):
     for arm, tag, fallback in (("raw_direct", "11", False), ("candidate_cnn", "22", True)):
         manifest_path = tmp_path / "manifest.json"; manifest=json.loads(manifest_path.read_text("utf-8")); digest = manifest["checkpoints"][arm]["selected"]["sha256"]
         path = tmp_path / arm / "runtime_metrics.json"; p = json.loads(path.read_text("utf-8"))
-        selected_step = int(tag) * 100 + 1
-        p.update({"target_training_seconds": float(tag), "recorded_training_seconds": float(tag)+.1, "run_wall_span_seconds":float(tag)+.2, "metrics_recorded_at_utc":f"2026-07-21T00:00:{float(tag)+.2:04.1f}+00:00", "overrun_seconds":(float(tag)+.1)-float(tag), "restart_count":int(tag), "max_unrecorded_seconds":float(tag)+.4, "start_timestep":int(tag)*100, "end_timestep":selected_step, "steps_per_second":1/(float(tag)+.1), "evaluation_seconds":float(tag)+.6, "parameter_counts":{"total":int(tag)*10,"feature_extractor":int(tag),"policy":int(tag)*2,"value":int(tag)*7}, "peak_cuda_memory_bytes":int(tag)*1000, "selection_count":0 if fallback else 5, "selection_tuple":None if fallback else [1.1,2.2,3.3], "selection_outcome":"fallback_final" if fallback else "best_model", "fallback_reason":"selection_not_run" if fallback else None, "selected_checkpoint_timestep":selected_step, "checkpoint_identity":{"filename":"fallback.sb3" if fallback else "best_model.sb3","sha256":digest}}); _json(path,p)
+        selected_step = 50000 if fallback else int(tag) * 100 + 1
+        p.update({"target_training_seconds": float(tag), "recorded_training_seconds": float(tag)+.1, "run_wall_span_seconds":float(tag)+.2, "metrics_recorded_at_utc":f"2026-07-21T00:00:{float(tag)+.2:04.1f}+00:00", "overrun_seconds":(float(tag)+.1)-float(tag), "restart_count":int(tag), "max_unrecorded_seconds":float(tag)+.4, "start_timestep":int(tag)*100, "end_timestep":selected_step, "steps_per_second":(selected_step-int(tag)*100)/(float(tag)+.1), "evaluation_seconds":float(tag)+.6, "parameter_counts":{"total":int(tag)*10,"feature_extractor":int(tag),"policy":int(tag)*2,"value":int(tag)*7}, "peak_cuda_memory_bytes":int(tag)*1000, "selection_count":5, "selection_tuple":[1.1,2.2,3.3], "selection_outcome":"best_model", "fallback_reason":None, "selected_checkpoint_timestep":selected_step, "checkpoint_identity":{"filename":"best_model.sb3","sha256":digest}}); _json(path,p)
         origin_path=tmp_path/arm/"run_origin.json"; origin=json.loads(origin_path.read_text("utf-8")); origin["initial_timestep"]=int(tag)*100; _json(origin_path,origin)
-        state_path=tmp_path/arm/"run_state.json"; state=json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds":float(tag),"completed_training_seconds":float(tag)+.1,"restart_count":int(tag),"max_unrecorded_seconds":float(tag)+.4,"last_checkpoint_timestep":int(tag)*100+1}); _json(state_path,state)
-        manifest["checkpoints"][arm]["selected"].update({"label":"fallback_final" if fallback else "best_model","path":f"{arm}/{'fallback.sb3' if fallback else 'best_model.sb3'}","timestep":selected_step}); _json(manifest_path,manifest)
+        state_path=tmp_path/arm/"run_state.json"; state=json.loads(state_path.read_text("utf-8")); state.update({"target_training_seconds":float(tag),"completed_training_seconds":float(tag)+.1,"restart_count":int(tag),"max_unrecorded_seconds":float(tag)+.4,"last_checkpoint_timestep":selected_step}); _json(state_path,state)
+        manifest["checkpoints"][arm]["selected"].update({"timestep":selected_step}); _json(manifest_path,manifest)
         for name in ("evaluation_scenarios.csv","evaluation_primary_test.csv"):
             file=tmp_path/arm/name
             with file.open(encoding="utf-8",newline="") as s: rows=list(csv.DictReader(s))
             for row in rows:
-                row["checkpoint"]="fallback_final" if fallback else "best_model"
                 row["checkpoint_timestep"] = str(selected_step)
             _write_csv(file,rows)
+        if fallback:
+            _set_fallback_final(tmp_path, arm, "selection_not_run")
+        else:
+            _refresh_evaluation_contract(tmp_path, arm)
     text=write_complete_report(tmp_path).read_text("utf-8")
-    for value in ("11.0","11.1","11.2","11.4","11.6","22.0","22.1","22.2","22.4","22.6","1100","1101","2200","2201","11000","22000","selection count 5","selection count 0","[1.1, 2.2, 3.3]","best_model","fallback_final","fallback 사유: 자료 없음"):
+    for value in ("11.0","11.1","11.2","11.4","11.6","22.0","22.1","22.2","22.4","22.6","1100","1101","2200","11000","22000","selection count 5","selection count 0","[1.1, 2.2, 3.3]","best_model","fallback_final","fallback 사유: selection_not_run"):
         assert value in text
     assert "10,800" not in text
 
@@ -528,9 +706,10 @@ def test_zero_recorded_runtime_allows_null_steps_per_second_and_extra_manifest_m
             file = tmp_path / arm / name
             with file.open(encoding="utf-8", newline="") as stream:
                 rows = list(csv.DictReader(stream))
-            for row in rows:
-                row["checkpoint_timestep"] = "7"
-            _write_csv(file, rows)
+                for row in rows:
+                    row["checkpoint_timestep"] = "7"
+                _write_csv(file, rows)
+        _refresh_evaluation_contract(tmp_path, arm)
     manifest=tmp_path/"manifest.json"; payload=json.loads(manifest.read_text("utf-8")); payload["provenance"]={"run":"x"}; _json(manifest,payload)
     summary=build_comparison_summary(tmp_path); assert summary["raw_direct"]["runtime_metrics"]["steps_per_second"] is None and summary["manifest"]["provenance"] == {"run":"x"}
     assert "자료 없음" in write_complete_report(tmp_path).read_text("utf-8")

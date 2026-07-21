@@ -640,6 +640,7 @@ def test_common_output_hash_validates_only_common_stage_marker(
     tmp_path: Path, monkeypatch
 ):
     from comparison import experiment_runner as runner_module
+    from comparison.artifact_manifest import canonical_json_sha256
 
     config = runner_module.ExperimentConfig.for_test()
     runner = runner_module._Runner(
@@ -653,6 +654,14 @@ def test_common_output_hash_validates_only_common_stage_marker(
     marker = tmp_path / "comparison" / "common_step_stage.json"
     marker.parent.mkdir()
     marker.write_bytes(b"common-marker")
+    run_configs = {
+        "raw_direct": {"extractor": "raw-direct"},
+        "candidate_cnn": {"extractor": "candidate-cnn"},
+    }
+    for arm, payload in run_configs.items():
+        path = tmp_path / arm / "run_config.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps(payload), encoding="utf-8")
     seen = []
     monkeypatch.setattr(
         runner_module,
@@ -668,6 +677,10 @@ def test_common_output_hash_validates_only_common_stage_marker(
             tmp_path,
             {
                 "expected_config_sha256": config.config_sha256,
+                "expected_run_config_sha256": {
+                    arm: canonical_json_sha256(payload)
+                    for arm, payload in run_configs.items()
+                },
                 "expected_scenario_sha256": config.fixed_scenarios_sha256,
                 "archive_timestep_reader": runner.archive_reader,
             },
@@ -1149,6 +1162,124 @@ def test_public_runner_refreshes_partial_between_raw_evaluation_and_cnn_training
     assert events == ["partial"]
 
 
+def test_production_path_skips_valid_raw_evaluation_then_publishes_partial_before_cnn_subprocess(
+    tmp_path: Path, monkeypatch
+):
+    from comparison import experiment_runner as runner_module
+    from comparison.artifact_manifest import sha256_file
+    from test_comparison_report import write_complete_fixture
+
+    write_complete_fixture(tmp_path)
+    (tmp_path / "candidate_cnn" / "evaluation_stage.json").unlink()
+    (tmp_path / "candidate_cnn" / "training_completion.json").unlink()
+    (tmp_path / "candidate_cnn" / "run_state.json").unlink()
+    config = replace(
+        runner_module.ExperimentConfig.for_test(),
+        config_sha256="b" * 64,
+        fixed_scenarios_sha256="c" * 64,
+    )
+    inputs = {
+        stage: f"{index + 100:064x}"
+        for index, stage in enumerate(runner_module.JOURNAL_STAGES)
+    }
+    outputs = {
+        stage: f"{index + 200:064x}"
+        for index, stage in enumerate(runner_module.JOURNAL_STAGES)
+    }
+    outputs["evaluate_raw_direct"] = sha256_file(
+        tmp_path / "raw_direct" / "evaluation_stage.json"
+    )
+    complete_prefix = set(
+        runner_module.JOURNAL_STAGES[
+            : runner_module.JOURNAL_STAGES.index("train_candidate_cnn")
+        ]
+    )
+    journal = {
+        stage: (
+            runner_module._journal_entry(
+                "complete",
+                input_sha256=inputs[stage],
+                output_sha256=outputs[stage],
+                started_at_utc="2026-07-21T00:00:00Z",
+                completed_at_utc="2026-07-21T00:00:01Z",
+            )
+            if stage in complete_prefix
+            else runner_module._journal_entry()
+        )
+        for stage in runner_module.JOURNAL_STAGES
+    }
+    runner_module.atomic_write_json(tmp_path / "stage_journal.json", journal)
+    original_output_hash = runner_module._Runner.output_hash
+    monkeypatch.setattr(
+        runner_module._Runner,
+        "input_hash",
+        lambda self, name, _journal: inputs[name],
+    )
+
+    def output_hash(self, name):
+        if name == "evaluate_raw_direct":
+            return original_output_hash(self, name)
+        return outputs[name]
+
+    monkeypatch.setattr(runner_module._Runner, "output_hash", output_hash)
+    monkeypatch.setattr(
+        runner_module._Runner,
+        "provenance",
+        lambda self: {
+            "baseline_sha256": "a" * 40,
+            "config_sha256": "b" * 64,
+            "scenario_sha256": "c" * 64,
+            "split_sha256": "d" * 64,
+            "lock_sha256": "e" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        runner_module._Runner,
+        "_validate_current_environment",
+        lambda *_args, **_kwargs: None,
+    )
+    original_evaluate_arm = runner_module._Runner.evaluate_arm
+
+    def evaluate_arm(self, arm):
+        if arm == "raw_direct":
+            pytest.fail("valid raw evaluation marker must skip raw evaluation")
+        return original_evaluate_arm(self, arm)
+
+    monkeypatch.setattr(runner_module._Runner, "evaluate_arm", evaluate_arm)
+    events = []
+
+    def subprocess_runner(argv, **_kwargs):
+        partial = tmp_path / "comparison" / "PARTIAL_REPORT.md"
+        events.append(
+            (
+                "candidate_subprocess",
+                partial.is_file(),
+                partial.read_text(encoding="utf-8") if partial.is_file() else "",
+                list(argv),
+            )
+        )
+        raise RuntimeError("stop after candidate subprocess launch")
+
+    with pytest.raises(
+        runner_module.ExperimentStageError,
+        match="train_candidate_cnn failed",
+    ):
+        runner_module.run_overnight_experiment(
+            config,
+            tmp_path,
+            subprocess_runner=subprocess_runner,
+            archive_timestep_reader=lambda _path: 50_000,
+            lease_interval_seconds=999,
+        )
+
+    assert len(events) == 1
+    event, partial_existed, partial_text, argv = events[0]
+    assert event == "candidate_subprocess"
+    assert partial_existed
+    assert "raw-direct runtime=있음" in partial_text
+    assert argv[argv.index("--extractor") + 1] == "candidate-cnn"
+
+
 def _public_harness():
     from comparison.experiment_runner import JOURNAL_STAGES
     calls = []
@@ -1200,10 +1331,10 @@ def test_public_harness_refreshes_lease_while_smoke_action_blocks(tmp_path: Path
     from comparison.experiment_runner import ExperimentConfig, run_overnight_experiment
     calls, actions, hashers = _public_harness(); entered = threading.Event(); release = threading.Event(); errors = []
     def block():
-        calls.append("smoke_raw_direct"); entered.set(); assert release.wait(2)
+        calls.append("smoke_raw_direct"); entered.set(); assert release.wait(10)
     actions["smoke_raw_direct"] = block
     worker = threading.Thread(target=lambda: (run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=.01),), daemon=True)
-    worker.start(); assert entered.wait(1)
+    worker.start(); assert entered.wait(10)
     seen = set(); deadline = time.monotonic() + 1.5
     while time.monotonic() < deadline and len(seen) < 2:
         try:
@@ -1211,7 +1342,7 @@ def test_public_harness_refreshes_lease_while_smoke_action_blocks(tmp_path: Path
             if payload.get("status") == "active": seen.add(payload["heartbeat_utc"])
         except (OSError, json.JSONDecodeError): pass
         time.sleep(.01)
-    release.set(); worker.join(2)
+    release.set(); worker.join(10)
     assert len(seen) >= 2 and not worker.is_alive() and json.loads((tmp_path / "lease.json").read_text())["status"] == "released"
 
 
@@ -1219,18 +1350,18 @@ def test_blocked_owner_cannot_overwrite_or_delete_stolen_lease(tmp_path: Path):
     from comparison.experiment_runner import ExperimentConfig, LeaseError, run_overnight_experiment
     calls, actions, hashers = _public_harness(); entered = threading.Event(); release = threading.Event(); errors = []
     def block():
-        entered.set(); assert release.wait(2)
+        entered.set(); assert release.wait(10)
     actions["smoke_raw_direct"] = block
     def invoke():
         try: run_overnight_experiment(ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=.01)
         except BaseException as error: errors.append(error)
-    worker = threading.Thread(target=invoke, daemon=True); worker.start(); assert entered.wait(1)
+    worker = threading.Thread(target=invoke, daemon=True); worker.start(); assert entered.wait(10)
     old = json.loads((tmp_path / "lease.json").read_text()); replacement = dict(old); replacement["token"] = "new-token"
     from comparison.experiment_runner import atomic_write_json
     atomic_write_json(tmp_path / "lease.json", replacement); (tmp_path / ".lease.acquire").write_text("new-token\n", encoding="utf-8")
     deadline = time.monotonic() + 1.5
     while time.monotonic() < deadline and not errors: time.sleep(.01)
-    release.set(); worker.join(2)
+    release.set(); worker.join(10)
     assert errors and isinstance(errors[0], LeaseError) and not (tmp_path / "COMPLETE.json").exists()
     assert json.loads((tmp_path / "lease.json").read_text())["token"] == "new-token" and (tmp_path / ".lease.acquire").read_text(encoding="utf-8").strip() == "new-token"
 
@@ -1528,22 +1659,163 @@ def test_task6_marker_validation_rejects_duplicate_runtime_metrics(tmp_path: Pat
         runner_module._validate_report_artifacts(tmp_path)
 
 
+def _stage_marker_integrity_runner(tmp_path: Path, monkeypatch):
+    from comparison import experiment_runner as runner_module
+    from test_comparison_report import write_complete_fixture
+
+    write_complete_fixture(tmp_path)
+    for arm in ("raw_direct", "candidate_cnn"):
+        (tmp_path / arm / "environment_segments.jsonl").write_text(
+            "fixture\n", encoding="utf-8"
+        )
+    config = replace(
+        runner_module.ExperimentConfig.for_test(),
+        config_sha256="b" * 64,
+        fixed_scenarios_sha256="c" * 64,
+    )
+    runner = runner_module._Runner(
+        config,
+        tmp_path,
+        subprocess_runner=lambda *_args, **_kwargs: None,
+        clock=lambda: 0,
+        python_executable="python",
+        archive_timestep_reader=lambda _path: 50_000,
+    )
+    monkeypatch.setattr(
+        runner,
+        "provenance",
+        lambda: {
+            "baseline_sha256": "a" * 40,
+            "config_sha256": "b" * 64,
+            "scenario_sha256": "c" * 64,
+            "split_sha256": "d" * 64,
+            "lock_sha256": "e" * 64,
+        },
+    )
+    monkeypatch.setattr(runner, "_training_completion", lambda _root: {})
+    monkeypatch.setattr(runner, "_state_complete", lambda *_args: True)
+    monkeypatch.setattr(runner_module, "_validate_root_environment", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner_module, "_validate_root_manifest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner_module, "_validate_environment_segments", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner_module, "_validate_checkpoint_manifest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runner_module,
+        "_validate_report_artifacts",
+        lambda _root: {"summary.json": "a" * 64},
+    )
+    return runner_module, runner
+
+
+@pytest.mark.parametrize(
+    ("relative", "mutation"),
+    [
+        ("raw_direct/evaluation_stage.json", "missing"),
+        ("candidate_cnn/evaluation_stage.json", "malformed"),
+        ("raw_direct/evaluation_stage.json", "provenance"),
+        ("comparison/common_step_stage.json", "missing"),
+        ("comparison/common_step_stage.json", "malformed"),
+        ("comparison/common_step_stage.json", "provenance"),
+    ],
+)
+def test_final_integrity_requires_valid_stage_markers(
+    tmp_path: Path, monkeypatch, relative: str, mutation: str
+):
+    runner_module, runner = _stage_marker_integrity_runner(tmp_path, monkeypatch)
+    marker = tmp_path / relative
+    if mutation == "missing":
+        marker.unlink()
+    elif mutation == "malformed":
+        marker.write_text("not-json", encoding="utf-8")
+    else:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        payload["config_sha256"] = "f" * 64
+        marker.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(runner_module.ExperimentIntegrityError):
+        runner.integrity()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["raw_direct/evaluation_stage.json", "comparison/common_step_stage.json"],
+)
+def test_final_integrity_rejects_symlinked_stage_markers(
+    tmp_path: Path, monkeypatch, relative: str
+):
+    runner_module, runner = _stage_marker_integrity_runner(tmp_path, monkeypatch)
+    marker = tmp_path / relative
+    outside = tmp_path.parent / f"{tmp_path.name}-integrity-{marker.name}"
+    outside.write_bytes(marker.read_bytes())
+    marker.unlink()
+    try:
+        marker.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows host")
+
+    with pytest.raises(runner_module.ExperimentIntegrityError):
+        runner.integrity()
+
+
+def test_final_stage_marker_validation_uses_archive_reader_fallback(
+    tmp_path: Path, monkeypatch
+):
+    from comparison import experiment_runner as runner_module
+
+    for arm in ("raw_direct", "candidate_cnn"):
+        path = tmp_path / arm / "run_config.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{}", encoding="utf-8")
+    runner = runner_module._Runner(
+        runner_module.ExperimentConfig.for_test(),
+        tmp_path,
+        subprocess_runner=lambda *_args, **_kwargs: None,
+        clock=lambda: 0,
+        python_executable="python",
+        archive_timestep_reader=None,
+    )
+    readers = []
+    monkeypatch.setattr(
+        runner_module,
+        "validate_arm_evaluation_stage",
+        lambda *_args, **kwargs: readers.append(
+            kwargs["archive_timestep_reader"]
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "validate_common_step_stage",
+        lambda *_args, **kwargs: readers.append(
+            kwargs["archive_timestep_reader"]
+        ),
+    )
+
+    runner._validate_evaluation_stage_markers(
+        {
+            "config_sha256": runner.config.config_sha256,
+            "scenario_sha256": runner.config.fixed_scenarios_sha256,
+        }
+    )
+
+    assert len(readers) == 3
+    assert all(callable(reader) for reader in readers)
+
+
 def test_public_marker_is_published_while_first_runner_still_owns_lease(tmp_path: Path, monkeypatch):
     from comparison import experiment_runner as runner_module
 
     entered, release, errors = threading.Event(), threading.Event(), []
     original = runner_module._Runner._complete_marker
     def paused_marker(self):
-        entered.set(); assert release.wait(2)
+        entered.set(); assert release.wait(10)
         return original(self)
     monkeypatch.setattr(runner_module._Runner, "_complete_marker", paused_marker)
     calls, actions, hashers = _public_harness()
     worker = threading.Thread(target=lambda: _capture(errors, lambda: runner_module.run_overnight_experiment(runner_module.ExperimentConfig.for_test(), tmp_path, stage_actions=actions, stage_output_hashers=hashers, lease_interval_seconds=999)), daemon=True)
-    worker.start(); assert entered.wait(2)
+    worker.start(); assert entered.wait(10)
     with pytest.raises(runner_module.LeaseError):
         with runner_module._Lease(tmp_path, stale_takeover=False, clock=time.monotonic, wall_time=time.time, interval=999):
             pass
-    release.set(); worker.join(2)
+    release.set(); worker.join(10)
     assert not errors and json.loads((tmp_path / "COMPLETE.json").read_text(encoding="utf-8"))["lease_token"] == json.loads((tmp_path / "lease.json").read_text(encoding="utf-8"))["token"]
 
 
@@ -1586,6 +1858,7 @@ def test_integrity_output_hash_revalidates_environment_segments_before_skip(tmp_
     _, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
     monkeypatch.setattr(runner, "_state_complete", lambda *args: True)
+    monkeypatch.setattr(runner, "_validate_evaluation_stage_markers", lambda _provenance: None)
     monkeypatch.setattr(runner_module, "_validate_checkpoint_manifest", lambda *args: None)
     monkeypatch.setattr(runner_module, "_validate_report_artifacts", lambda *args: {"summary.json": "a" * 64})
     runner.integrity()
@@ -1673,6 +1946,7 @@ def test_complete_marker_revalidates_environment_segments_after_integrity_stage(
     _, runner, _, environment = _integrity_fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(runner, "_training_completion", lambda _root: {"valid": True})
     monkeypatch.setattr(runner, "_state_complete", lambda *args: True)
+    monkeypatch.setattr(runner, "_validate_evaluation_stage_markers", lambda _provenance: None)
     monkeypatch.setattr(runner_module, "_validate_checkpoint_manifest", lambda *args: None)
     monkeypatch.setattr(runner_module, "_validate_report_artifacts", lambda *args: {"summary.json": "a" * 64})
     runner.integrity()

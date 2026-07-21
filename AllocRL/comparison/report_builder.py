@@ -21,6 +21,7 @@ from matplotlib.figure import Figure
 from comparison.artifact_manifest import (
     REQUIRED_ENVIRONMENT_KEYS,
     RUNTIME_METRICS_KEYS,
+    canonical_json_sha256,
     read_json_object,
     read_run_origin,
     read_runtime_metrics,
@@ -31,7 +32,9 @@ from comparison.checkpoint_evaluator import (
     PRIMARY_TEST_SEEDS,
     SELECTION_SEEDS,
     validate_arm_evaluation_stage,
+    validate_common_step_stage,
 )
+from comparison.path_integrity import resolve_direct_regular_file
 from comparison.wall_clock_callback import read_progress_timing, read_wall_clock_state
 from comparison import training_log_validation
 
@@ -435,7 +438,7 @@ def _report_text(summary: Mapping[str, Any], pairs: list[dict]) -> str:
         runtime = arm["runtime_metrics"]; count = runtime.get("selection_count")
         if int(count) > 0:
             return f"label=best_model, timestep {_cell(runtime.get('selected_checkpoint_timestep'))}, SHA={_cell(runtime.get('checkpoint_identity', {}).get('sha256'))}, selection count {count}, tuple {_cell(runtime.get('selection_tuple'))}"
-        return f"label=fallback_final, timestep {_cell(runtime.get('selected_checkpoint_timestep'))}, SHA={_cell(runtime.get('checkpoint_identity', {}).get('sha256'))}, selection count 0, fallback 사유: 자료 없음"
+        return f"label=fallback_final, timestep {_cell(runtime.get('selected_checkpoint_timestep'))}, SHA={_cell(runtime.get('checkpoint_identity', {}).get('sha256'))}, selection count 0, fallback 사유: {_cell(runtime.get('fallback_reason'))}"
     pair_mean = {key: sum(row[key] for row in pairs) / len(pairs) for key in PAIR_COLUMNS[1:]}
     return f"""# Raw-direct vs Candidate-CNN 예비 결과
 
@@ -465,9 +468,47 @@ raw-direct: target={_cell(raw['runtime_metrics']['target_training_seconds'])}, r
 """
 
 
+def _validate_evaluation_stages(root: Path) -> None:
+    manifest = _manifest(root)
+    config_sha256 = _sha(
+        manifest.get("config_sha256"), "manifest config_sha256"
+    )
+    scenario_sha256 = _sha(
+        manifest.get("scenario_sha256"), "manifest scenario_sha256"
+    )
+    run_config_sha256 = {}
+    for arm in ARMS:
+        validate_arm_evaluation_stage(
+            root,
+            arm,
+            expected_config_sha256=config_sha256,
+            expected_scenario_sha256=scenario_sha256,
+        )
+        arm_root = root / arm
+        run_config_path = resolve_direct_regular_file(
+            arm_root,
+            arm_root / "run_config.json",
+            label=f"{arm} run config",
+        )
+        run_config_sha256[arm] = canonical_json_sha256(
+            read_json_object(run_config_path)
+        )
+    validate_common_step_stage(
+        root,
+        expected_config_sha256=config_sha256,
+        expected_run_config_sha256=run_config_sha256,
+        expected_scenario_sha256=scenario_sha256,
+    )
+
+
 def write_complete_report(root: str | Path) -> Path:
     """Write complete report artifacts; integrity marker creation belongs to Task 6."""
-    base = Path(root); comparison = base / "comparison"
+    base = Path(root)
+    try:
+        _validate_evaluation_stages(base)
+    except OSError as error:
+        raise ValueError("evaluation stage artifacts are unavailable") from error
+    comparison = base / "comparison"
     summary = build_comparison_summary(base); pairs = build_paired_differences(base)
     _canonical_write_json(comparison / "summary.json", summary); _write_pairs(comparison / "scenario_paired_differences.csv", pairs)
     _learning_plot(base, comparison / "learning_curves.png"); _holdout_plot(summary, pairs, comparison / "holdout_comparison.png")

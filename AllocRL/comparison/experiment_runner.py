@@ -39,6 +39,7 @@ from comparison.checkpoint_evaluator import (
     validate_arm_evaluation_stage,
     validate_common_step_stage,
 )
+from comparison.path_integrity import resolve_direct_regular_file
 from comparison.report_builder import PAIR_COLUMNS, JOURNAL_STAGES, JOURNAL_STATUSES, build_comparison_summary, build_paired_differences, write_complete_report, write_partial_report
 from comparison.wall_clock_callback import atomic_write_json, read_wall_clock_state, resolve_state_checkpoint
 from comparison.training_completion import validate_training_completion
@@ -666,6 +667,17 @@ class _Runner:
     def save_journal(self, data: Mapping[str, Any]) -> None: atomic_write_json(self.journal_path, dict(data))
     def stage_path(self, name: str) -> Path:
         return {"preflight":self.root/"manifest.json", "smoke_raw_direct":self.root/"smoke"/"raw_direct"/"runner_verified.json", "smoke_candidate_cnn":self.root/"smoke"/"candidate_cnn"/"runner_verified.json", "train_raw_direct":self.root/"raw_direct"/"training_completion.json", "evaluate_raw_direct":self.root/"raw_direct"/"evaluation_stage.json", "train_candidate_cnn":self.root/"candidate_cnn"/"training_completion.json", "evaluate_candidate_cnn":self.root/"candidate_cnn"/"evaluation_stage.json", "evaluate_common_step":self.root/"comparison"/"common_step_stage.json", "build_report":self.root/"comparison"/"preliminary_comparison_ko.md", "integrity_verification":self.root/"integrity_verification.json"}[name]
+    def _run_config_sha256(self) -> dict[str, str]:
+        result = {}
+        for arm in _COMPARISON_ARMS:
+            arm_root = self.root / arm
+            run_config_path = resolve_direct_regular_file(
+                arm_root,
+                arm_root / "run_config.json",
+                label=f"{arm} run config",
+            )
+            result[arm] = canonical_json_sha256(_json(run_config_path))
+        return result
     def output_hash(self, name: str) -> str:
         """Hash only artifacts owned by this stage, never mutable descendants."""
         if self._injected_output_hasher is not None: return self._injected_output_hasher(name)
@@ -699,6 +711,7 @@ class _Runner:
             validate_common_step_stage(
                 self.root,
                 expected_config_sha256=self.config.config_sha256,
+                expected_run_config_sha256=self._run_config_sha256(),
                 expected_scenario_sha256=self.config.fixed_scenarios_sha256,
                 archive_timestep_reader=(
                     self.archive_reader or model_num_timesteps
@@ -899,6 +912,32 @@ class _Runner:
             scenario_sha256=provenance["scenario_sha256"],
             regular_interval=self.config.checkpoint_freq,
         )
+    def _validate_evaluation_stage_markers(
+        self, provenance: Mapping[str, str]
+    ) -> None:
+        try:
+            from train import model_num_timesteps
+
+            archive_reader = self.archive_reader or model_num_timesteps
+            for arm in _COMPARISON_ARMS:
+                validate_arm_evaluation_stage(
+                    self.root,
+                    arm,
+                    expected_config_sha256=provenance["config_sha256"],
+                    expected_scenario_sha256=provenance["scenario_sha256"],
+                    archive_timestep_reader=archive_reader,
+                )
+            validate_common_step_stage(
+                self.root,
+                expected_config_sha256=provenance["config_sha256"],
+                expected_run_config_sha256=self._run_config_sha256(),
+                expected_scenario_sha256=provenance["scenario_sha256"],
+                archive_timestep_reader=archive_reader,
+            )
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            raise ExperimentIntegrityError(
+                "evaluation stage marker integrity failed"
+            ) from error
     def _validate_integrity(self, *, write_record: bool) -> dict[str, Any]:
         provenance=self.provenance(); manifest=_json(self.root/"manifest.json"); environment=_json(self.root/"environment.json")
         _validate_root_environment(environment, provenance, production_loaded=self.config.production_loaded)
@@ -910,6 +949,7 @@ class _Runner:
             if not self._state_complete(self.root/arm,state): raise ExperimentIntegrityError("incomplete arm")
             checkpoint = resolve_state_checkpoint(self.root / arm, state)
             states[arm] = {"state": asdict(state), "checkpoint_sha256": sha256_file(checkpoint)}
+        self._validate_evaluation_stage_markers(provenance)
         _validate_environment_segments(self.root, environment, provenance, production_loaded=self.config.production_loaded)
         _validate_checkpoint_manifest(self.root, manifest, self.archive_reader)
         reports = _validate_report_artifacts(self.root)
