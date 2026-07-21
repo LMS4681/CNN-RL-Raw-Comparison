@@ -294,6 +294,7 @@ def _preflight_runner(tmp_path: Path, monkeypatch, *, scenario_payload=None):
         ExperimentConfig.for_test(),
         fixed_scenarios_sha256=sha256_file(scenario),
         split_manifest_sha256=sha256_file(split),
+        dependency_lock_sha256=sha256_file(lock),
     )
     monkeypatch.setattr(runner_module, "_allocrl_dir", lambda: base)
     return runner_module, _Runner(
