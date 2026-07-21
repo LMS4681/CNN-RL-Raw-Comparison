@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - The baseline implementation is `https://github.com/LMS4681/CNN-RL.git` commit `cd4e14fc1725a4ff159e59d6874d3602f3b65a06` and observation schema 3.
-- The immutable input hashes are fixed scenarios `6125f53939a1b8eef8662b2628c0da2f1d0f26b5b541a99252858326b38cd814` and split manifest `d3df1d0076248b4bcbddb4c910a3cb81481da65c7415c6b3cacf9e055cc3f9df`.
+- The immutable input hashes are fixed scenarios `913cac9046dec8164ef65da60275522f7127de5ea775b1c5a6b6aac255716271` and split manifest `601bd6143ed8890577e5ff34921241d36fd6a0e99c4bdab4e26152ab168178f8`.
 - Publish a separate public repository named `LMS4681/CNN-RL-Raw-Comparison`; do not push comparison implementation commits to the original repository's `main`.
 - Preserve the 913-block episode, deterministic ship-disjoint split, fixed ten-workspace order, action mask, no-rotation semantics, reward conservation, normalization scales, and fixed scenario bundle.
 - Compare `raw-direct/full` against the baseline candidate-CNN feature extractor with its SB3 2.9 policy defaults made explicit, using seed `0`, one environment, and the same Colab VM/GPU.
@@ -991,9 +991,9 @@ Expected: FAIL because the runner and config do not exist.
 {
   "schema_version": 1,
   "baseline_commit": "cd4e14fc1725a4ff159e59d6874d3602f3b65a06",
-  "fixed_scenarios_sha256": "6125f53939a1b8eef8662b2628c0da2f1d0f26b5b541a99252858326b38cd814",
+  "fixed_scenarios_sha256": "913cac9046dec8164ef65da60275522f7127de5ea775b1c5a6b6aac255716271",
   "split_manifest_path": "data/data_split_manifest.json",
-  "split_manifest_sha256": "d3df1d0076248b4bcbddb4c910a3cb81481da65c7415c6b3cacf9e055cc3f9df",
+  "split_manifest_sha256": "601bd6143ed8890577e5ff34921241d36fd6a0e99c4bdab4e26152ab168178f8",
   "seed": 0,
   "state_context": "full",
   "target_training_seconds_per_arm": 10800,

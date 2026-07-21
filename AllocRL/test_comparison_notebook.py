@@ -27,6 +27,8 @@ COLAB_BADGE = (
 )
 DATA_TREE_OID = "0140dfe704c607045da2f20faa32a0141e7bcc9b"
 LOCK_SHA256 = "37634576e34043d169cf24bfc0cc2261818dc65b9358d4b9b2e46ab614d0bdda"
+FIXED_SCENARIOS_SHA256 = "913cac9046dec8164ef65da60275522f7127de5ea775b1c5a6b6aac255716271"
+SPLIT_MANIFEST_SHA256 = "601bd6143ed8890577e5ff34921241d36fd6a0e99c4bdab4e26152ab168178f8"
 
 
 def load_notebook() -> dict[str, object]:
@@ -102,8 +104,8 @@ def test_notebook_fails_closed_on_fixed_provenance_and_lock_hashes():
     *_, verify, _, _ = code_cells(load_notebook())
     for value in (
         "cd4e14fc1725a4ff159e59d6874d3602f3b65a06",
-        "6125f53939a1b8eef8662b2628c0da2f1d0f26b5b541a99252858326b38cd814",
-        "d3df1d0076248b4bcbddb4c910a3cb81481da65c7415c6b3cacf9e055cc3f9df",
+        FIXED_SCENARIOS_SHA256,
+        SPLIT_MANIFEST_SHA256,
         "UPSTREAM_BASELINE.md",
         "sha256",
         "%cd /content/CNN-RL-Raw-Comparison/AllocRL",
@@ -257,6 +259,22 @@ def test_comparison_lock_is_checked_out_as_canonical_lf_bytes():
     assert "AllocRL/requirements-comparison.txt text eol=lf" in attributes.splitlines()
 
 
+def test_immutable_json_inputs_are_canonical_lf_git_blob_bytes():
+    expected = {
+        "AllocRL/data/fixed_eval_scenarios.json": FIXED_SCENARIOS_SHA256,
+        "AllocRL/data/data_split_manifest.json": SPLIT_MANIFEST_SHA256,
+    }
+    attributes = (REPOSITORY_ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
+    for relative_path, expected_sha256 in expected.items():
+        blob = subprocess.check_output(
+            ["git", "show", f"HEAD:{relative_path}"],
+            cwd=REPOSITORY_ROOT,
+        )
+        assert b"\r\n" not in blob
+        assert hashlib.sha256(blob).hexdigest() == expected_sha256
+        assert f"{relative_path} text eol=lf" in attributes
+
+
 def test_operator_docs_bind_the_lock_and_disclose_colab_limitations():
     readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8").lower()
     assert all(term in readme for term in (
@@ -270,8 +288,8 @@ def test_operator_docs_bind_the_lock_and_disclose_colab_limitations():
     assert hashlib.sha256(lock).hexdigest() in provenance
     for value in (
         "cd4e14fc1725a4ff159e59d6874d3602f3b65a06",
-        "6125f53939a1b8eef8662b2628c0da2f1d0f26b5b541a99252858326b38cd814",
-        "d3df1d0076248b4bcbddb4c910a3cb81481da65c7415c6b3cacf9e055cc3f9df",
+        FIXED_SCENARIOS_SHA256,
+        SPLIT_MANIFEST_SHA256,
         "overnight-v1",
         "must never be placed onto the original upstream main/history",
     ):
