@@ -1,6 +1,6 @@
 # Raw observation vs CNN comparison: code and experiment handoff
 
-Updated: 2026-07-21 15:00 (Asia/Seoul)
+Updated: 2026-07-21 17:00 (Asia/Seoul)
 
 ## Release state
 
@@ -229,3 +229,82 @@ stabilization is attempted one variable at a time only after that diagnostic.
 For another PC, clone `main`, read this handoff and the plan, and do not move the
 immutable `overnight-v1` tag. The tag remains the released execution baseline;
 new documentation and future implementation commits advance `main` only.
+
+## Immediate next-PC implementation: scale-aware CNN and six-hour Colab
+
+The user approved a focused improvement before the next candidate-CNN run.
+This immediate implementation is specified in:
+
+```text
+docs/superpowers/plans/2026-07-21-scale-aware-cnn-six-hour-colab-implementation.md
+```
+
+Read that focused plan before the broader four-arm stabilization plan above.
+It does not change reward, actions, episode order, data generation, workspace
+order, or the no-rotation rule. It appends four workspace-relative current
+block fields to `ws_meta`, appends maximum future length and breadth to each
+future-demand window, and bumps observation schema 3 to schema 4. Existing
+schema-3 checkpoints must not be resumed.
+
+The CNN and structured/fusion MLP remain trainable end to end. Do not replace
+their weights with fixed all-one kernels. The actual executable candidate-CNN
+also retains its current four grid channels. The previously prepared report's
+three-channel explanation is not a request to remove the candidate channel
+from the new training code.
+
+The approved production settings are:
+
+```text
+Colab GPU:             L4 (high-memory system profile if offered)
+parallel environments: 8 with SubprocVecEnv
+per-env n_steps:        120
+rollout transitions:    8 * 120 = 960
+batch size:             64
+n_epochs:               5
+initial LR:             1e-4
+final LR:               1e-5
+LR decay horizon:       1,000,000 cumulative timesteps
+training budget:        21,600 cumulative seconds (6 hours)
+checkpoint interval:    10,000 timesteps
+Drive output root:       /content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0
+```
+
+The LR schedule must use absolute cumulative `model.num_timesteps`; SB3's
+per-`learn()` progress value is insufficient because it can reset its horizon
+on resume. The schedule and wall-clock budget must both continue from their
+saved state after a Colab disconnect.
+
+Use `n_steps=120`, not 960, with eight environments. This preserves the old
+960-transition PPO update size and prevents an eightfold rollout-buffer
+increase. `batch_size=64` then produces exactly 15 minibatches per epoch.
+
+For the final Colab UI, select:
+
+```text
+Runtime -> Change runtime type -> Hardware accelerator: GPU -> GPU type: L4
+```
+
+Colab resource availability is dynamic. The notebook must print and verify the
+actual device before starting the six-hour timer. A100 is a manual fallback,
+but L4 is the planned runtime because the environment simulation remains partly
+CPU-bound and L4 has ample memory for this model. Do not silently run the final
+job on T4.
+
+Runtime references:
+
+```text
+https://research.google.com/colaboratory/faq.html
+https://www.nvidia.com/en-us/data-center/l4/
+```
+
+The future implementation creates a new immutable tag
+`scale-aware-cnn-6h-v1`. Do not create or move that tag during planning; create
+it only after schema-4 tests, full pytest, and a short real eight-environment
+resume rehearsal pass. Its eventual notebook URL will be:
+
+```text
+https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/scale-aware-cnn-6h-v1/notebooks/improved_cnn_6h.ipynb
+```
+
+That URL is not usable until the implementation is complete and the tag has
+been pushed. The existing r4 run and `overnight-v1` release remain untouched.
