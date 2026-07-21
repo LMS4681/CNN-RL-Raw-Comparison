@@ -145,6 +145,7 @@ def write_scenarios(
     destination.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
+        newline="\n",
     )
 
 
