@@ -59,6 +59,7 @@ PRODUCTION_CONFIG = {
     "checkpoint_heartbeat_seconds": 300, "holdout_eval_freq": 50_000,
     "holdout_selection_count": 5, "smoke_timesteps": 1024,
     "scenario_path": "data/fixed_eval_scenarios.json", "dependency_lock_path": "requirements-comparison.txt",
+    "dependency_lock_sha256": "37634576e34043d169cf24bfc0cc2261818dc65b9358d4b9b2e46ab614d0bdda",
 }
 _OPERATING_OVERRIDES = frozenset({"target_training_seconds_per_arm", "timesteps_ceiling", "checkpoint_freq", "checkpoint_heartbeat_seconds", "holdout_eval_freq", "smoke_timesteps"})
 _SHA256 = __import__("re").compile(r"[0-9a-f]{64}\Z")
@@ -449,7 +450,7 @@ class ExperimentConfig:
     n_steps: int; batch_size: int; n_epochs: int; gamma: float; gae_lambda: float
     n_envs: int; vec_env: str; device: str; checkpoint_freq: int
     checkpoint_heartbeat_seconds: float; holdout_eval_freq: int; holdout_selection_count: int
-    smoke_timesteps: int; scenario_path: str; dependency_lock_path: str
+    smoke_timesteps: int; scenario_path: str; dependency_lock_path: str; dependency_lock_sha256: str
     config_sha256: str = field(default="", compare=True)
     path: Path | None = field(default=None, compare=False, repr=False)
     production_loaded: bool = field(default=False, compare=False, repr=False)
@@ -478,7 +479,10 @@ def _validate_config_payload(payload: Mapping[str, Any], *, allow_operational_ov
             if not _valid_number(value) or float(value) != expected_value: raise ValueError(f"immutable config value differs: {key}")
         elif type(value) is not type(expected_value) or value != expected_value:
             raise ValueError(f"immutable config value differs: {key}")
-    if _SHA1.fullmatch(payload["baseline_commit"]) is None or _SHA256.fullmatch(payload["fixed_scenarios_sha256"]) is None or _SHA256.fullmatch(payload["split_manifest_sha256"]) is None:
+    if (_SHA1.fullmatch(payload["baseline_commit"]) is None
+            or _SHA256.fullmatch(payload["fixed_scenarios_sha256"]) is None
+            or _SHA256.fullmatch(payload["split_manifest_sha256"]) is None
+            or _SHA256.fullmatch(payload["dependency_lock_sha256"]) is None):
         raise ValueError("invalid immutable provenance digest")
 
 
@@ -789,6 +793,7 @@ class _Runner:
             if not path.is_file(): raise ExperimentIntegrityError(f"required {key} input is absent: {path}")
         scenario,split,lock=(sha256_file(paths[key]) for key in ("scenario","split","lock"))
         if scenario!=self.config.fixed_scenarios_sha256 or split!=self.config.split_manifest_sha256: raise ExperimentIntegrityError("immutable input hash mismatch")
+        if lock!=self.config.dependency_lock_sha256: raise ExperimentIntegrityError("dependency lock hash mismatch")
         try:
             scenarios = read_scenarios(paths["scenario"])
             if any(type(item["seed"]) is not int for item in scenarios):

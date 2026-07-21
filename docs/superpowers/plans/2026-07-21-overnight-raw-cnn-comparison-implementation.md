@@ -1013,7 +1013,8 @@ Expected: FAIL because the runner and config do not exist.
   "holdout_selection_count": 5,
   "smoke_timesteps": 1024,
   "scenario_path": "data/fixed_eval_scenarios.json",
-  "dependency_lock_path": "requirements-comparison.txt"
+  "dependency_lock_path": "requirements-comparison.txt",
+  "dependency_lock_sha256": "37634576e34043d169cf24bfc0cc2261818dc65b9358d4b9b2e46ab614d0bdda"
 }
 ```
 

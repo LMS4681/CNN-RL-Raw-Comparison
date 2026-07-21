@@ -40,6 +40,35 @@ def test_production_config_is_strict_and_commands_are_safe(tmp_path: Path):
     ]
 
 
+def test_production_config_pins_and_runtime_enforces_dependency_lock(monkeypatch, tmp_path: Path):
+    from comparison import experiment_runner as runner_module
+
+    config = runner_module.ExperimentConfig.for_test()
+    expected_lock = "37634576e34043d169cf24bfc0cc2261818dc65b9358d4b9b2e46ab614d0bdda"
+    assert config.dependency_lock_sha256 == expected_lock
+
+    expected_by_name = {
+        Path(config.scenario_path).name: config.fixed_scenarios_sha256,
+        Path(config.split_manifest_path).name: config.split_manifest_sha256,
+        Path(config.dependency_lock_path).name: "f" * 64,
+    }
+    monkeypatch.setattr(
+        runner_module,
+        "sha256_file",
+        lambda path: expected_by_name[Path(path).name],
+    )
+    runner = runner_module._Runner(
+        config,
+        tmp_path,
+        subprocess_runner=lambda *args, **kwargs: None,
+        clock=lambda: 0,
+        python_executable=None,
+        archive_timestep_reader=None,
+    )
+    with pytest.raises(runner_module.ExperimentIntegrityError, match="dependency lock hash mismatch"):
+        runner.provenance()
+
+
 def test_loader_rejects_unknown_production_key(tmp_path: Path):
     from comparison.experiment_runner import load_experiment_config
 

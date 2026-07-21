@@ -106,11 +106,14 @@ def test_notebook_fails_closed_on_fixed_provenance_and_lock_hashes():
         "cd4e14fc1725a4ff159e59d6874d3602f3b65a06",
         FIXED_SCENARIOS_SHA256,
         SPLIT_MANIFEST_SHA256,
+        LOCK_SHA256,
         "UPSTREAM_BASELINE.md",
         "sha256",
         "%cd /content/CNN-RL-Raw-Comparison/AllocRL",
     ):
         assert value in verify
+    assert '"dependency_lock_sha256"' in verify
+    assert 'lock_sha256 != expected["dependency_lock_sha256"]' in verify
     assert "raise RuntimeError" in verify
 
 
