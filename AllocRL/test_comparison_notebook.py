@@ -78,6 +78,7 @@ def test_notebook_installs_hashed_lock_without_mutating_colab_torch_stack():
     *_, install, _, _, _ = code_cells(load_notebook())
     assert install.startswith("import json\n")
     assert "requirements-comparison.txt" in install and "--require-hashes" in install
+    assert '"--no-deps"' in install
     assert '"pip", "check"' in install
     assert "def child_torch_snapshot" in install
     assert "sys.executable" in install and '"-c"' in install and "json.loads" in install
