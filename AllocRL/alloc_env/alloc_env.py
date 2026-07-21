@@ -1,4 +1,4 @@
-"""Gymnasium environment exposing the fixed schema-3 allocation state."""
+"""Gymnasium environment exposing the fixed schema-4 allocation state."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ SYNTHETIC_SPREAD_MAX_RATIO = 1.2
 
 
 class BlockPlacementEnv(gym.Env):
-    """Sequential block-allocation environment with fixed schema-3 state."""
+    """Sequential block-allocation environment with fixed schema-4 state."""
 
     metadata = {"render_modes": []}
 
@@ -761,6 +761,15 @@ class BlockPlacementEnv(gym.Env):
             [workspace.breadth for workspace in self._workspaces],
             dtype=np.float32,
         )
+        if (
+            not np.all(np.isfinite(workspace_lengths))
+            or not np.all(np.isfinite(workspace_breadths))
+            or np.any(workspace_lengths <= 0.0)
+            or np.any(workspace_breadths <= 0.0)
+        ):
+            raise ValueError(
+                "workspace dimensions must be finite and positive"
+            )
         placed_area_ratio = np.clip(
             self._ws_used_area / self._ws_areas, 0.0, 1.0
         )
@@ -783,6 +792,16 @@ class BlockPlacementEnv(gym.Env):
             ),
             placed_area_ratio,
             placeable,
+            np.clip(block.length / workspace_lengths, 0.0, 1.0),
+            np.clip(block.breadth / workspace_breadths, 0.0, 1.0),
+            np.clip(
+                (block.length * block.breadth)
+                / (workspace_lengths * workspace_breadths),
+                0.0,
+                1.0,
+            ),
+            np.minimum(workspace_lengths, workspace_breadths)
+            / np.maximum(workspace_lengths, workspace_breadths),
         ], axis=1).astype(np.float32)
 
         future_indices = simulator.unassigned_block_indices()
@@ -829,7 +848,7 @@ class BlockPlacementEnv(gym.Env):
         }
 
     def _get_terminal_obs(self) -> Dict[str, np.ndarray]:
-        """Return a schema-3 zero observation after the episode ends."""
+        """Return a schema-4 zero observation after the episode ends."""
         return {
             key: np.zeros(space.shape, dtype=space.dtype)
             for key, space in self.observation_space.spaces.items()

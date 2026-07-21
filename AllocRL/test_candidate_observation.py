@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from datetime import date
 
 import numpy as np
@@ -112,6 +113,76 @@ def make_env(
         strategy,
         grid_size=32,
         observation_scales=fixture_scales([workspace]),
+    )
+
+
+def test_workspace_metadata_exposes_scale_and_orientation_without_rotation():
+    def observe(block_length: float, block_breadth: float):
+        strategy = BaseGridStrategy(step=5.0)
+        workspaces = [
+            Workspace(
+                code="SMALL",
+                origin_x=0.0,
+                origin_y=0.0,
+                length=100.0,
+                breadth=50.0,
+                strategy=strategy,
+            ),
+            Workspace(
+                code="LARGE",
+                origin_x=0.0,
+                origin_y=0.0,
+                length=200.0,
+                breadth=100.0,
+                strategy=strategy,
+            ),
+        ]
+        block = Block(
+            name="SCALE",
+            ship_no="T001",
+            block_type="BUILD",
+            length=block_length,
+            breadth=block_breadth,
+            height=5.0,
+            weight=10.0,
+            in_date=date(2026, 1, 5),
+            out_date=date(2026, 1, 30),
+        )
+        env = BlockPlacementEnv(
+            [block],
+            workspaces,
+            strategy,
+            grid_size=32,
+            observation_scales=replace(
+                fixture_scales(workspaces), max_breadth=20.0
+            ),
+        )
+        observation, _ = env.reset(seed=0)
+        return observation
+
+    original = observe(20.0, 10.0)
+    swapped = observe(10.0, 20.0)
+
+    assert original["ws_meta"].shape == (2, 8)
+    np.testing.assert_array_equal(
+        original["grids"][0, :3], original["grids"][1, :3]
+    )
+    np.testing.assert_allclose(
+        original["ws_meta"][:, 4:],
+        np.array(
+            [
+                [20.0 / 100.0, 10.0 / 50.0, 200.0 / 5_000.0, 0.5],
+                [20.0 / 200.0, 10.0 / 100.0, 200.0 / 20_000.0, 0.5],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    np.testing.assert_allclose(
+        swapped["ws_meta"][0, 4:6],
+        np.array([10.0 / 100.0, 20.0 / 50.0], dtype=np.float32),
+    )
+    assert not np.array_equal(
+        original["ws_meta"][0, 4:6], swapped["ws_meta"][0, 4:6]
     )
 
 

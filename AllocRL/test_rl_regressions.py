@@ -195,7 +195,7 @@ class RlRegressionTests(unittest.TestCase):
         self.assertEqual(0.5, obs["block"][0])
 
     def test_ws_meta_exposes_placeability_column(self):
-        # Schema 3: [length, breadth, placed-area ratio, placeability].
+        # Schema 4 preserves the first four fields and appends scale ratios.
         blocks = [
             make_block("A001", date(2026, 1, 5)),
             make_block("A002", date(2026, 1, 6)),
@@ -208,7 +208,7 @@ class RlRegressionTests(unittest.TestCase):
         )
         obs, _ = env.reset()
 
-        self.assertEqual(obs["ws_meta"].shape, (1, 4))
+        self.assertEqual(obs["ws_meta"].shape, (1, 8))
         placeable = obs["ws_meta"][:, 3]
         # 이진 신호(0/1)여야 한다.
         self.assertTrue(bool(((placeable == 0.0) | (placeable == 1.0)).all()))
@@ -267,7 +267,7 @@ class RlRegressionTests(unittest.TestCase):
         obs, _ = env.reset()
 
         self.assertEqual((1, 4, 32, 32), obs["grids"].shape)
-        self.assertEqual((1, 4), obs["ws_meta"].shape)
+        self.assertEqual((1, 8), obs["ws_meta"].shape)
         self.assertEqual([True], env.action_masks().tolist())
         self.assertGreater(float(obs["grids"][0].sum()), 0.0)
 

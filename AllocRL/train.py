@@ -81,7 +81,7 @@ DEFAULT_EXCLUDED_START_MONTHS = (7, 11)
 DEFAULT_MONTHLY_JITTER = 20
 DEFAULT_EMPIRICAL_PROFILE_PROBABILITY = 0.2
 TRAINING_DATA_SCHEMA_VERSION = 2
-OBSERVATION_SCHEMA_VERSION = 3
+OBSERVATION_SCHEMA_VERSION = 4
 REWARD_SCHEMA_VERSION = 2
 MODEL_FILENAME = "block_placement_ppo.sb3"
 LEGACY_MODEL_FILENAME = "block_placement_ppo.zip"
@@ -975,8 +975,8 @@ def require_current_observation_schema(
     raise ValueError(
         f"[{source}] Saved model observation_schema_version is "
         f"incompatible: saved={saved_version}, "
-        f"current={OBSERVATION_SCHEMA_VERSION}. Schema-2 models cannot be "
-        "used with the schema-3 environment; train or select a schema-3 model."
+        f"current={OBSERVATION_SCHEMA_VERSION}. Schema-3 models cannot be "
+        "used with the schema-4 environment; train or select a schema-4 model."
     )
 
 

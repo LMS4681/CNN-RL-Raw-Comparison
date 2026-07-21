@@ -26,10 +26,10 @@ GRID_LIFETIME_NORMALIZER = 60
 
 CURRENT_BLOCK_FEATURE_DIM = 8
 FUTURE_BLOCK_FEATURE_DIM = 6
-FUTURE_DEMAND_FEATURE_DIM = 4
+FUTURE_DEMAND_FEATURE_DIM = 6
 PENDING_BLOCK_FEATURE_DIM = 7
 PENDING_SUMMARY_FEATURE_DIM = 4
-WORKSPACE_META_FEATURE_DIM = 4
+WORKSPACE_META_FEATURE_DIM = 8
 
 _FLOAT_SCALE_FIELDS = (
     "max_length",
@@ -289,6 +289,10 @@ def encode_future_demand(
             sum(block.original_duration for block in window_blocks)
             / (len(window_blocks) * scales.max_duration),
             max(areas) / scales.max_workspace_area,
+            max(block.length for block in window_blocks)
+            / scales.max_length,
+            max(block.breadth for block in window_blocks)
+            / scales.max_breadth,
         ])
     return demand
 

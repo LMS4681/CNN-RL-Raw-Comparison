@@ -8,6 +8,7 @@ test_feature_extractors.py (torch/gym 필요) 참고.
 """
 
 import unittest
+from dataclasses import replace
 from datetime import date
 
 import numpy as np
@@ -379,11 +380,40 @@ def test_future_working_day_windows_include_exact_boundaries():
         blocks, list(range(len(blocks))), base, make_encoder_scales()
     )
 
-    expected_row = np.array([2 / 913, 100 / 200_000, 1.0, 0.01], np.float32)
+    expected_row = np.array(
+        [2 / 913, 100 / 200_000, 1.0, 0.01, 1.0, 1.0],
+        np.float32,
+    )
     np.testing.assert_allclose(demand, np.tile(expected_row, (3, 1)))
-    assert demand.shape == (3, 4)
+    assert demand.shape == (3, 6)
     assert demand.dtype == np.float32
     assert [vars(block) for block in blocks] == before
+
+
+def test_future_demand_preserves_length_and_breadth_for_equal_area_blocks():
+    base = date(2026, 1, 5)
+    scales = replace(
+        make_encoder_scales(), max_length=20.0, max_breadth=20.0
+    )
+    horizontal = make_encoder_block(
+        0, base, length=10.0, breadth=5.0
+    )
+    vertical = make_encoder_block(
+        1, base, length=5.0, breadth=10.0
+    )
+    horizontal_before = vars(horizontal).copy()
+    vertical_before = vars(vertical).copy()
+
+    horizontal_demand = encode_future_demand(
+        [horizontal], [0], base, scales
+    )
+    vertical_demand = encode_future_demand([vertical], [0], base, scales)
+
+    assert horizontal_demand[0, 3] == pytest.approx(vertical_demand[0, 3])
+    np.testing.assert_allclose(horizontal_demand[0, 4:], [0.5, 0.25])
+    np.testing.assert_allclose(vertical_demand[0, 4:], [0.25, 0.5])
+    assert vars(horizontal) == horizontal_before
+    assert vars(vertical) == vertical_before
 
 
 def test_future_demand_empty_windows_are_zero_and_uses_only_passed_indices():

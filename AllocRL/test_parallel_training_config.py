@@ -23,8 +23,10 @@ from alloc_env.cnn_extractor import (
 from comparison.raw_direct_extractor import RawDirectExtractor
 from alloc_env.strategy import BaseGridStrategy
 from alloc_env.observation_state import (
+    FUTURE_DEMAND_FEATURE_DIM,
     GRID_SIZE,
     N_WORKSPACES,
+    WORKSPACE_META_FEATURE_DIM,
     ObservationScales,
     build_observation_space,
 )
@@ -322,14 +324,16 @@ class ParallelTrainingConfigTests(unittest.TestCase):
 
         self.assertAlmostEqual(single_env_mb * 4, four_env_mb)
 
-    def test_run_config_records_schema3_observation_constants(self):
+    def test_run_config_records_schema4_observation_constants(self):
         scales = full_source_scales()
 
         config = train_module.current_run_config(
             make_args(), WORKSPACE_CODES, source_manifest(), scales
         )
 
-        self.assertEqual(3, config["observation_schema_version"])
+        self.assertEqual(4, config["observation_schema_version"])
+        self.assertEqual(8, WORKSPACE_META_FEATURE_DIM)
+        self.assertEqual(6, FUTURE_DEMAND_FEATURE_DIM)
         self.assertEqual(64, config["grid_size"])
         self.assertEqual(16, config["ordered_future_count"])
         self.assertEqual(32, config["pending_queue_slots"])
@@ -362,14 +366,14 @@ class ParallelTrainingConfigTests(unittest.TestCase):
                 full_source_scales(),
             )
 
-    def test_rollout_estimate_counts_every_schema3_float(self):
+    def test_rollout_estimate_counts_every_schema4_float(self):
         floats_per_observation = (
             8
             + 10 * 4 * 64 * 64
-            + 10 * 4
+            + 10 * 8
             + 16 * 6
             + 16
-            + 3 * 4
+            + 3 * 6
             + 10 * 32 * 7
             + 10 * 32
             + 10 * 4
