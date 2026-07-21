@@ -21,6 +21,7 @@ from alloc_env.observation_state import ObservationScales
 from comparison.artifact_manifest import (
     CANONICAL_SELECTION_COUNT,
     FALLBACK_REASON_CODES,
+    canonical_json_sha256,
     read_json_object,
     read_runtime_metrics,
     sha256_file,
@@ -78,6 +79,7 @@ _COMMON_CACHE_KEYS = frozenset(
         "schema_version",
         "arm",
         "config_sha256",
+        "run_config_sha256",
         "scenario_sha256",
         "checkpoint",
         "rows",
@@ -87,6 +89,7 @@ _COMMON_MARKER_KEYS = frozenset(
     {
         "schema_version",
         "config_sha256",
+        "run_config_sha256",
         "scenario_sha256",
         "common_timestep",
         "checkpoints",
@@ -853,9 +856,9 @@ def validate_arm_evaluation_stage(
         "final": manifest_checkpoints.get("final"),
     } != {"selected": selected, "final": final}:
         raise ValueError("evaluation checkpoint manifest mismatch")
-    if manifest.get("config_sha256", config_sha) != config_sha:
+    if manifest.get("config_sha256") != config_sha:
         raise ValueError("evaluation config hash differs from root manifest")
-    if manifest.get("scenario_sha256", scenario_sha) != scenario_sha:
+    if manifest.get("scenario_sha256") != scenario_sha:
         raise ValueError("evaluation scenario hash differs from root manifest")
     selected_reference = CheckpointRef(
         base / selected["path"],
@@ -986,6 +989,7 @@ def _common_cache_payload(
     arm: str,
     *,
     config_sha256: str,
+    run_config_sha256: str,
     scenario_sha256: str,
     checkpoint: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
@@ -994,6 +998,7 @@ def _common_cache_payload(
         "schema_version": 1,
         "arm": arm,
         "config_sha256": config_sha256,
+        "run_config_sha256": run_config_sha256,
         "scenario_sha256": scenario_sha256,
         "checkpoint": dict(checkpoint),
         "rows": _normalized_common_rows(rows, arm, checkpoint),
@@ -1005,6 +1010,7 @@ def _read_common_cache(
     arm: str,
     *,
     config_sha256: str,
+    run_config_sha256: str,
     scenario_sha256: str,
     checkpoint: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1024,12 +1030,14 @@ def _read_common_cache(
         payload["schema_version"] != 1
         or payload["arm"] != arm
         or payload["config_sha256"] != config_sha256
+        or payload["run_config_sha256"] != run_config_sha256
         or payload["scenario_sha256"] != scenario_sha256
         or payload["checkpoint"] != dict(checkpoint)
         or not isinstance(payload["rows"], list)
     ):
         raise ValueError(f"{arm} common cache identity is invalid")
     _sha256_text(payload["config_sha256"], "common cache config hash")
+    _sha256_text(payload["run_config_sha256"], "common cache run config hash")
     _sha256_text(payload["scenario_sha256"], "common cache scenario hash")
     return payload, _normalized_common_rows(
         payload["rows"], arm, checkpoint
@@ -1078,6 +1086,7 @@ def validate_common_step_stage(
     root: str | Path,
     *,
     expected_config_sha256: str | None = None,
+    expected_run_config_sha256: Mapping[str, str] | None = None,
     expected_scenario_sha256: str | None = None,
     archive_timestep_reader: Callable[[Path], int | None] | None = None,
 ) -> dict[str, Any]:
@@ -1120,6 +1129,24 @@ def validate_common_step_stage(
         raise ValueError("common config hash mismatch")
     if expected_scenario_sha256 is not None and scenario_sha != expected_scenario_sha256:
         raise ValueError("common scenario hash mismatch")
+    run_config_sha256 = marker["run_config_sha256"]
+    if not isinstance(run_config_sha256, Mapping) or set(
+        run_config_sha256
+    ) != set(ARMS):
+        raise ValueError("common run config hash schema is invalid")
+    normalized_run_config_sha256 = {
+        arm: _sha256_text(
+            run_config_sha256[arm], f"{arm} common run config hash"
+        )
+        for arm in ARMS
+    }
+    if expected_run_config_sha256 is not None:
+        if not isinstance(expected_run_config_sha256, Mapping) or set(
+            expected_run_config_sha256
+        ) != set(ARMS):
+            raise ValueError("expected common run config hash schema is invalid")
+        if normalized_run_config_sha256 != dict(expected_run_config_sha256):
+            raise ValueError("common run config hash mismatch")
     common_timestep = _exact_nonnegative_int(
         marker["common_timestep"], "common timestep"
     )
@@ -1162,6 +1189,7 @@ def validate_common_step_stage(
             comparison_root,
             arm,
             config_sha256=config_sha,
+            run_config_sha256=normalized_run_config_sha256[arm],
             scenario_sha256=scenario_sha,
             checkpoint=normalized_checkpoints[arm],
         )
@@ -1297,9 +1325,9 @@ def evaluate_arm_artifacts(
         manifest = read_json_object(manifest_path)
     except (OSError, UnicodeDecodeError, ValueError) as error:
         raise PartialResultError("root manifest.json must already be valid") from error
-    if manifest.get("config_sha256", config_sha256) != config_sha256:
+    if manifest.get("config_sha256") != config_sha256:
         raise PartialResultError("root manifest config hash mismatch")
-    if manifest.get("scenario_sha256", scenario_sha256) != scenario_sha256:
+    if manifest.get("scenario_sha256") != scenario_sha256:
         raise PartialResultError("root manifest scenario hash mismatch")
 
     final = resolve_final_checkpoint(arm_root, model_loader=model_loader)
@@ -1410,6 +1438,9 @@ def evaluate_common_step_artifacts(
         raise ValueError("common evaluation requires exact arm configs")
     if any(not isinstance(arm_configs[arm], Mapping) for arm in ARMS):
         raise ValueError("common evaluation arm config must be a mapping")
+    run_config_sha256 = {
+        arm: canonical_json_sha256(arm_configs[arm]) for arm in ARMS
+    }
     try:
         split_holdout_records(scenarios)
     except (KeyError, TypeError, ValueError) as error:
@@ -1456,6 +1487,7 @@ def evaluate_common_step_artifacts(
         return validate_common_step_stage(
             base,
             expected_config_sha256=config_sha256,
+            expected_run_config_sha256=run_config_sha256,
             expected_scenario_sha256=scenario_sha256,
             archive_timestep_reader=archive_timestep_reader,
         )
@@ -1520,6 +1552,7 @@ def evaluate_common_step_artifacts(
                 comparison_root,
                 arm,
                 config_sha256=config_sha256,
+                run_config_sha256=run_config_sha256[arm],
                 scenario_sha256=scenario_sha256,
                 checkpoint=checkpoint_payloads[arm],
             )
@@ -1540,6 +1573,7 @@ def evaluate_common_step_artifacts(
             cache = _common_cache_payload(
                 arm,
                 config_sha256=config_sha256,
+                run_config_sha256=run_config_sha256[arm],
                 scenario_sha256=scenario_sha256,
                 checkpoint=checkpoint_payloads[arm],
                 rows=rows,
@@ -1551,6 +1585,7 @@ def evaluate_common_step_artifacts(
                 comparison_root,
                 arm,
                 config_sha256=config_sha256,
+                run_config_sha256=run_config_sha256[arm],
                 scenario_sha256=scenario_sha256,
                 checkpoint=checkpoint_payloads[arm],
             )
@@ -1591,6 +1626,7 @@ def evaluate_common_step_artifacts(
     marker = {
         "schema_version": 1,
         "config_sha256": config_sha256,
+        "run_config_sha256": run_config_sha256,
         "scenario_sha256": scenario_sha256,
         "common_timestep": common_step,
         "checkpoints": {
@@ -1611,6 +1647,7 @@ def evaluate_common_step_artifacts(
         validated_marker = validate_common_step_stage(
             base,
             expected_config_sha256=config_sha256,
+            expected_run_config_sha256=run_config_sha256,
             expected_scenario_sha256=scenario_sha256,
             archive_timestep_reader=archive_timestep_reader,
         )

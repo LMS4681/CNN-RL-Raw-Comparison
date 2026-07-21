@@ -163,10 +163,13 @@ def _common_artifact_fixture(tmp_path, evaluator):
         final.write_bytes(f"{arm}:final".encode())
         common.write_bytes(f"{arm}:common".encode())
         per_arm_csv = arm_root / "evaluation_scenarios.csv"
+        primary_csv = arm_root / "evaluation_primary_test.csv"
         per_arm_csv.write_bytes(f"{arm}:selected-csv".encode())
+        primary_csv.write_bytes(f"{arm}:primary-csv".encode())
         protected_bytes[best] = best.read_bytes()
         protected_bytes[final] = final.read_bytes()
         protected_bytes[per_arm_csv] = per_arm_csv.read_bytes()
+        protected_bytes[primary_csv] = primary_csv.read_bytes()
         checkpoint_refs[arm] = evaluator.CheckpointRef(
             common,
             "common_step",
@@ -197,6 +200,63 @@ def _common_artifact_fixture(tmp_path, evaluator):
     }
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return root, checkpoint_refs, protected_bytes, manifest
+
+
+def _arm_artifact_fixture(tmp_path, monkeypatch, evaluator):
+    root = tmp_path.resolve()
+    arm = "raw_direct"
+    arm_root = root / arm
+    arm_root.mkdir()
+    selected_path = arm_root / "best_model.sb3"
+    final_path = arm_root / "checkpoints" / "final.sb3"
+    selected_path.write_bytes(b"selected")
+    final_path.parent.mkdir()
+    final_path.write_bytes(b"final")
+    selected = evaluator.CheckpointRef(
+        selected_path, "best_model", 50_000, _sha256(selected_path)
+    )
+    final = evaluator.CheckpointRef(
+        final_path, "final", 60_000, _sha256(final_path)
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_archive_timestep",
+        lambda path, _loader: (
+            selected.timestep if Path(path) == selected_path else final.timestep
+        ),
+    )
+    manifest = {
+        "schema_version": 1,
+        "config_sha256": "c" * 64,
+        "scenario_sha256": "d" * 64,
+        "checkpoints": {},
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(
+        evaluator, "resolve_final_checkpoint", lambda *_args, **_kwargs: final
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "resolve_selection_decision",
+        lambda *_args, **_kwargs: evaluator.SelectionDecision(
+            selected, "best_model", None, 5, [1.0, 0.0, 0.0]
+        ),
+    )
+    _stub_training_evidence(monkeypatch, evaluator, arm_root, selected, final)
+    calls = []
+
+    def evaluate(*_args, **_kwargs):
+        calls.append(arm)
+        return _evaluation_rows(
+            arm,
+            checkpoint="best_model",
+            timestep=selected.timestep,
+            digest=selected.sha256,
+        )
+
+    monkeypatch.setattr(evaluator, "evaluate_checkpoint", evaluate)
+    scenarios = [{"seed": seed} for seed in range(1000, 1020)]
+    return root, arm, selected, final, scenarios, calls
 
 
 def test_selection_decision_records_verified_best_provenance(tmp_path):
@@ -657,6 +717,8 @@ def test_evaluate_arm_artifacts_publishes_csv_manifest_then_exact_marker(
         json.dumps(
             {
                 "schema_version": 1,
+                "config_sha256": "c" * 64,
+                "scenario_sha256": "d" * 64,
                 "sentinel": True,
                 "checkpoints": {"candidate_cnn": {"sentinel": True}},
             }
@@ -789,6 +851,131 @@ def test_evaluate_arm_artifacts_publishes_csv_manifest_then_exact_marker(
         evaluator.validate_arm_evaluation_stage(root, arm)
 
 
+def test_evaluate_arm_artifacts_publishes_real_fallback_final(
+    tmp_path, monkeypatch
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root = tmp_path.resolve()
+    arm = "raw_direct"
+    arm_root = root / arm
+    arm_root.mkdir()
+    final_path = _selection_fixture(arm_root)
+    final = evaluator.CheckpointRef(
+        final_path, "final", 60_000, _sha256(final_path)
+    )
+    selected = evaluator.CheckpointRef(
+        final_path, "fallback_final", 60_000, final.sha256
+    )
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config_sha256": "c" * 64,
+                "scenario_sha256": "d" * 64,
+                "checkpoints": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    _stub_training_evidence(
+        monkeypatch,
+        evaluator,
+        arm_root,
+        selected,
+        final,
+        selection_outcome="fallback_final",
+        fallback_reason="selection_not_run",
+    )
+    calls = []
+
+    def evaluate(path, _config, _scenarios, label, received_arm, _loader):
+        calls.append((Path(path), label, received_arm))
+        return _evaluation_rows(
+            arm,
+            checkpoint="fallback_final",
+            timestep=selected.timestep,
+            digest=selected.sha256,
+        )
+
+    monkeypatch.setattr(evaluator, "evaluate_checkpoint", evaluate)
+    marker = evaluator.evaluate_arm_artifacts(
+        root,
+        arm,
+        [{"seed": seed} for seed in range(1000, 1020)],
+        {"run": "config"},
+        config_sha256="c" * 64,
+        scenario_sha256="d" * 64,
+        model_loader=_text_loader,
+    )
+
+    assert calls == [(final_path, "fallback_final", arm)]
+    assert marker["selection_outcome"] == "fallback_final"
+    assert marker["fallback_reason"] == "selection_not_run"
+    assert marker["checkpoints"]["selected"] == {
+        "path": "raw_direct/checkpoints/final_60000.sb3",
+        "label": "fallback_final",
+        "sha256": final.sha256,
+        "timestep": 60_000,
+    }
+    assert marker["checkpoints"]["final"] == {
+        **marker["checkpoints"]["selected"],
+        "label": "final",
+    }
+
+
+@pytest.mark.parametrize("missing_key", ["config_sha256", "scenario_sha256"])
+def test_evaluate_arm_requires_exact_root_manifest_hashes(
+    tmp_path, monkeypatch, missing_key
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root, arm, _selected, _final, scenarios, calls = _arm_artifact_fixture(
+        tmp_path, monkeypatch, evaluator
+    )
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop(missing_key)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(evaluator.PartialResultError, match="root manifest"):
+        evaluator.evaluate_arm_artifacts(
+            root,
+            arm,
+            scenarios,
+            {"run": "config"},
+            config_sha256="c" * 64,
+            scenario_sha256="d" * 64,
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("missing_key", ["config_sha256", "scenario_sha256"])
+def test_arm_marker_validation_requires_exact_root_manifest_hashes(
+    tmp_path, monkeypatch, missing_key
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root, arm, _selected, _final, scenarios, _calls = _arm_artifact_fixture(
+        tmp_path, monkeypatch, evaluator
+    )
+    evaluator.evaluate_arm_artifacts(
+        root,
+        arm,
+        scenarios,
+        {"run": "config"},
+        config_sha256="c" * 64,
+        scenario_sha256="d" * 64,
+    )
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop(missing_key)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="root manifest"):
+        evaluator.validate_arm_evaluation_stage(root, arm)
+
+
 def test_evaluate_arm_artifacts_failure_invalidates_old_marker(tmp_path, monkeypatch):
     from comparison import checkpoint_evaluator as evaluator
 
@@ -796,7 +983,16 @@ def test_evaluate_arm_artifacts_failure_invalidates_old_marker(tmp_path, monkeyp
     arm_root.mkdir()
     marker = arm_root / "evaluation_stage.json"
     marker.write_text('{"stale":true}', encoding="utf-8")
-    (tmp_path / "manifest.json").write_text('{"schema_version":1}', encoding="utf-8")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config_sha256": "c" * 64,
+                "scenario_sha256": "d" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         evaluator,
         "resolve_final_checkpoint",
@@ -842,7 +1038,15 @@ def test_evaluate_arm_marker_is_not_trusted_after_csv_or_manifest_tamper(
         ),
     )
     (root / "manifest.json").write_text(
-        '{"schema_version":1,"checkpoints":{}}', encoding="utf-8"
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config_sha256": "c" * 64,
+                "scenario_sha256": "d" * 64,
+                "checkpoints": {},
+            }
+        ),
+        encoding="utf-8",
     )
     monkeypatch.setattr(evaluator, "resolve_final_checkpoint", lambda *_a, **_k: final)
     monkeypatch.setattr(
@@ -896,6 +1100,44 @@ def test_evaluate_arm_marker_is_not_trusted_after_csv_or_manifest_tamper(
         evaluator.validate_arm_evaluation_stage(root, "raw_direct")
 
 
+@pytest.mark.parametrize(
+    "artifact_name",
+    [
+        "evaluation_stage.json",
+        "evaluation_scenarios.csv",
+        "runtime_metrics.json",
+        "training_completion.json",
+    ],
+)
+def test_arm_validator_rejects_symlinked_stage_artifacts(
+    tmp_path, monkeypatch, artifact_name
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root, arm, _selected, _final, scenarios, _calls = _arm_artifact_fixture(
+        tmp_path, monkeypatch, evaluator
+    )
+    evaluator.evaluate_arm_artifacts(
+        root,
+        arm,
+        scenarios,
+        {"run": "config"},
+        config_sha256="c" * 64,
+        scenario_sha256="d" * 64,
+    )
+    artifact = root / arm / artifact_name
+    outside = root / f"outside-{artifact_name}"
+    outside.write_bytes(artifact.read_bytes())
+    artifact.unlink()
+    try:
+        os.symlink(outside, artifact)
+    except OSError as error:
+        pytest.skip(f"symlink creation was rejected by the OS: {error}")
+
+    with pytest.raises(ValueError):
+        evaluator.validate_arm_evaluation_stage(root, arm)
+
+
 def test_evaluate_arm_marker_write_failure_leaves_no_trusted_marker(
     tmp_path, monkeypatch
 ):
@@ -921,7 +1163,15 @@ def test_evaluate_arm_marker_write_failure_leaves_no_trusted_marker(
         ),
     )
     (root / "manifest.json").write_text(
-        '{"schema_version":1,"checkpoints":{}}', encoding="utf-8"
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config_sha256": "c" * 64,
+                "scenario_sha256": "d" * 64,
+                "checkpoints": {},
+            }
+        ),
+        encoding="utf-8",
     )
     (arm_root / "evaluation_stage.json").write_text("stale", encoding="utf-8")
     monkeypatch.setattr(evaluator, "resolve_final_checkpoint", lambda *_a, **_k: final)
@@ -963,6 +1213,56 @@ def test_evaluate_arm_marker_write_failure_leaves_no_trusted_marker(
     assert not (arm_root / "evaluation_stage.json").exists()
 
 
+def test_evaluate_arm_manifest_failure_leaves_no_marker_and_retry_is_coherent(
+    tmp_path, monkeypatch
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root, arm, selected, _final, scenarios, calls = _arm_artifact_fixture(
+        tmp_path, monkeypatch, evaluator
+    )
+    marker_path = root / arm / "evaluation_stage.json"
+    marker_path.write_text('{"stale":true}', encoding="utf-8")
+    original_atomic_write_json = evaluator.atomic_write_json
+    fail_manifest = {"value": True}
+
+    def fail_manifest_once(path, payload):
+        if Path(path).name == "manifest.json" and fail_manifest["value"]:
+            fail_manifest["value"] = False
+            assert (root / arm / "evaluation_scenarios.csv").is_file()
+            assert (root / arm / "evaluation_primary_test.csv").is_file()
+            raise OSError("manifest replace failed")
+        return original_atomic_write_json(path, payload)
+
+    monkeypatch.setattr(evaluator, "atomic_write_json", fail_manifest_once)
+    arguments = (root, arm, scenarios, {"run": "config"})
+    keywords = {
+        "config_sha256": "c" * 64,
+        "scenario_sha256": "d" * 64,
+    }
+    with pytest.raises(OSError, match="manifest replace failed"):
+        evaluator.evaluate_arm_artifacts(*arguments, **keywords)
+    assert not marker_path.exists()
+    assert calls == [arm]
+
+    marker = evaluator.evaluate_arm_artifacts(*arguments, **keywords)
+    assert calls == [arm, arm]
+    assert marker_path.is_file()
+    assert marker == evaluator.validate_arm_evaluation_stage(root, arm)
+    with (root / arm / "evaluation_scenarios.csv").open(
+        encoding="utf-8", newline=""
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    assert {
+        (
+            row["checkpoint"],
+            int(row["checkpoint_timestep"]),
+            row["checkpoint_sha256"],
+        )
+        for row in rows
+    } == {("best_model", selected.timestep, selected.sha256)}
+
+
 def test_evaluate_arm_rejects_rows_not_bound_to_resolved_selected_checkpoint(
     tmp_path, monkeypatch
 ):
@@ -988,7 +1288,15 @@ def test_evaluate_arm_rejects_rows_not_bound_to_resolved_selected_checkpoint(
         ),
     )
     (root / "manifest.json").write_text(
-        '{"schema_version":1,"checkpoints":{}}', encoding="utf-8"
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config_sha256": "c" * 64,
+                "scenario_sha256": "d" * 64,
+                "checkpoints": {},
+            }
+        ),
+        encoding="utf-8",
     )
     monkeypatch.setattr(evaluator, "resolve_final_checkpoint", lambda *_a, **_k: final)
     monkeypatch.setattr(
@@ -1047,7 +1355,15 @@ def test_second_atomic_csv_replace_failure_preserves_complete_files_without_mark
         ),
     )
     (root / "manifest.json").write_text(
-        '{"schema_version":1,"checkpoints":{}}', encoding="utf-8"
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config_sha256": "c" * 64,
+                "scenario_sha256": "d" * 64,
+                "checkpoints": {},
+            }
+        ),
+        encoding="utf-8",
     )
     old_rows = _evaluation_rows(
         "raw_direct",
@@ -1163,7 +1479,15 @@ def test_arm_marker_validator_checks_actual_checkpoint_timestep(
         ),
     )
     (root / "manifest.json").write_text(
-        '{"schema_version":1,"checkpoints":{}}', encoding="utf-8"
+        json.dumps(
+            {
+                "schema_version": 1,
+                "config_sha256": "c" * 64,
+                "scenario_sha256": "d" * 64,
+                "checkpoints": {},
+            }
+        ),
+        encoding="utf-8",
     )
     _stub_training_evidence(monkeypatch, evaluator, arm_root, selected, final)
     monkeypatch.setattr(evaluator, "resolve_final_checkpoint", lambda *_a, **_k: final)
@@ -1263,6 +1587,7 @@ def test_common_only_evaluation_publishes_caches_combined_refs_and_marker(
     assert set(marker) == {
         "schema_version",
         "config_sha256",
+        "run_config_sha256",
         "scenario_sha256",
         "common_timestep",
         "checkpoints",
@@ -1380,6 +1705,161 @@ def test_common_first_arm_cache_survives_crash_and_is_reused(
     calls.clear()
     evaluator.evaluate_common_step_artifacts(*arguments, **keywords)
     assert calls == ["candidate_cnn"]
+
+
+def test_common_manifest_failure_preserves_both_caches_for_retry(
+    tmp_path, monkeypatch
+):
+    from comparison import checkpoint_evaluator as evaluator
+
+    root, refs, _protected, original_manifest = _common_artifact_fixture(
+        tmp_path, evaluator
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "readable_checkpoint_inventory",
+        lambda directory, *_a, **_k: {10_000: refs[Path(directory).name].path},
+    )
+    monkeypatch.setattr(evaluator, "_archive_timestep", lambda *_a, **_k: 10_000)
+    calls = []
+
+    def evaluate(_path, _config, _scenarios, label, arm, _loader):
+        calls.append(arm)
+        return _evaluation_rows(
+            arm,
+            checkpoint=label,
+            timestep=10_000,
+            digest=refs[arm].sha256,
+        )
+
+    monkeypatch.setattr(evaluator, "evaluate_checkpoint", evaluate)
+    original_atomic_write_json = evaluator.atomic_write_json
+    fail_manifest = {"value": True}
+
+    def fail_manifest_once(path, payload):
+        if Path(path).name == "manifest.json" and fail_manifest["value"]:
+            fail_manifest["value"] = False
+            for arm in evaluator.ARMS:
+                assert (
+                    root / "comparison" / f"common_step_{arm}.cache.json"
+                ).is_file()
+            raise OSError("common manifest replace failed")
+        return original_atomic_write_json(path, payload)
+
+    monkeypatch.setattr(evaluator, "atomic_write_json", fail_manifest_once)
+    arguments = (
+        root,
+        [{"seed": seed} for seed in range(1000, 1020)],
+        {arm: {} for arm in evaluator.ARMS},
+    )
+    keywords = {
+        "config_sha256": "c" * 64,
+        "scenario_sha256": "d" * 64,
+        "model_loader": "loader",
+    }
+    with pytest.raises(
+        evaluator.PartialResultError, match="manifest publication failed"
+    ):
+        evaluator.evaluate_common_step_artifacts(*arguments, **keywords)
+
+    comparison = root / "comparison"
+    marker_path = comparison / "common_step_stage.json"
+    assert not marker_path.exists()
+    cache_bytes = {
+        arm: (comparison / f"common_step_{arm}.cache.json").read_bytes()
+        for arm in evaluator.ARMS
+    }
+    assert calls == list(evaluator.ARMS)
+    assert json.loads((root / "manifest.json").read_text(encoding="utf-8")) == (
+        original_manifest
+    )
+
+    marker = evaluator.evaluate_common_step_artifacts(*arguments, **keywords)
+    assert calls == list(evaluator.ARMS)
+    assert {
+        arm: (comparison / f"common_step_{arm}.cache.json").read_bytes()
+        for arm in evaluator.ARMS
+    } == cache_bytes
+    assert marker_path.is_file()
+    assert marker == evaluator.validate_common_step_stage(
+        root, archive_timestep_reader=lambda _path: 10_000
+    )
+
+
+def test_common_cache_and_marker_are_bound_to_each_arm_run_config(
+    tmp_path, monkeypatch
+):
+    from comparison import checkpoint_evaluator as evaluator
+    from comparison.artifact_manifest import canonical_json_sha256
+
+    root, refs, _protected, _manifest = _common_artifact_fixture(tmp_path, evaluator)
+    monkeypatch.setattr(
+        evaluator,
+        "readable_checkpoint_inventory",
+        lambda directory, *_a, **_k: {10_000: refs[Path(directory).name].path},
+    )
+    monkeypatch.setattr(evaluator, "_archive_timestep", lambda *_a, **_k: 10_000)
+    calls = []
+
+    def evaluate(_path, config, _scenarios, label, arm, _loader):
+        calls.append((arm, dict(config)))
+        return _evaluation_rows(
+            arm,
+            checkpoint=label,
+            timestep=10_000,
+            digest=refs[arm].sha256,
+        )
+
+    monkeypatch.setattr(evaluator, "evaluate_checkpoint", evaluate)
+    scenarios = [{"seed": seed} for seed in range(1000, 1020)]
+    configs = {
+        "raw_direct": {"extractor": "raw", "scale": 1},
+        "candidate_cnn": {"extractor": "cnn", "scale": 2},
+    }
+    keywords = {
+        "config_sha256": "c" * 64,
+        "scenario_sha256": "d" * 64,
+        "model_loader": "loader",
+    }
+
+    marker = evaluator.evaluate_common_step_artifacts(
+        root, scenarios, configs, **keywords
+    )
+    expected_hashes = {
+        arm: canonical_json_sha256(config) for arm, config in configs.items()
+    }
+    assert marker["run_config_sha256"] == expected_hashes
+    for arm in evaluator.ARMS:
+        cache = json.loads(
+            (
+                root
+                / "comparison"
+                / f"common_step_{arm}.cache.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert cache["run_config_sha256"] == expected_hashes[arm]
+
+    changed_configs = {
+        **configs,
+        "raw_direct": {"extractor": "raw", "scale": 3},
+    }
+    changed_hashes = {
+        arm: canonical_json_sha256(config)
+        for arm, config in changed_configs.items()
+    }
+    with pytest.raises(ValueError, match="run config hash mismatch"):
+        evaluator.validate_common_step_stage(
+            root,
+            expected_run_config_sha256=changed_hashes,
+            archive_timestep_reader=lambda _path: 10_000,
+        )
+
+    calls.clear()
+    marker = evaluator.evaluate_common_step_artifacts(
+        root, scenarios, changed_configs, **keywords
+    )
+    assert calls == [("raw_direct", changed_configs["raw_direct"])]
+    assert marker["run_config_sha256"] == changed_hashes
 
 
 def test_manifest_update_uses_atomic_publication(tmp_path, monkeypatch):
