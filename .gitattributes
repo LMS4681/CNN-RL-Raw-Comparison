@@ -1,3 +1,6 @@
 AllocRL/requirements-comparison.txt text eol=lf
 AllocRL/data/fixed_eval_scenarios.json text eol=lf
 AllocRL/data/data_split_manifest.json text eol=lf
+AllocRL/configs/candidate_pretrain_seed0.json text eol=lf
+AllocRL/configs/improved_cnn_6h_seed0.json text eol=lf
+notebooks/improved_cnn_6h.ipynb text eol=lf

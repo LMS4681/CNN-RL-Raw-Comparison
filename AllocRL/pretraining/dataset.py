@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 from collections import Counter
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
@@ -155,6 +156,16 @@ def _atomic_json(path: Path, values: Mapping[str, object]) -> None:
     os.replace(temporary, path)
 
 
+def _atomic_copy_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    with source.open("rb") as input_file, temporary.open("wb") as output_file:
+        shutil.copyfileobj(input_file, output_file)
+        output_file.flush()
+        os.fsync(output_file.fileno())
+    os.replace(temporary, destination)
+
+
 def _resolve_input_path(value: str) -> Path:
     path = Path(value)
     if path.is_absolute():
@@ -297,13 +308,18 @@ def _collect_split(
     seeds: tuple[int, ...],
     config: PretrainingDataConfig,
     create_environment: Callable[[int], object],
+    existing_shards: list[dict[str, object]] | None = None,
+    on_shard_complete: Callable[
+        [str, list[dict[str, object]]], None
+    ] | None = None,
 ) -> dict[str, object]:
-    shards: list[dict[str, object]] = []
+    shards = [dict(entry) for entry in (existing_shards or [])]
     episodes: list[dict[str, object]] = []
     observations: list[dict[str, np.ndarray]] = []
     targets: list[AuxiliaryTargets] = []
     state_index = 0
-    shard_start = 0
+    completed_states = sum(int(entry["state_count"]) for entry in shards)
+    shard_start = completed_states
 
     def flush() -> None:
         nonlocal shard_start
@@ -322,6 +338,8 @@ def _collect_split(
         shard_start += len(observations)
         observations.clear()
         targets.clear()
+        if on_shard_complete is not None:
+            on_shard_complete(split_name, shards)
 
     for episode_index, (seed, quota) in enumerate(
         zip(seeds, _episode_quotas(state_count, seeds))
@@ -341,16 +359,20 @@ def _collect_split(
                 raise RuntimeError(
                     f"episode seed {seed} ended before its state quota"
                 )
+            current_observation = env._get_obs()
             observation = {
                 key: value.copy()
-                for key, value in env._get_obs().items()
+                for key, value in current_observation.items()
             }
-            include_replay = state_index % config.replay_every_n_states == 0
-            target = build_auxiliary_targets(
-                env, include_replay=include_replay
-            )
-            observations.append(observation)
-            targets.append(target)
+            if state_index >= completed_states:
+                include_replay = (
+                    state_index % config.replay_every_n_states == 0
+                )
+                target = build_auxiliary_targets(
+                    env, include_replay=include_replay
+                )
+                observations.append(observation)
+                targets.append(target)
             collected += 1
             state_index += 1
             action = policy.select_action(env, observation)
@@ -432,42 +454,157 @@ def _verify_existing_dataset(
     return True
 
 
+def _verified_progress_shards(
+    root: Path,
+    progress: Mapping[str, object],
+    config_sha256: str,
+    split_name: str,
+    state_count: int,
+    states_per_shard: int,
+) -> list[dict[str, object]]:
+    if progress.get("dataset_schema_version") != DATASET_SCHEMA_VERSION:
+        raise ValueError("unsupported dataset progress schema version")
+    if progress.get("config_sha256") != config_sha256:
+        raise ValueError("dataset progress configuration mismatch")
+    splits = progress.get("splits")
+    if not isinstance(splits, Mapping):
+        raise ValueError("dataset progress is missing splits")
+    entries = splits.get(split_name, [])
+    if not isinstance(entries, list):
+        raise ValueError("dataset progress split must be a list")
+    verified: list[dict[str, object]] = []
+    expected_start = 0
+    minimal_manifest = {"dataset_schema_version": DATASET_SCHEMA_VERSION}
+    for index, raw_entry in enumerate(entries):
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError("dataset progress shard must be an object")
+        entry = dict(raw_entry)
+        count = int(entry.get("state_count", 0))
+        if count < 1 or count > states_per_shard:
+            raise ValueError("dataset progress shard state_count is invalid")
+        if int(entry.get("start_index", -1)) != expected_start:
+            raise ValueError("dataset progress shard indices are not contiguous")
+        expected_path = f"{split_name}/shard-{index:05d}.npz"
+        if entry.get("path") != expected_path:
+            raise ValueError("dataset progress shard path is not canonical")
+        load_pretraining_shard(root, minimal_manifest, entry)
+        verified.append(entry)
+        expected_start += count
+    if expected_start > state_count:
+        raise ValueError("dataset progress exceeds configured state count")
+    if (
+        expected_start < state_count
+        and verified
+        and int(verified[-1]["state_count"]) != states_per_shard
+    ):
+        raise ValueError("only a final dataset shard may be partial")
+    return verified
+
+
 def collect_pretraining_dataset(
     config: PretrainingDataConfig,
     output_dir: Path,
+    *,
+    progress_mirror_dir: Path | None = None,
 ) -> Path:
     config = _resolved_config(config)
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     manifest_path = root / "dataset_manifest.json"
+    progress_path = root / "dataset_progress.json"
+    mirror_root = (
+        None
+        if progress_mirror_dir is None
+        else Path(progress_mirror_dir).resolve()
+    )
+    if mirror_root == root:
+        raise ValueError("dataset progress mirror must differ from output_dir")
+    if mirror_root is not None:
+        mirror_root.mkdir(parents=True, exist_ok=True)
     config_sha256 = _config_sha256(config)
     if manifest_path.is_file():
         existing = read_dataset_manifest(manifest_path)
         if _verify_existing_dataset(root, existing, config_sha256):
+            if mirror_root is not None:
+                for split in existing["splits"].values():
+                    for entry in split["shards"]:
+                        relative = Path(str(entry["path"]))
+                        _atomic_copy_file(
+                            root / relative, mirror_root / relative
+                        )
+                _atomic_copy_file(
+                    manifest_path, mirror_root / manifest_path.name
+                )
+                (mirror_root / progress_path.name).unlink(missing_ok=True)
             return manifest_path
         raise ValueError("existing dataset manifest does not match configuration")
+
+    progress: dict[str, object] = {
+        "dataset_schema_version": DATASET_SCHEMA_VERSION,
+        "config_sha256": config_sha256,
+        "splits": {"train": [], "validation": []},
+    }
+    if progress_path.is_file():
+        loaded_progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded_progress, dict):
+            raise ValueError("dataset progress must contain a JSON object")
+        progress = loaded_progress
+
+    existing = {
+        split_name: _verified_progress_shards(
+            root,
+            progress,
+            config_sha256,
+            split_name,
+            state_count,
+            config.states_per_shard,
+        )
+        for split_name, state_count in (
+            ("train", config.train_state_count),
+            ("validation", config.validation_state_count),
+        )
+    }
+
+    def record_progress(
+        split_name: str, shards: list[dict[str, object]]
+    ) -> None:
+        progress_splits = progress["splits"]
+        if not isinstance(progress_splits, dict):
+            raise ValueError("dataset progress splits must be mutable")
+        progress_splits[split_name] = [dict(entry) for entry in shards]
+        _atomic_json(progress_path, progress)
+        if mirror_root is not None:
+            latest = shards[-1]
+            relative = Path(str(latest["path"]))
+            _atomic_copy_file(root / relative, mirror_root / relative)
+            _atomic_copy_file(
+                progress_path, mirror_root / progress_path.name
+            )
 
     create_environment = _environment_factory(config)
     train_seeds = _seed_values(config.train_episode_seeds)
     validation_seeds = _seed_values(config.validation_episode_seeds)
-    splits = {
-        "train": _collect_split(
-            root,
-            "train",
-            config.train_state_count,
-            train_seeds,
-            config,
-            create_environment,
-        ),
-        "validation": _collect_split(
-            root,
-            "validation",
-            config.validation_state_count,
-            validation_seeds,
-            config,
-            create_environment,
-        ),
-    }
+    splits = {}
+    splits["train"] = _collect_split(
+        root,
+        "train",
+        config.train_state_count,
+        train_seeds,
+        config,
+        create_environment,
+        existing["train"],
+        record_progress,
+    )
+    splits["validation"] = _collect_split(
+        root,
+        "validation",
+        config.validation_state_count,
+        validation_seeds,
+        config,
+        create_environment,
+        existing["validation"],
+        record_progress,
+    )
     manifest = {
         "dataset_schema_version": DATASET_SCHEMA_VERSION,
         "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
@@ -482,6 +619,10 @@ def collect_pretraining_dataset(
         "splits": splits,
     }
     _atomic_json(manifest_path, manifest)
+    if mirror_root is not None:
+        _atomic_copy_file(manifest_path, mirror_root / manifest_path.name)
+        (mirror_root / progress_path.name).unlink(missing_ok=True)
+    progress_path.unlink(missing_ok=True)
     return manifest_path
 
 
@@ -491,10 +632,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--progress-mirror-dir", type=Path, default=None)
     args = parser.parse_args(argv)
     values = json.loads(args.config.read_text(encoding="utf-8"))
     path = collect_pretraining_dataset(
-        PretrainingDataConfig.from_mapping(values), args.output_dir
+        PretrainingDataConfig.from_mapping(values),
+        args.output_dir,
+        progress_mirror_dir=args.progress_mirror_dir,
     )
     print(path)
     return 0

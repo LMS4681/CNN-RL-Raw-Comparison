@@ -21,3 +21,20 @@ python -m pytest -q
 The durable artifact root contains `manifest.json`, `environment.json`,
 `stage_journal.json`, per-arm checkpoints and logs, `comparison/`, and either
 `COMPLETE.json` or `comparison/PARTIAL_REPORT.md`.
+
+## Scale-aware CNN two-stage run
+
+[![Open improved CNN in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/scale-aware-cnn-6h-v1/notebooks/improved_cnn_6h.ipynb)
+
+For the new candidate model, select `Runtime -> Change runtime type -> GPU ->
+GPU type: L4` and run `notebooks/improved_cnn_6h.ipynb`. The notebook first
+builds and verifies simulator-supervised Stage 1 features, then runs exactly
+six PPO hours with eight subprocess environments. Stage 1 time is outside the
+six-hour PPO budget. Rerunning all restores verified dataset shards,
+`pretraining_last.pt`, and the exact checkpoint named by PPO `run_state.json`.
+
+The durable root is
+`/content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0`; Stage 1 uses
+its `pretraining/` child and PPO uses its separate `ppo/` child. The pinned
+`scale-aware-cnn-6h-v1` URL becomes runnable only after that immutable tag is
+published.

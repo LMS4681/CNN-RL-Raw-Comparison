@@ -739,13 +739,29 @@ def test_wall_clock_resume_rejects_stored_timestep_mismatch(tmp_path):
         )
 
 
-def test_wall_clock_mode_rejects_broad_auto_resume(tmp_path):
-    with pytest.raises(ValueError, match="auto-resume.*wall-clock"):
-        train_module.resolve_resume_path(
-            wall_clock_args(None, auto_resume=True),
-            tmp_path,
-            complete_config(),
-        )
+def test_wall_clock_auto_resume_uses_only_state_named_checkpoint(tmp_path):
+    output_dir = tmp_path / "output"
+    checkpoint = save_real_model(
+        output_dir / "checkpoints" / "model_100_g1.sb3", 100
+    )
+    write_wall_clock_state(output_dir, checkpoint, timestep=100)
+    train_module.write_run_config(output_dir, complete_config())
+
+    resolved = train_module.resolve_resume_path(
+        wall_clock_args(None, auto_resume=True),
+        output_dir,
+        complete_config(),
+    )
+
+    assert resolved == checkpoint.resolve()
+
+
+def test_wall_clock_auto_resume_without_state_starts_new_run(tmp_path):
+    assert train_module.resolve_resume_path(
+        wall_clock_args(None, auto_resume=True),
+        tmp_path,
+        complete_config(),
+    ) is None
 
 
 def test_wall_clock_state_requires_explicit_exact_resume_archive(tmp_path):

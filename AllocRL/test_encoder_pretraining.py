@@ -296,3 +296,166 @@ def test_tiny_training_publishes_finite_smoke_artifacts(
     assert receipt["smoke_mode"] is True
     assert np.isfinite(metrics["validation_total_loss"])
     assert (output / "candidate_encoder_pretrained.pt").is_file()
+
+
+def test_interrupted_training_resumes_from_pretraining_last(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    import pretraining.train_encoder as trainer
+
+    monkeypatch.setattr(
+        dataset_module,
+        "_environment_factory",
+        lambda _config: tiny_environment,
+    )
+    dataset_root = tmp_path / "dataset"
+    data_config = tiny_config(grid_size=16)
+    collect_pretraining_dataset(data_config, dataset_root)
+    values = {
+        **data_config.__dict__,
+        "schema_version": 1,
+        "seed": 0,
+        "optimizer": "AdamW",
+        "learning_rate": 0.0001,
+        "batch_size": 2,
+        "max_epochs": 3,
+        "early_stopping_patience": 3,
+        "minimum_relative_baseline_improvement": 0.05,
+        "minimum_shuffled_grid_degradation": 0.05,
+    }
+    for key, value in tuple(values.items()):
+        if isinstance(value, tuple):
+            values[key] = list(value)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    output = tmp_path / "output"
+
+    original_save = trainer._atomic_torch_save
+    interrupted = False
+
+    def interrupt_after_last_saved(payload, path):
+        nonlocal interrupted
+        original_save(payload, path)
+        if Path(path).name == "pretraining_last.pt" and not interrupted:
+            interrupted = True
+            raise RuntimeError("injected epoch interruption")
+
+    step_count = 0
+    original_step = torch.optim.AdamW.step
+
+    def count_step(optimizer, *args, **kwargs):
+        nonlocal step_count
+        step_count += 1
+        return original_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(trainer, "_atomic_torch_save", interrupt_after_last_saved)
+    monkeypatch.setattr(torch.optim.AdamW, "step", count_step)
+    with pytest.raises(RuntimeError, match="epoch interruption"):
+        train_candidate_encoder(
+            config_path,
+            dataset_root,
+            output,
+            smoke_state_count=4,
+            max_epochs=2,
+            device="cpu",
+        )
+
+    last = output / "pretraining_last.pt"
+    assert last.is_file()
+    monkeypatch.setattr(trainer, "_atomic_torch_save", original_save)
+    marker = train_candidate_encoder(
+        config_path,
+        dataset_root,
+        output,
+        smoke_state_count=4,
+        max_epochs=2,
+        device="cpu",
+    )
+
+    metrics = json.loads(
+        (output / "pretraining_metrics.json").read_text(encoding="utf-8")
+    )
+    assert marker.is_file()
+    assert metrics["epochs_completed"] == 2
+    assert step_count == 4
+
+
+def test_resume_at_early_stopping_limit_does_not_run_another_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    import pretraining.train_encoder as trainer
+
+    monkeypatch.setattr(
+        dataset_module,
+        "_environment_factory",
+        lambda _config: tiny_environment,
+    )
+    dataset_root = tmp_path / "dataset"
+    data_config = tiny_config(grid_size=16)
+    collect_pretraining_dataset(data_config, dataset_root)
+    values = {
+        **data_config.__dict__,
+        "schema_version": 1,
+        "seed": 0,
+        "optimizer": "AdamW",
+        "learning_rate": 0.0001,
+        "batch_size": 2,
+        "max_epochs": 3,
+        "early_stopping_patience": 1,
+        "minimum_relative_baseline_improvement": 0.05,
+        "minimum_shuffled_grid_degradation": 0.05,
+    }
+    for key, value in tuple(values.items()):
+        if isinstance(value, tuple):
+            values[key] = list(value)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(values), encoding="utf-8")
+    output = tmp_path / "output"
+
+    constant_metrics = {
+        "total_loss": 1.0,
+        "future_fit_bce": 1.0,
+        "no_grid_future_fit_bce": 1.0,
+        "optionality_mae": 1.0,
+        "mean_baseline_optionality_mae": 1.0,
+        "shuffled_grid_total_loss": 1.0,
+        "counterfactual_geometry_delta": 0.0,
+    }
+    monkeypatch.setattr(
+        trainer, "_evaluate", lambda *_args, **_kwargs: constant_metrics.copy()
+    )
+    step_count = 0
+    original_step = torch.optim.AdamW.step
+
+    def count_step(optimizer, *args, **kwargs):
+        nonlocal step_count
+        step_count += 1
+        return original_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", count_step)
+    train_candidate_encoder(
+        config_path,
+        dataset_root,
+        output,
+        smoke_state_count=4,
+        max_epochs=3,
+        device="cpu",
+    )
+    steps_at_stop = step_count
+
+    train_candidate_encoder(
+        config_path,
+        dataset_root,
+        output,
+        smoke_state_count=4,
+        max_epochs=3,
+        device="cpu",
+    )
+
+    metrics = json.loads(
+        (output / "pretraining_metrics.json").read_text(encoding="utf-8")
+    )
+    assert metrics["epochs_completed"] == 2
+    assert step_count == steps_at_stop

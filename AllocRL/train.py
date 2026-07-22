@@ -1215,10 +1215,11 @@ def _resolve_wall_clock_resume_path(
             "wall-clock training requires --comparison-config-sha256 as "
             "64-character lowercase hexadecimal"
         )
-    if getattr(args, "auto_resume", False):
+    auto_resume = bool(getattr(args, "auto_resume", False))
+    if auto_resume and getattr(args, "resume_from", None):
         raise ValueError(
-            "--auto-resume is not allowed in wall-clock mode; pass the exact "
-            "state-named archive with --resume-from"
+            "wall-clock mode accepts either --auto-resume or --resume-from, "
+            "not both"
         )
 
     output_dir = Path(output_dir).resolve()
@@ -1248,12 +1249,15 @@ def _resolve_wall_clock_resume_path(
         )
     expected = resolve_state_checkpoint(output_dir, state)
     requested = getattr(args, "resume_from", None)
-    if not requested:
+    if auto_resume:
+        candidate = resolve_model_archive_path(expected)
+    elif not requested:
         raise ValueError(
             "existing wall-clock state requires --resume-from with the exact "
             "state-named checkpoint"
         )
-    candidate = resolve_model_archive_path(requested)
+    else:
+        candidate = resolve_model_archive_path(requested)
     if candidate.resolve() != expected.resolve():
         raise ValueError(
             "--resume-from must be the exact checkpoint named by run_state.json: "

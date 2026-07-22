@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -159,3 +160,114 @@ def test_loader_rejects_modified_shard_before_numpy_load(
     with pytest.raises(ValueError, match="SHA256"):
         load_pretraining_shard(tmp_path, manifest, entry)
     assert not load_called
+
+
+def test_interrupted_collection_resumes_after_verified_shards(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(
+        dataset_module,
+        "_environment_factory",
+        lambda _config: tiny_environment,
+    )
+    config = tiny_config(
+        train_state_count=4,
+        validation_state_count=2,
+        train_episode_seeds=(10, 10),
+        validation_episode_seeds=(20, 20),
+        states_per_shard=2,
+    )
+    original_write = dataset_module._write_shard
+    write_count = 0
+
+    def interrupt_second_shard(*args, **kwargs):
+        nonlocal write_count
+        write_count += 1
+        if write_count == 2:
+            raise RuntimeError("injected shard interruption")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dataset_module, "_write_shard", interrupt_second_shard
+    )
+    with pytest.raises(RuntimeError, match="shard interruption"):
+        collect_pretraining_dataset(config, tmp_path)
+
+    progress = tmp_path / "dataset_progress.json"
+    assert progress.is_file()
+    first_shard = tmp_path / "train" / "shard-00000.npz"
+    first_bytes = first_shard.read_bytes()
+
+    target_calls = 0
+    original_targets = dataset_module.build_auxiliary_targets
+
+    def count_targets(*args, **kwargs):
+        nonlocal target_calls
+        target_calls += 1
+        return original_targets(*args, **kwargs)
+
+    monkeypatch.setattr(dataset_module, "_write_shard", original_write)
+    monkeypatch.setattr(
+        dataset_module, "build_auxiliary_targets", count_targets
+    )
+    manifest = collect_pretraining_dataset(config, tmp_path)
+
+    assert manifest.is_file()
+    assert target_calls == 4
+    assert first_shard.read_bytes() == first_bytes
+    assert not progress.exists()
+
+
+def test_progress_mirror_survives_loss_of_local_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(
+        dataset_module,
+        "_environment_factory",
+        lambda _config: tiny_environment,
+    )
+    config = tiny_config(
+        train_state_count=4,
+        validation_state_count=2,
+        train_episode_seeds=(10, 10),
+        validation_episode_seeds=(20, 20),
+        states_per_shard=2,
+    )
+    local = tmp_path / "local"
+    mirror = tmp_path / "drive"
+    original_write = dataset_module._write_shard
+    write_count = 0
+
+    def interrupt_second_shard(*args, **kwargs):
+        nonlocal write_count
+        write_count += 1
+        if write_count == 2:
+            raise RuntimeError("injected shard interruption")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dataset_module, "_write_shard", interrupt_second_shard
+    )
+    with pytest.raises(RuntimeError, match="shard interruption"):
+        collect_pretraining_dataset(
+            config, local, progress_mirror_dir=mirror
+        )
+
+    assert (mirror / "dataset_progress.json").is_file()
+    mirrored_shard = mirror / "train" / "shard-00000.npz"
+    assert mirrored_shard.read_bytes() == (
+        local / "train" / "shard-00000.npz"
+    ).read_bytes()
+
+    resumed = tmp_path / "resumed"
+    shutil.copytree(mirror, resumed)
+    monkeypatch.setattr(dataset_module, "_write_shard", original_write)
+    manifest_path = collect_pretraining_dataset(
+        config, resumed, progress_mirror_dir=mirror
+    )
+
+    assert manifest_path.is_file()
+    assert (mirror / "dataset_manifest.json").is_file()
+    assert not (mirror / "dataset_progress.json").exists()

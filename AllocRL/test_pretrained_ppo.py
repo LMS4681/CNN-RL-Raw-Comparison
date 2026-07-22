@@ -376,3 +376,31 @@ def test_freeze_boundary_uses_absolute_timesteps_across_resume(tmp_path):
     assert groups["extractor"]["lr"] == pytest.approx(
         groups["policy"]["lr"] * 0.1
     )
+
+
+def test_real_32_step_two_stage_smoke_publishes_verified_result(tmp_path):
+    from pretraining.two_stage_smoke import run_two_stage_smoke
+
+    source = CandidateCnnExtractor(
+        observation_space(grid_size=64), features_dim=256
+    )
+    checkpoint, marker = write_artifacts(tmp_path, source.state_dict())
+    output = tmp_path / "smoke"
+
+    result_path = run_two_stage_smoke(
+        checkpoint,
+        marker,
+        output,
+        timesteps=32,
+        device="cpu",
+    )
+
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["schema_version"] == 1
+    assert result["total_timesteps"] == 32
+    assert result["extractor_unchanged_while_frozen"] is True
+    assert result["extractor_changed_after_unfreeze"] is True
+    assert result["nonzero_extractor_gradient"] is True
+    assert result["extractor_lr_ratio"] == pytest.approx(0.1)
+    assert (output / "before_boundary.sb3").is_file()
+    assert (output / "after_boundary.sb3").is_file()

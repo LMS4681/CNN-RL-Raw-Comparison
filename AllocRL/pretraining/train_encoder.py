@@ -27,6 +27,7 @@ from pretraining.model import CandidatePretrainingModel
 
 CHECKPOINT_SCHEMA_VERSION = 1
 COMPLETION_SCHEMA_VERSION = 1
+RESUME_SCHEMA_VERSION = 1
 
 
 class PretrainingGateError(RuntimeError):
@@ -98,6 +99,98 @@ def _atomic_torch_save(values: object, path: Path) -> None:
         destination.flush()
         os.fsync(destination.fileno())
     os.replace(temporary, path)
+
+
+def _load_resume_state(
+    path: Path,
+    *,
+    config_sha256: str,
+    dataset_manifest_sha256: str,
+    smoke_state_count: int | None,
+) -> Mapping[str, object]:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as error:
+        raise ValueError("invalid pretraining_last.pt") from error
+    expected_keys = {
+        "resume_schema_version",
+        "observation_schema_version",
+        "config_sha256",
+        "dataset_manifest_sha256",
+        "smoke_state_count",
+        "next_epoch",
+        "model_state_dict",
+        "optimizer_state_dict",
+        "best_loss",
+        "best_epoch",
+        "best_state",
+        "patience",
+        "history",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected_keys:
+        raise ValueError("pretraining resume payload keys differ")
+    if payload["resume_schema_version"] != RESUME_SCHEMA_VERSION:
+        raise ValueError("pretraining resume schema differs")
+    if payload["observation_schema_version"] != 4:
+        raise ValueError("pretraining resume observation schema differs")
+    if payload["config_sha256"] != config_sha256:
+        raise ValueError("pretraining resume config SHA256 differs")
+    if payload["dataset_manifest_sha256"] != dataset_manifest_sha256:
+        raise ValueError("pretraining resume dataset SHA256 differs")
+    if payload["smoke_state_count"] != smoke_state_count:
+        raise ValueError("pretraining resume smoke subset differs")
+    next_epoch = payload["next_epoch"]
+    history = payload["history"]
+    if (
+        isinstance(next_epoch, bool)
+        or not isinstance(next_epoch, int)
+        or next_epoch < 1
+        or not isinstance(history, list)
+        or len(history) != next_epoch
+    ):
+        raise ValueError("pretraining resume epoch history is invalid")
+    return payload
+
+
+def _save_resume_state(
+    path: Path,
+    *,
+    model: CandidatePretrainingModel,
+    optimizer: torch.optim.Optimizer,
+    config_sha256: str,
+    dataset_manifest_sha256: str,
+    smoke_state_count: int | None,
+    next_epoch: int,
+    best_loss: float,
+    best_epoch: int,
+    best_state: Mapping[str, torch.Tensor],
+    patience: int,
+    history: list[dict[str, float | int]],
+) -> None:
+    _atomic_torch_save(
+        {
+            "resume_schema_version": RESUME_SCHEMA_VERSION,
+            "observation_schema_version": 4,
+            "config_sha256": config_sha256,
+            "dataset_manifest_sha256": dataset_manifest_sha256,
+            "smoke_state_count": smoke_state_count,
+            "next_epoch": next_epoch,
+            "model_state_dict": {
+                key: value.detach().cpu()
+                for key, value in model.state_dict().items()
+            },
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_loss": float(best_loss),
+            "best_epoch": int(best_epoch),
+            "best_state": {
+                key: value.detach().cpu()
+                for key, value in best_state.items()
+            },
+            "patience": int(patience),
+            "history": list(history),
+        },
+        path,
+    )
 
 
 class PretrainingShardDataset(Dataset):
@@ -488,14 +581,6 @@ def train_candidate_encoder(
         raise ValueError("pretraining datasets must be non-empty")
 
     _seed_everything(config.seed)
-    generator = torch.Generator().manual_seed(config.seed)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=0,
-        generator=generator,
-    )
     deterministic_train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -527,7 +612,40 @@ def train_candidate_encoder(
     best_state: dict[str, torch.Tensor] | None = None
     patience = 0
     history = []
-    for epoch in range(epochs):
+    start_epoch = 0
+    resume_path = output_dir / "pretraining_last.pt"
+    if resume_path.is_file():
+        resume = _load_resume_state(
+            resume_path,
+            config_sha256=config_sha256,
+            dataset_manifest_sha256=dataset_manifest_sha256,
+            smoke_state_count=smoke_state_count,
+        )
+        model.load_state_dict(resume["model_state_dict"], strict=True)
+        optimizer.load_state_dict(resume["optimizer_state_dict"])
+        best_loss = float(resume["best_loss"])
+        best_epoch = int(resume["best_epoch"])
+        best_state = {
+            key: value.clone()
+            for key, value in resume["best_state"].items()
+        }
+        patience = int(resume["patience"])
+        history = list(resume["history"])
+        start_epoch = int(resume["next_epoch"])
+
+    epoch_range = (
+        range(0)
+        if patience >= config.early_stopping_patience
+        else range(start_epoch, epochs)
+    )
+    for epoch in epoch_range:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=0,
+            generator=torch.Generator().manual_seed(config.seed + epoch),
+        )
         model.train()
         train_loss = 0.0
         train_count = 0
@@ -565,8 +683,23 @@ def train_candidate_encoder(
             patience = 0
         else:
             patience += 1
-            if patience >= config.early_stopping_patience:
-                break
+        assert best_state is not None
+        _save_resume_state(
+            resume_path,
+            model=model,
+            optimizer=optimizer,
+            config_sha256=config_sha256,
+            dataset_manifest_sha256=dataset_manifest_sha256,
+            smoke_state_count=smoke_state_count,
+            next_epoch=epoch + 1,
+            best_loss=best_loss,
+            best_epoch=best_epoch,
+            best_state=best_state,
+            patience=patience,
+            history=history,
+        )
+        if patience >= config.early_stopping_patience:
+            break
     if best_state is None:
         raise RuntimeError("pretraining produced no finite checkpoint")
     model.load_state_dict(best_state, strict=True)
