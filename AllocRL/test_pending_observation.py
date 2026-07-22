@@ -78,16 +78,16 @@ def make_observation_fixture(block_count: int = 40) -> dict:
     }
 
 
-EXPECTED_SCHEMA3_SHAPES = {
+EXPECTED_SCHEMA4_SHAPES = {
     "block": (8,),
     "future_blocks": (16, 6),
-    "future_demand": (3, 4),
+    "future_demand": (3, 6),
     "future_mask": (16,),
     "grids": (10, 4, 64, 64),
     "pending_blocks": (10, 32, 7),
     "pending_mask": (10, 32),
     "pending_summary": (10, 4),
-    "ws_meta": (10, 4),
+    "ws_meta": (10, 8),
 }
 
 
@@ -266,16 +266,16 @@ class PendingAssignmentIndicesTests(unittest.TestCase):
         self.assertEqual(simulator.pending_assignment_indices(99), [])
 
 
-def assert_schema3_observation(env, observation):
+def assert_schema4_observation(env, observation):
     assert list(observation) == list(env.observation_space.spaces)
     assert {
         key: value.shape for key, value in observation.items()
-    } == EXPECTED_SCHEMA3_SHAPES
+    } == EXPECTED_SCHEMA4_SHAPES
     assert all(value.dtype == np.float32 for value in observation.values())
     assert env.observation_space.contains(observation)
 
 
-def test_reset_step_and_terminal_observations_match_schema3():
+def test_reset_step_and_terminal_observations_match_schema4():
     env = make_ten_workspace_env()
 
     reset_observation, _ = env.reset(seed=0)
@@ -283,9 +283,9 @@ def test_reset_step_and_terminal_observations_match_schema3():
     terminal_observation = env.unwrapped._get_terminal_obs()
 
     assert not terminated
-    assert_schema3_observation(env, reset_observation)
-    assert_schema3_observation(env, step_observation)
-    assert_schema3_observation(env, terminal_observation)
+    assert_schema4_observation(env, reset_observation)
+    assert_schema4_observation(env, step_observation)
+    assert_schema4_observation(env, terminal_observation)
 
 
 def test_current_mode_zeros_only_structured_context():
@@ -305,7 +305,7 @@ def test_current_mode_zeros_only_structured_context():
         assert np.count_nonzero(current_observation[key]) == 0
     for key in ("block", "grids", "ws_meta"):
         np.testing.assert_array_equal(current_observation[key], full_observation[key])
-    assert_schema3_observation(current_env, current_observation)
+    assert_schema4_observation(current_env, current_observation)
 
 
 def test_current_mode_context_stays_zero_after_step_and_at_terminal():
@@ -328,7 +328,7 @@ def test_current_mode_context_stays_zero_after_step_and_at_terminal():
     while not terminated:
         observation, _reward, terminated, _truncated, _info = env.step(0)
 
-    assert_schema3_observation(env, observation)
+    assert_schema4_observation(env, observation)
     for key in (
         "future_blocks",
         "future_mask",
@@ -539,7 +539,7 @@ def test_delayed_assignment_uses_exact_pending_workspace_slot_and_delay():
     np.testing.assert_array_equal(repeated["grids"][1], after["grids"][1])
 
 
-def test_schema3_observation_space_has_complete_exact_contract():
+def test_schema4_observation_space_has_complete_exact_contract():
     space = build_observation_space(n_workspaces=3, grid_size=8)
 
     assert list(space.spaces) == [
@@ -556,10 +556,10 @@ def test_schema3_observation_space_has_complete_exact_contract():
     expected_shapes = {
         "block": (8,),
         "grids": (3, 4, 8, 8),
-        "ws_meta": (3, 4),
+        "ws_meta": (3, 8),
         "future_blocks": (16, 6),
         "future_mask": (16,),
-        "future_demand": (3, 4),
+        "future_demand": (3, 6),
         "pending_blocks": (3, 32, 7),
         "pending_mask": (3, 32),
         "pending_summary": (3, 4),
@@ -574,7 +574,7 @@ def test_schema3_observation_space_has_complete_exact_contract():
     ("n_workspaces", "grid_size", "message"),
     [(0, 64, "workspace"), (10, 0, "grid_size")],
 )
-def test_schema3_observation_space_rejects_nonpositive_dimensions(
+def test_schema4_observation_space_rejects_nonpositive_dimensions(
     n_workspaces, grid_size, message
 ):
     with pytest.raises(ValueError, match=message):
@@ -829,13 +829,13 @@ def test_build_observation_scales_rejects_zero_working_day_span(
         )
 
 
-def test_schema3_structured_shapes_ranges_and_initial_zero_pending_state():
+def test_schema4_structured_shapes_ranges_and_initial_zero_pending_state():
     state = build_structured_state(make_observation_fixture())
 
     assert state["block"].shape == (8,)
     assert state["future_blocks"].shape == (16, 6)
     assert state["future_mask"].shape == (16,)
-    assert state["future_demand"].shape == (3, 4)
+    assert state["future_demand"].shape == (3, 6)
     assert state["pending_blocks"].shape == (10, 32, 7)
     assert state["pending_mask"].shape == (10, 32)
     assert state["pending_summary"].shape == (10, 4)

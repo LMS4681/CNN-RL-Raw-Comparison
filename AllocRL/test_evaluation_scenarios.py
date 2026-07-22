@@ -359,12 +359,15 @@ class EvaluationScenarioTests(unittest.TestCase):
             )
 
     def test_prepared_artifact_bytes_match_committed_bundle_and_manifest(self):
-        committed_scenarios = (
-            DATA_DIR / "fixed_eval_scenarios.json"
-        ).read_bytes()
-        committed_manifest = (
-            DATA_DIR / "data_split_manifest.json"
-        ).read_bytes()
+        repository_root = Path(__file__).resolve().parent.parent
+        committed_scenarios = subprocess.check_output(
+            ["git", "show", "HEAD:AllocRL/data/fixed_eval_scenarios.json"],
+            cwd=repository_root,
+        )
+        committed_manifest = subprocess.check_output(
+            ["git", "show", "HEAD:AllocRL/data/data_split_manifest.json"],
+            cwd=repository_root,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             prepared_path = Path(tmpdir) / "fixed_eval_scenarios.json"

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import gymnasium as gym
@@ -404,3 +406,58 @@ def test_real_32_step_two_stage_smoke_publishes_verified_result(tmp_path):
     assert result["extractor_lr_ratio"] == pytest.approx(0.1)
     assert (output / "before_boundary.sb3").is_file()
     assert (output / "after_boundary.sb3").is_file()
+
+
+def test_release_rehearsal_uses_eight_subprocess_envs_and_resumes_twice(
+    tmp_path,
+):
+    source = CandidateCnnExtractor(
+        observation_space(grid_size=64), features_dim=256
+    )
+    checkpoint, marker = write_artifacts(tmp_path, source.state_dict())
+    output = tmp_path / "release-rehearsal"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pretraining.release_rehearsal",
+            "--checkpoint",
+            str(checkpoint),
+            "--complete",
+            str(marker),
+            "--output-dir",
+            str(output),
+            "--device",
+            "cpu",
+        ],
+        cwd=Path(__file__).parent,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert "fatal exception" not in completed.stderr.lower()
+
+    result_path = output / "REHEARSAL_COMPLETE.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["n_envs"] == 8
+    assert result["vec_env"] == "subproc"
+    assert result["n_steps"] == 120
+    assert result["rollout_transitions"] == 960
+    assert result["timesteps"] == [960, 1920, 2880]
+    assert result["extractor_unchanged_while_frozen"] is True
+    assert result["extractor_changed_after_unfreeze"] is True
+    assert result["nonzero_extractor_gradient"] is True
+    assert result["extractor_lr_ratio"] == pytest.approx(0.1)
+    assert result["learning_rates"] == sorted(
+        result["learning_rates"], reverse=True
+    )
+    assert result["strict_pretraining_transfer"] is True
+    assert result["exact_before_boundary_resume"] is True
+    assert result["exact_after_boundary_resume"] is True
+    for name in (
+        "before_boundary.sb3",
+        "after_boundary.sb3",
+        "after_second_resume.sb3",
+    ):
+        assert (output / name).is_file()
