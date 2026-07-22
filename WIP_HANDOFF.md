@@ -1,6 +1,107 @@
 # Raw observation vs CNN comparison: code and experiment handoff
 
-Updated: 2026-07-21 17:56 (Asia/Seoul)
+Updated: 2026-07-22 10:40 (Asia/Seoul)
+
+## 2026-07-22 scale-aware two-stage CNN release
+
+The focused implementation plan is complete in `feature/common-step-finish`
+through implementation commit `7087558`. The working tree contains two
+untracked report drafts under `reports/`; they are user artifacts and are not
+part of this release. The code release adds:
+
+- observation schema 4 with physical workspace scale and orientation-specific
+  current/future block geometry;
+- simulator-cloned auxiliary targets and sharded, resumable Stage 1 data;
+- strict simulator-supervised CNN/structured-MLP pretraining publication;
+- strict Stage 1 hash transfer into `ScaleAwareMaskablePPO`;
+- a 50,000-absolute-timestep extractor freeze, then `0.1` LR fine-tuning;
+- absolute cumulative linear LR decay that survives save/load/resume;
+- a resumable L4 Colab workflow with eight subprocess environments and
+  `n_steps=120`, preserving 960 transitions per PPO update.
+
+No reward calculation or constant, action mapping, rotation behavior,
+production block generator, episode ordering, existing comparison runner, or
+existing comparison output root changed. Rotation remains forbidden.
+
+Fresh local verification after the final implementation and release rehearsal:
+
+```text
+py -3.12 -m pytest -q
+1097 passed, 87 warnings, 55 subtests passed in 606.44s
+
+py -3.12 -m compileall -q AllocRL
+exit 0
+
+notebooks/improved_cnn_6h.ipynb code-cell compile
+exit 0
+
+git diff --check
+exit 0
+```
+
+The warnings are existing dependency deprecations and missing local Hangul
+plot glyphs. There were no test failures. The Windows CRLF-sensitive immutable
+artifact test now compares the committed Git blob, matching its stated
+contract and the existing canonical-LF test.
+
+A new deterministic simulator rehearsal generated 48 training and 24
+validation states with varied workspace and block geometry, trained Stage 1,
+and published a production-eligible `PRETRAINING_COMPLETE.json`. All five
+gates passed:
+
+```text
+validation_total_loss:          0.045702747690180935
+future_fit_bce:                 0.04171265562375386
+no_grid_future_fit_bce:         0.12697900484005611
+optionality_mae:                0.04313018023967743
+mean_baseline_optionality_mae:  0.06944443583488465
+shuffled_grid_total_loss:       0.12836183793842793
+counterfactual_geometry_delta:  0.004932411868746082
+```
+
+That real Stage 1 checkpoint then passed the eight-`SubprocVecEnv` release
+rehearsal in `pretraining.release_rehearsal`: strict transfer, one frozen
+rollout, resume before the boundary, unfreeze and update, resume after the
+boundary, and a third update. The durable receipt reported:
+
+```text
+n_envs=8, n_steps=120, rollout_transitions=960
+timesteps=[960, 1920, 2880]
+policy_lr=[0.0007, 0.0004, 0.0001]
+extractor_lr_ratio=0.1
+extractor unchanged/gradients clear while frozen=true
+extractor changed/nonzero gradient after unfreeze=true
+exact before-boundary and after-boundary resume=true
+```
+
+The production notebook is `notebooks/improved_cnn_6h.ipynb`. Its immutable
+release tag must be created only after this handoff commit is on `main`:
+
+```text
+scale-aware-cnn-6h-v1
+```
+
+Select an NVIDIA L4 runtime. The fixed Drive roots are:
+
+```text
+experiment:  /content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0
+pretraining: /content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0/pretraining
+PPO:         /content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0/ppo
+```
+
+After the tag is pushed, use:
+
+```text
+https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/scale-aware-cnn-6h-v1/notebooks/improved_cnn_6h.ipynb
+```
+
+The notebook verifies L4, immutable tag identity, dependency and input hashes,
+resumable Stage 1 shards/checkpoints, the 32-step CUDA transfer smoke, and the
+exact state-named Stage 2 auto-resume before starting the six cumulative PPO
+hours. Do not reuse the old overnight Drive root for this run.
+
+The sections below preserve the earlier raw-direct versus joint-from-scratch
+candidate-CNN experiment handoff and reporting constraints.
 
 ## Release state
 
