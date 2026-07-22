@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "seed": 0,
+  "train_state_count": 5000,
+  "validation_state_count": 1000,
+  "train_episode_seeds": [20000, 20039],
+  "validation_episode_seeds": [30000, 30009],
+  "states_per_shard": 100,
+  "replay_every_n_states": 4,
+  "replay_resolved_blocks": 8,
+  "replay_max_decisions": 32,
+  "optimizer": "AdamW",
+  "learning_rate": 0.0001,
+  "batch_size": 8,
+  "max_epochs": 30,
+  "early_stopping_patience": 5,
+  "minimum_relative_baseline_improvement": 0.05,
+  "minimum_shuffled_grid_degradation": 0.05
+}

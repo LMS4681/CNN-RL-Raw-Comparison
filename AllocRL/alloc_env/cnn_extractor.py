@@ -210,7 +210,7 @@ class _WorkspaceExtractor(BaseFeaturesExtractor):
     ) -> torch.Tensor | None:
         return None
 
-    def forward(
+    def encode_workspace_features(
         self,
         observations: dict[str, torch.Tensor],
     ) -> torch.Tensor:
@@ -229,9 +229,15 @@ class _WorkspaceExtractor(BaseFeaturesExtractor):
         if grid_features is not None:
             inputs.append(grid_features)
 
-        workspace_features = self.workspace_fusion(
+        return self.workspace_fusion(
             torch.cat(inputs, dim=-1)
         )
+
+    def forward(
+        self,
+        observations: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        workspace_features = self.encode_workspace_features(observations)
         return self.global_fusion(workspace_features.flatten(1))
 
 
