@@ -706,6 +706,7 @@ CONFIG_COMPATIBILITY_KEYS = tuple(sorted({
     "training_data_schema_version",
     "observation_schema_version",
     "reward_schema_version",
+    "model_class",
     "extractor",
     "state_context",
     "grid_size",
@@ -729,12 +730,57 @@ CONFIG_COMPATIBILITY_KEYS = tuple(sorted({
     "learning_rate_schedule",
     "final_learning_rate",
     "learning_rate_decay_steps",
+    "pretraining_checkpoint_sha256",
+    "pretraining_manifest_sha256",
+    "pretraining_complete_sha256",
+    "freeze_extractor_steps",
+    "extractor_lr_scale",
     "n_steps",
     "batch_size",
     "n_epochs",
     "gamma",
     "gae_lambda",
 }))
+
+
+def requested_pretraining_receipt(args):
+    from pretraining.transfer import verify_pretraining_artifacts
+
+    checkpoint = getattr(args, "pretrained_extractor", None)
+    complete = getattr(args, "pretraining_complete", None)
+    required = bool(getattr(args, "require_pretrained_extractor", False))
+    if args.extractor != "candidate-cnn":
+        if checkpoint is not None or complete is not None or required:
+            raise ValueError(
+                "pretrained extractor options require --extractor candidate-cnn"
+            )
+        return None
+    if (checkpoint is None) != (complete is None):
+        raise ValueError(
+            "--pretrained-extractor and --pretraining-complete are required together"
+        )
+    if checkpoint is None:
+        if required:
+            raise ValueError(
+                "--require-pretrained-extractor requires both Stage 1 paths"
+            )
+        return None
+    return verify_pretraining_artifacts(
+        Path(checkpoint), Path(complete)
+    ).receipt
+
+
+def initialize_pretrained_extractor(model, args, *, is_resume: bool):
+    """Apply Stage 1 only to a new model; resumed SB3 weights are authoritative."""
+    if is_resume or getattr(args, "pretrained_extractor", None) is None:
+        return None
+    from pretraining.transfer import load_verified_pretrained_extractor
+
+    return load_verified_pretrained_extractor(
+        model,
+        Path(args.pretrained_extractor),
+        Path(args.pretraining_complete),
+    )
 
 
 def current_run_config(
@@ -761,10 +807,28 @@ def current_run_config(
         )
     learning_rate_schedule = schedule_from_args(args)
     schedule_spec = learning_rate_schedule.spec()
+    receipt = requested_pretraining_receipt(args)
+    freeze_steps = getattr(args, "freeze_extractor_steps", 50_000)
+    if (
+        isinstance(freeze_steps, bool)
+        or not isinstance(freeze_steps, int)
+        or freeze_steps < 0
+    ):
+        raise ValueError("--freeze-extractor-steps must be non-negative")
+    extractor_lr_scale = float(
+        getattr(args, "extractor_lr_scale", 0.1)
+    )
+    if not np.isfinite(extractor_lr_scale) or not 0 < extractor_lr_scale <= 1:
+        raise ValueError("--extractor-lr-scale must be in (0, 1]")
     return {
         "training_data_schema_version": TRAINING_DATA_SCHEMA_VERSION,
         "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
         "reward_schema_version": REWARD_SCHEMA_VERSION,
+        "model_class": (
+            "ScaleAwareMaskablePPO"
+            if args.extractor == "candidate-cnn"
+            else "MaskablePPO"
+        ),
         "extractor": args.extractor,
         "features_dim": args.features_dim,
         "extractor_output_dim": (
@@ -794,6 +858,17 @@ def current_run_config(
         "learning_rate_schedule": schedule_spec["mode"],
         "final_learning_rate": schedule_spec["final_rate"],
         "learning_rate_decay_steps": schedule_spec["decay_steps"],
+        "pretraining_checkpoint_sha256": (
+            receipt.checkpoint_sha256 if receipt is not None else None
+        ),
+        "pretraining_manifest_sha256": (
+            receipt.manifest_sha256 if receipt is not None else None
+        ),
+        "pretraining_complete_sha256": (
+            receipt.complete_sha256 if receipt is not None else None
+        ),
+        "freeze_extractor_steps": freeze_steps,
+        "extractor_lr_scale": extractor_lr_scale,
         "n_steps": int(args.n_steps),
         "batch_size": int(args.batch_size),
         "n_epochs": int(args.n_epochs),
@@ -1376,11 +1451,11 @@ def train(args):
 
 def _train(args, resources: _TrainingResourceLifecycle):
     """MaskablePPO 학습 실행."""
-    from sb3_contrib import MaskablePPO
-
     from alloc_env.strategy import BaseGridStrategy
     from alloc_env.callbacks import AllocationCallback, TrainingMetricsCallback
     from alloc_env.block_generator import SyntheticBlockGenerator
+    from evaluation_runner import model_class_from_run_config
+    from pretraining.ppo import ExtractorFineTuneCallback
 
     fixed_scenarios = load_requested_evaluation_scenarios(
         getattr(args, "eval_scenarios", None)
@@ -1468,6 +1543,7 @@ def _train(args, resources: _TrainingResourceLifecycle):
     is_resume = resume_path is not None
     persist_run_config(output_dir, run_config, is_resume=is_resume)
     learning_rate_schedule = schedule_from_args(args)
+    ppo_class = model_class_from_run_config(run_config)
 
     # ── 2. Synthetic 블록 생성기 ─────────────────────────────────
     generator = SyntheticBlockGenerator.from_blocks(
@@ -1535,7 +1611,7 @@ def _train(args, resources: _TrainingResourceLifecycle):
     print(f"Feature extractor: {args.extractor}")
     if is_resume:
         print(f"기존 모델에서 이어 학습: {resume_path}")
-        model = MaskablePPO.load(
+        model = ppo_class.load(
             str(resume_path),
             env=env,
             device=args.device,
@@ -1543,11 +1619,21 @@ def _train(args, resources: _TrainingResourceLifecycle):
         )
         require_model_schedule(model, learning_rate_schedule.spec())
     else:
-        model = MaskablePPO(
+        model = ppo_class(
             "MultiInputPolicy",
             env,
             verbose=1,
             learning_rate=learning_rate_schedule,
+            **(
+                {
+                    "extractor_lr_scale": float(run_config.get(
+                        "extractor_lr_scale",
+                        getattr(args, "extractor_lr_scale", 0.1),
+                    ))
+                }
+                if args.extractor == "candidate-cnn"
+                else {}
+            ),
             n_steps=args.n_steps,
             batch_size=args.batch_size,
             n_epochs=args.n_epochs,
@@ -1558,6 +1644,7 @@ def _train(args, resources: _TrainingResourceLifecycle):
             device=args.device,
             tensorboard_log=str(output_dir / "tb_logs"),
         )
+        initialize_pretrained_extractor(model, args, is_resume=False)
     resources.model = model
     run_origin = None
     if wall_clock_enabled:
@@ -1608,7 +1695,6 @@ def _train(args, resources: _TrainingResourceLifecycle):
 
     # ── 5. 콜백 설정 ──────────────────────────────────────────────
     callback = [
-        AbsoluteScheduleCallback(),
         AllocationCallback(
             log_dir=args.output_dir, verbose=1, append=is_resume
         ),
@@ -1626,6 +1712,14 @@ def _train(args, resources: _TrainingResourceLifecycle):
     )
     if holdout_callback is not None:
         callback.append(holdout_callback)
+    callback.append(AbsoluteScheduleCallback())
+    if args.extractor == "candidate-cnn":
+        callback.append(ExtractorFineTuneCallback(
+            int(run_config.get(
+                "freeze_extractor_steps",
+                getattr(args, "freeze_extractor_steps", 50_000),
+            ))
+        ))
     if args.checkpoint_freq > 0 and not wall_clock_enabled:
         # SB3 CheckpointCallback은 콜백 호출 횟수 기준이라 n_envs로 나눠 step 단위를 맞춘다.
         save_freq = max(args.checkpoint_freq // max(args.n_envs, 1), 1)
@@ -1772,7 +1866,7 @@ def _train(args, resources: _TrainingResourceLifecycle):
             seed=args.seed,
         )
         scenario_rows = evaluate_selected_holdout_report(
-            MaskablePPO,
+            ppo_class,
             output_dir=output_dir,
             training_env=selected_model_env,
             scenario_records=fixed_scenarios,
@@ -2007,6 +2101,36 @@ def main():
         default="candidate-cnn",
         choices=["structured", "fixed-grid", "candidate-cnn", "raw-direct"],
         help="feature extractor ablation mode",
+    )
+    parser.add_argument(
+        "--pretrained-extractor",
+        type=str,
+        default=None,
+        help="verified Stage 1 candidate extractor checkpoint",
+    )
+    parser.add_argument(
+        "--pretraining-complete",
+        type=str,
+        default=None,
+        help="PRETRAINING_COMPLETE.json beside the Stage 1 checkpoint",
+    )
+    parser.add_argument(
+        "--require-pretrained-extractor",
+        action="store_true",
+        default=False,
+        help="reject a new candidate run without verified Stage 1 weights",
+    )
+    parser.add_argument(
+        "--freeze-extractor-steps",
+        type=int,
+        default=50_000,
+        help="absolute PPO timestep at which extractor fine-tuning begins",
+    )
+    parser.add_argument(
+        "--extractor-lr-scale",
+        type=float,
+        default=0.1,
+        help="extractor learning-rate multiplier after unfreezing",
     )
     parser.add_argument(
         "--state-context",

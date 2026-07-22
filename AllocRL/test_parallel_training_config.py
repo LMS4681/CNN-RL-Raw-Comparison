@@ -82,6 +82,11 @@ def make_args() -> SimpleNamespace:
         lr_schedule="constant",
         lr_final=None,
         lr_decay_steps=None,
+        pretrained_extractor=None,
+        pretraining_complete=None,
+        require_pretrained_extractor=False,
+        freeze_extractor_steps=50_000,
+        extractor_lr_scale=0.1,
         n_steps=960,
         batch_size=64,
         n_epochs=10,
@@ -357,6 +362,12 @@ class ParallelTrainingConfigTests(unittest.TestCase):
         self.assertEqual("constant", config["learning_rate_schedule"])
         self.assertEqual(3e-4, config["final_learning_rate"])
         self.assertEqual(0, config["learning_rate_decay_steps"])
+        self.assertEqual("ScaleAwareMaskablePPO", config["model_class"])
+        self.assertIsNone(config["pretraining_checkpoint_sha256"])
+        self.assertIsNone(config["pretraining_manifest_sha256"])
+        self.assertIsNone(config["pretraining_complete_sha256"])
+        self.assertEqual(50_000, config["freeze_extractor_steps"])
+        self.assertEqual(0.1, config["extractor_lr_scale"])
         self.assertEqual(960, config["n_steps"])
         self.assertEqual(64, config["batch_size"])
         self.assertEqual(10, config["n_epochs"])

@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Literal
 
-from sb3_contrib import MaskablePPO
-
 import evaluation_runner
 from alloc_env.observation_state import ObservationScales
 from comparison.artifact_manifest import (
@@ -40,6 +38,17 @@ EXPECTED_HOLDOUT_SEEDS = tuple(range(1000, 1020))
 SELECTION_SEEDS = tuple(range(1000, 1005))
 PRIMARY_TEST_SEEDS = tuple(range(1005, 1020))
 ARMS = ("raw_direct", "candidate_cnn")
+
+
+def load_model_archive(path, *args, **kwargs):
+    """Load an archive with the model class recorded beside it."""
+    from train import load_model_run_config
+
+    run_config = load_model_run_config(Path(path))
+    model_class = evaluation_runner.model_class_from_run_config(run_config)
+    return model_class.load(path, *args, **kwargs)
+
+
 if len(SELECTION_SEEDS) != CANONICAL_SELECTION_COUNT:
     raise RuntimeError("selection protocol count differs from canonical metadata")
 EVALUATION_COLUMNS = (
@@ -133,7 +142,7 @@ class SelectionDecision:
         }
 
 
-def _archive_timestep(path: Path, loader=MaskablePPO.load) -> int | None:
+def _archive_timestep(path: Path, loader=load_model_archive) -> int | None:
     """Use train's canonical, corruption-tolerant archive reader lazily."""
     from train import model_num_timesteps
     return model_num_timesteps(path, loader=loader)
@@ -169,7 +178,7 @@ def readable_checkpoint_inventory(
     output_dir: Path,
     regular_interval: int = REGULAR_INTERVAL,
     *,
-    model_loader=MaskablePPO.load,
+    model_loader=load_model_archive,
 ) -> dict[int, Path]:
     """Return newest readable archive at each regular stored timestep."""
     if regular_interval <= 0:
@@ -198,7 +207,9 @@ def readable_checkpoint_inventory(
 def select_common_timestep(
     raw_dir: Path,
     cnn_dir: Path,
-    regular_interval: int = REGULAR_INTERVAL, *, model_loader=MaskablePPO.load,
+    regular_interval: int = REGULAR_INTERVAL,
+    *,
+    model_loader=load_model_archive,
 ) -> int:
     raw_steps = set(readable_checkpoint_inventory(raw_dir, regular_interval, model_loader=model_loader))
     cnn_steps = set(readable_checkpoint_inventory(cnn_dir, regular_interval, model_loader=model_loader))
@@ -260,7 +271,14 @@ def _selected_timestep(selection_path: Path) -> int | None:
     return best[0] if best is not None else None
 
 
-def _verified_ref(path: Path, label: Literal["best_model", "fallback_final", "final", "common_step"], timestep: int, loader=MaskablePPO.load) -> CheckpointRef | None:
+def _verified_ref(
+    path: Path,
+    label: Literal[
+        "best_model", "fallback_final", "final", "common_step"
+    ],
+    timestep: int,
+    loader=load_model_archive,
+) -> CheckpointRef | None:
     try:
         verified_path = resolve_direct_regular_file(
             path.parent, path, label=f"{label} checkpoint"
@@ -273,7 +291,7 @@ def _verified_ref(path: Path, label: Literal["best_model", "fallback_final", "fi
 
 
 def resolve_final_checkpoint(
-    output_dir: Path, *, model_loader=MaskablePPO.load
+    output_dir: Path, *, model_loader=load_model_archive
 ) -> CheckpointRef:
     """Return only the readable archive named and verified by complete state."""
     root = Path(output_dir)
@@ -293,7 +311,7 @@ def resolve_final_checkpoint(
 def resolve_selection_decision(
     output_dir: Path,
     *,
-    model_loader=MaskablePPO.load,
+    model_loader=load_model_archive,
     archive_timestep_reader=None,
     final_reference: CheckpointRef | None = None,
 ) -> SelectionDecision:
@@ -378,7 +396,7 @@ def resolve_selection_decision(
 
 
 def resolve_selected_or_fallback(
-    output_dir: Path, *, model_loader=MaskablePPO.load
+    output_dir: Path, *, model_loader=load_model_archive
 ) -> CheckpointRef:
     """Compatibility wrapper returning only the canonical selected reference."""
     return resolve_selection_decision(
@@ -401,7 +419,7 @@ def evaluate_checkpoint(
     scenarios: Sequence[dict],
     checkpoint_label: str,
     arm: str,
-    model_loader=MaskablePPO.load,
+    model_loader=load_model_archive,
 ) -> list[dict]:
     """Evaluate one archive and attach truthful checkpoint provenance."""
     selection, primary = split_holdout_records(scenarios)
@@ -565,7 +583,7 @@ def _stable_checkpoint_reference(
     reference: CheckpointRef,
     arm_root: Path,
     *,
-    model_loader=MaskablePPO.load,
+    model_loader=load_model_archive,
 ) -> None:
     """Recheck identity after evaluation so publication cannot bind a raced file."""
     path = _reference_path_within_arm(reference, arm_root)
@@ -1290,7 +1308,7 @@ def evaluate_arm_artifacts(
     *,
     config_sha256: str,
     scenario_sha256: str,
-    model_loader=MaskablePPO.load,
+    model_loader=load_model_archive,
 ) -> dict[str, Any]:
     """Evaluate one selected checkpoint and commit its artifacts marker-last."""
     if arm not in ARMS:
@@ -1422,7 +1440,7 @@ def evaluate_common_step_artifacts(
     config_sha256: str,
     scenario_sha256: str,
     regular_interval: int = REGULAR_INTERVAL,
-    model_loader=MaskablePPO.load,
+    model_loader=load_model_archive,
 ) -> dict[str, Any]:
     """Evaluate only the shared regular checkpoint and commit marker-last.
 

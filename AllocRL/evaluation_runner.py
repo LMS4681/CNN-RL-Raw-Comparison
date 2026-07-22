@@ -20,6 +20,31 @@ from evaluation_scenarios import (
 )
 
 
+def model_class_from_run_config(run_config):
+    """Select the archive loader without mutating legacy schema-3 models."""
+    from sb3_contrib import MaskablePPO
+
+    observation_schema = int(
+        run_config.get("observation_schema_version", 0)
+    )
+    extractor = run_config.get("extractor")
+    recorded = run_config.get("model_class")
+    if observation_schema == 4 and extractor == "candidate-cnn":
+        from pretraining.ppo import ScaleAwareMaskablePPO
+
+        if recorded != "ScaleAwareMaskablePPO":
+            raise ValueError(
+                "schema-4 candidate run_config model_class must be "
+                "ScaleAwareMaskablePPO"
+            )
+        return ScaleAwareMaskablePPO
+    if recorded not in (None, "MaskablePPO"):
+        raise ValueError(
+            f"run_config model_class is incompatible: {recorded!r}"
+        )
+    return MaskablePPO
+
+
 class ModelActionPolicy:
     def __init__(self, model, name: str = "model"):
         self.model = model

@@ -13,10 +13,9 @@ def export_saved_model(
     device: str = "auto",
 ) -> Path:
     """Recreate the saved observation space and export the actor to ONNX."""
-    from sb3_contrib import MaskablePPO
-
     from alloc_env.observation_state import GRID_SIZE
     from alloc_env.strategy import BaseGridStrategy
+    from evaluation_runner import model_class_from_run_config
     from train import (
         create_evaluation_env,
         export_to_onnx,
@@ -28,6 +27,7 @@ def export_saved_model(
 
     model_path = resolve_model_archive_path(model_path)
     run_config = load_model_run_config(model_path)
+    model_class = model_class_from_run_config(run_config)
     workspace_codes, state_context, observation_scales = (
         observation_contract_from_run_config(
             run_config, source="ONNX export"
@@ -52,7 +52,7 @@ def export_saved_model(
         seed=int(run_config.get("seed", 0)),
     )
     try:
-        model = MaskablePPO.load(str(model_path), env=env, device=device)
+        model = model_class.load(str(model_path), env=env, device=device)
         destination = (
             Path(onnx_path).expanduser().resolve()
             if onnx_path is not None

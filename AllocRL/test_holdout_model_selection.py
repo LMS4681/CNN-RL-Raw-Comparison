@@ -668,10 +668,14 @@ def test_train_frequency_zero_disables_holdout_callback(tmp_path):
         final_holdout_report=False,
     )
 
-    assert [item.__name__ for item in state["callback_types"]] == [
+    callback_names = [item.__name__ for item in state["callback_types"]]
+    assert callback_names[:2] == [
         "ExistingAllocationCallback",
         "ExistingTrainingMetricsCallback",
     ]
+    assert "FixedHoldoutEvalCallback" not in callback_names
+    assert "AbsoluteScheduleCallback" in callback_names
+    assert "ExtractorFineTuneCallback" in callback_names
     assert "load:selected-model" not in state["events"]
     assert state["training_env"].close_count == 1
     assert state["original_env"].close_count == 1

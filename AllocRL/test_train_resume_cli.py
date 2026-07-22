@@ -30,6 +30,7 @@ REQUIRED_COMPATIBILITY_KEYS = {
     "training_data_schema_version",
     "observation_schema_version",
     "reward_schema_version",
+    "model_class",
     "extractor",
     "features_dim",
     "extractor_output_dim",
@@ -53,6 +54,11 @@ REQUIRED_COMPATIBILITY_KEYS = {
     "learning_rate_schedule",
     "final_learning_rate",
     "learning_rate_decay_steps",
+    "pretraining_checkpoint_sha256",
+    "pretraining_manifest_sha256",
+    "pretraining_complete_sha256",
+    "freeze_extractor_steps",
+    "extractor_lr_scale",
     "n_steps",
     "batch_size",
     "n_epochs",
@@ -66,6 +72,7 @@ def complete_config(observation_schema_version=4):
         "training_data_schema_version": 2,
         "observation_schema_version": observation_schema_version,
         "reward_schema_version": 2,
+        "model_class": "ScaleAwareMaskablePPO",
         "extractor": "candidate-cnn",
         "state_context": "full",
         "grid_size": 64,
@@ -100,6 +107,11 @@ def complete_config(observation_schema_version=4):
         "learning_rate_schedule": "constant",
         "final_learning_rate": 3e-4,
         "learning_rate_decay_steps": 0,
+        "pretraining_checkpoint_sha256": None,
+        "pretraining_manifest_sha256": None,
+        "pretraining_complete_sha256": None,
+        "freeze_extractor_steps": 50_000,
+        "extractor_lr_scale": 0.1,
         "n_steps": 960,
         "batch_size": 64,
         "n_epochs": 10,
@@ -121,6 +133,11 @@ def make_args():
         lr_schedule="constant",
         lr_final=None,
         lr_decay_steps=None,
+        pretrained_extractor=None,
+        pretraining_complete=None,
+        require_pretrained_extractor=False,
+        freeze_extractor_steps=50_000,
+        extractor_lr_scale=0.1,
         n_steps=960,
         batch_size=64,
         n_epochs=10,
@@ -141,6 +158,8 @@ def source_manifest():
 
 
 def different_value(value):
+    if value is None:
+        return "changed"
     if isinstance(value, str):
         return f"{value}-changed"
     if isinstance(value, int):
@@ -273,6 +292,63 @@ def test_run_config_contains_every_compatibility_key():
     assert train_module.CONFIG_COMPATIBILITY_KEYS == tuple(
         sorted(REQUIRED_COMPATIBILITY_KEYS)
     )
+
+
+def test_required_pretraining_rejects_missing_stage1_paths():
+    args = make_args()
+    args.require_pretrained_extractor = True
+
+    with pytest.raises(ValueError, match="requires both Stage 1 paths"):
+        train_module.current_run_config(
+            args,
+            WORKSPACE_CODES,
+            source_manifest(),
+            ObservationScales.from_dict(
+                complete_config()["observation_scales"]
+            ),
+        )
+
+
+def test_resume_never_reapplies_stage1_extractor(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "pretraining.transfer.load_verified_pretrained_extractor",
+        lambda *args: calls.append(args),
+    )
+    args = make_args()
+    args.pretrained_extractor = "encoder.pt"
+    args.pretraining_complete = "PRETRAINING_COMPLETE.json"
+
+    result = train_module.initialize_pretrained_extractor(
+        object(), args, is_resume=True
+    )
+
+    assert result is None
+    assert calls == []
+
+
+def test_new_run_applies_stage1_extractor_once(monkeypatch):
+    receipt = object()
+    calls = []
+    monkeypatch.setattr(
+        "pretraining.transfer.load_verified_pretrained_extractor",
+        lambda *args: calls.append(args) or receipt,
+    )
+    args = make_args()
+    args.pretrained_extractor = "encoder.pt"
+    args.pretraining_complete = "PRETRAINING_COMPLETE.json"
+    model = object()
+
+    result = train_module.initialize_pretrained_extractor(
+        model, args, is_resume=False
+    )
+
+    assert result is receipt
+    assert calls == [(
+        model,
+        Path("encoder.pt"),
+        Path("PRETRAINING_COMPLETE.json"),
+    )]
 
 
 def test_raw_direct_run_config_records_fixed_output_dimension():
@@ -865,6 +941,37 @@ class TrainResumeCliTest(unittest.TestCase):
         self.assertEqual("linear", captured["lr_schedule"])
         self.assertEqual(1e-5, captured["lr_final"])
         self.assertEqual(1_000_000, captured["lr_decay_steps"])
+
+    def test_pretrained_extractor_arguments_are_accepted(self):
+        captured = {}
+        argv = [
+            "train.py",
+            "--pretrained-extractor",
+            "encoder.pt",
+            "--pretraining-complete",
+            "PRETRAINING_COMPLETE.json",
+            "--require-pretrained-extractor",
+            "--freeze-extractor-steps",
+            "50000",
+            "--extractor-lr-scale",
+            "0.1",
+        ]
+
+        with patch.object(sys, "argv", argv), patch.object(
+            train_module,
+            "train",
+            lambda args: captured.update(vars(args)),
+        ):
+            train_module.main()
+
+        self.assertEqual("encoder.pt", captured["pretrained_extractor"])
+        self.assertEqual(
+            "PRETRAINING_COMPLETE.json",
+            captured["pretraining_complete"],
+        )
+        self.assertTrue(captured["require_pretrained_extractor"])
+        self.assertEqual(50_000, captured["freeze_extractor_steps"])
+        self.assertEqual(0.1, captured["extractor_lr_scale"])
 
     def test_finalize_complete_state_argument_is_accepted(self):
         captured = {}

@@ -426,16 +426,16 @@ def evaluate_model_and_export(
     output_dir: str | Path,
     frame_stride_days: int = 1,
 ) -> list[dict[str, str]]:
-    from sb3_contrib import MaskablePPO
-
     from alloc_env.observation_state import GRID_SIZE
     from alloc_env.strategy import BaseGridStrategy
+    from evaluation_runner import model_class_from_run_config
     from train import create_evaluation_env, load_allocation_scenario
 
     _setup_korean_font()  # 한글 라벨 깨짐 방지 (폰트 없으면 무시)
 
     model_path = resolve_model_archive_path(model_path)
     run_config = load_model_run_config(model_path)
+    model_class = model_class_from_run_config(run_config)
     active_codes, state_context, observation_scales = (
         observation_contract_from_run_config(
             run_config, source="placement visualization"
@@ -458,7 +458,7 @@ def evaluate_model_and_export(
         seed=int(run_config.get("seed", 0)),
     )
     try:
-        model = MaskablePPO.load(str(model_path), env=env, device="auto")
+        model = model_class.load(str(model_path), env=env, device="auto")
         obs, _ = env.reset()
         done = False
         info = {}
