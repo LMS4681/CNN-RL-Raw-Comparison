@@ -50,6 +50,9 @@ REQUIRED_COMPATIBILITY_KEYS = {
     "monthly_jitter",
     "empirical_profile_probability",
     "learning_rate",
+    "learning_rate_schedule",
+    "final_learning_rate",
+    "learning_rate_decay_steps",
     "n_steps",
     "batch_size",
     "n_epochs",
@@ -94,6 +97,9 @@ def complete_config(observation_schema_version=4):
         "monthly_jitter": 20,
         "empirical_profile_probability": 0.2,
         "learning_rate": 3e-4,
+        "learning_rate_schedule": "constant",
+        "final_learning_rate": 3e-4,
+        "learning_rate_decay_steps": 0,
         "n_steps": 960,
         "batch_size": 64,
         "n_epochs": 10,
@@ -112,6 +118,9 @@ def make_args():
         monthly_jitter=20,
         empirical_profile_probability=0.2,
         lr=3e-4,
+        lr_schedule="constant",
+        lr_final=None,
+        lr_decay_steps=None,
         n_steps=960,
         batch_size=64,
         n_epochs=10,
@@ -830,6 +839,32 @@ class TrainResumeCliTest(unittest.TestCase):
         )
         self.assertEqual(300, captured["wall_clock_heartbeat_seconds"])
         self.assertEqual("a" * 64, captured["comparison_config_sha256"])
+
+    def test_linear_learning_rate_arguments_are_accepted(self):
+        captured = {}
+
+        argv = [
+            "train.py",
+            "--lr",
+            "0.0001",
+            "--lr-schedule",
+            "linear",
+            "--lr-final",
+            "0.00001",
+            "--lr-decay-steps",
+            "1000000",
+        ]
+
+        with patch.object(sys, "argv", argv), patch.object(
+            train_module,
+            "train",
+            lambda args: captured.update(vars(args)),
+        ):
+            train_module.main()
+
+        self.assertEqual("linear", captured["lr_schedule"])
+        self.assertEqual(1e-5, captured["lr_final"])
+        self.assertEqual(1_000_000, captured["lr_decay_steps"])
 
     def test_finalize_complete_state_argument_is_accepted(self):
         captured = {}

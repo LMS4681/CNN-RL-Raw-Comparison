@@ -79,6 +79,9 @@ def make_args() -> SimpleNamespace:
         monthly_jitter=20,
         empirical_profile_probability=0.2,
         lr=3e-4,
+        lr_schedule="constant",
+        lr_final=None,
+        lr_decay_steps=None,
         n_steps=960,
         batch_size=64,
         n_epochs=10,
@@ -351,6 +354,9 @@ class ParallelTrainingConfigTests(unittest.TestCase):
             config["target_month_counts"],
         )
         self.assertEqual(3e-4, config["learning_rate"])
+        self.assertEqual("constant", config["learning_rate_schedule"])
+        self.assertEqual(3e-4, config["final_learning_rate"])
+        self.assertEqual(0, config["learning_rate_decay_steps"])
         self.assertEqual(960, config["n_steps"])
         self.assertEqual(64, config["batch_size"])
         self.assertEqual(10, config["n_epochs"])

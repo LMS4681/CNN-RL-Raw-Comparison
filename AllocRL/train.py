@@ -39,6 +39,12 @@ import torch
 from sb3_contrib import MaskablePPO
 from stable_baselines3.common.callbacks import CheckpointCallback
 
+from learning_rate_schedule import (
+    AbsoluteScheduleCallback,
+    require_model_schedule,
+    schedule_from_args,
+)
+
 from comparison.wall_clock_callback import (
     WallClockBudgetCallback,
     atomic_write_json,
@@ -720,6 +726,9 @@ CONFIG_COMPATIBILITY_KEYS = tuple(sorted({
     "monthly_jitter",
     "empirical_profile_probability",
     "learning_rate",
+    "learning_rate_schedule",
+    "final_learning_rate",
+    "learning_rate_decay_steps",
     "n_steps",
     "batch_size",
     "n_epochs",
@@ -750,6 +759,8 @@ def current_run_config(
         raise ValueError(
             f"source manifest is missing required compatibility fields: {missing}"
         )
+    learning_rate_schedule = schedule_from_args(args)
+    schedule_spec = learning_rate_schedule.spec()
     return {
         "training_data_schema_version": TRAINING_DATA_SCHEMA_VERSION,
         "observation_schema_version": OBSERVATION_SCHEMA_VERSION,
@@ -780,6 +791,9 @@ def current_run_config(
             args.empirical_profile_probability
         ),
         "learning_rate": float(args.lr),
+        "learning_rate_schedule": schedule_spec["mode"],
+        "final_learning_rate": schedule_spec["final_rate"],
+        "learning_rate_decay_steps": schedule_spec["decay_steps"],
         "n_steps": int(args.n_steps),
         "batch_size": int(args.batch_size),
         "n_epochs": int(args.n_epochs),
@@ -1453,6 +1467,7 @@ def _train(args, resources: _TrainingResourceLifecycle):
     resume_path = resolve_resume_path(args, output_dir, run_config)
     is_resume = resume_path is not None
     persist_run_config(output_dir, run_config, is_resume=is_resume)
+    learning_rate_schedule = schedule_from_args(args)
 
     # ── 2. Synthetic 블록 생성기 ─────────────────────────────────
     generator = SyntheticBlockGenerator.from_blocks(
@@ -1526,12 +1541,13 @@ def _train(args, resources: _TrainingResourceLifecycle):
             device=args.device,
             tensorboard_log=str(output_dir / "tb_logs"),
         )
+        require_model_schedule(model, learning_rate_schedule.spec())
     else:
         model = MaskablePPO(
             "MultiInputPolicy",
             env,
             verbose=1,
-            learning_rate=args.lr,
+            learning_rate=learning_rate_schedule,
             n_steps=args.n_steps,
             batch_size=args.batch_size,
             n_epochs=args.n_epochs,
@@ -1592,6 +1608,7 @@ def _train(args, resources: _TrainingResourceLifecycle):
 
     # ── 5. 콜백 설정 ──────────────────────────────────────────────
     callback = [
+        AbsoluteScheduleCallback(),
         AllocationCallback(
             log_dir=args.output_dir, verbose=1, append=is_resume
         ),
@@ -1920,6 +1937,24 @@ def main():
                         help="총 학습 타임스텝")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="학습률 (learning rate)")
+    parser.add_argument(
+        "--lr-schedule",
+        choices=["constant", "linear"],
+        default="constant",
+        help="learning-rate schedule keyed to cumulative timesteps",
+    )
+    parser.add_argument(
+        "--lr-final",
+        type=float,
+        default=None,
+        help="final learning rate; required for --lr-schedule linear",
+    )
+    parser.add_argument(
+        "--lr-decay-steps",
+        type=int,
+        default=None,
+        help="absolute decay horizon; required for --lr-schedule linear",
+    )
     parser.add_argument("--n-steps", type=int, default=960,
                         help="PPO n_steps (913-block episode 근사, batch 64 배수)")
     parser.add_argument(
