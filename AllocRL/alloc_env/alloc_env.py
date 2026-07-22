@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import gymnasium as gym
 import numpy as np
 from datetime import date
@@ -382,6 +383,52 @@ class BlockPlacementEnv(gym.Env):
             self._workspace_grid_signature(ws, env_date)
             for ws in self._workspaces
         ]
+
+    def clone_for_diagnostics(self) -> BlockPlacementEnv:
+        """Clone the current environment state for side-effect-free previews."""
+        if self._placement_simulator is None:
+            raise RuntimeError(
+                "Environment must be reset before diagnostic cloning."
+            )
+
+        clone = copy.copy(self)
+        clone._original_blocks = [
+            block.clone() for block in self._original_blocks
+        ]
+        clone._original_workspaces = Workspace.deep_copy_list(
+            self._original_workspaces
+        )
+        clone._strategy = copy.deepcopy(self._strategy)
+        clone._generator = copy.deepcopy(self._generator)
+        clone._constraints = copy.deepcopy(self._constraints)
+        clone._placement_simulator = (
+            self._placement_simulator.clone_for_diagnostics()
+        )
+        clone._blocks = clone._placement_simulator.blocks
+        clone._workspaces = clone._placement_simulator.workspaces
+        clone._picker = ValidWorkspacePicker(
+            clone._blocks, clone._workspaces, clone._constraints
+        )
+        clone._assignments = list(self._assignments)
+        clone._ws_areas = self._ws_areas.copy()
+        clone._ws_used_area = self._ws_used_area.copy()
+        clone._emitted_resolved_indices = set(
+            self._emitted_resolved_indices
+        )
+        clone._last_result = copy.deepcopy(self._last_result)
+        clone._candidate_placements = copy.deepcopy(
+            self._candidate_placements
+        )
+        clone._renderer = OccupancyGridRenderer(self._grid_size)
+        clone._grid_cache = BaseGridCache(
+            clone._renderer, clone._num_workspaces
+        )
+        clone.action_space = copy.deepcopy(self.action_space)
+        clone.observation_space = copy.deepcopy(self.observation_space)
+        clone._np_random = copy.deepcopy(self.np_random)
+        if hasattr(self, "_np_random_seed"):
+            clone._np_random_seed = self._np_random_seed
+        return clone
 
     # ── reset / step ──────────────────────────────────────────────
 

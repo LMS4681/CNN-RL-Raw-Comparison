@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from datetime import date
 import math
@@ -90,6 +91,30 @@ class IncrementalPlacementSimulator:
             self.env_date = date(2026, 4, 1)
 
         self._advance_to_next_decision()
+
+    def clone_for_diagnostics(self) -> IncrementalPlacementSimulator:
+        """Clone the current transition state without replaying the episode."""
+        graph = copy.deepcopy({
+            "original_blocks": self._original_blocks,
+            "original_workspaces": self._original_workspaces,
+            "blocks": self.blocks,
+            "workspaces": self.workspaces,
+            "transition_results": self._transition_results,
+        })
+        clone = object.__new__(type(self))
+        clone._original_blocks = graph["original_blocks"]
+        clone._original_workspaces = graph["original_workspaces"]
+        clone._dropout_threshold = self._dropout_threshold
+        clone._infeasible = set(self._infeasible)
+        clone.blocks = graph["blocks"]
+        clone.workspaces = graph["workspaces"]
+        clone.assignments = list(self.assignments)
+        clone.delay_days = list(self.delay_days)
+        clone.pending = set(self.pending)
+        clone.env_date = self.env_date
+        clone.current_block_index = self.current_block_index
+        clone._transition_results = graph["transition_results"]
+        return clone
 
     @property
     def is_done(self) -> bool:
