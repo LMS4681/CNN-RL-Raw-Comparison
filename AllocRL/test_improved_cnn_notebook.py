@@ -92,7 +92,7 @@ def test_notebook_requires_l4_and_sufficient_cpu_ram_and_drive():
 def test_notebook_uses_clean_immutable_checkout_and_preserves_torch():
     source = "\n".join(code_cells())
     assert "https://github.com/LMS4681/CNN-RL-Raw-Comparison.git" in source
-    assert "scale-aware-cnn-6h-v1" in source
+    assert "scale-aware-cnn-6h-v2" in source
     assert '"--depth", "1"' in source
     assert '"status", "--porcelain"' in source
     assert "requirements-comparison.txt" in source
@@ -175,4 +175,39 @@ def test_readme_documents_l4_and_new_pinned_notebook_url():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "GPU type: L4" in readme
     assert "six PPO hours" in readme
-    assert "scale-aware-cnn-6h-v1/notebooks/improved_cnn_6h.ipynb" in readme
+    assert "scale-aware-cnn-6h-v2/notebooks/improved_cnn_6h.ipynb" in readme
+
+
+def test_final_cell_is_standalone_read_only_resume_diagnostic():
+    final_cell = notebook()["cells"][-1]
+    source = "".join(final_cell["source"])
+
+    assert final_cell["cell_type"] == "code"
+    for term in (
+        'Path("/content/CNN-RL-Raw-Comparison")',
+        'Path("/content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0")',
+        "run_state.json",
+        "run_config.json",
+        "last_checkpoint_file",
+        "hashlib.sha256",
+        "zipfile.is_zipfile",
+        'ScaleAwareMaskablePPO.load(checkpoint_path, device="cpu")',
+        "model.num_timesteps",
+        "verify_pretraining_artifacts",
+        "progress_timing.csv",
+        "DIAGNOSTIC_STATUS",
+    ):
+        assert term in source
+
+    for forbidden in (
+        "subprocess.run",
+        "train.py",
+        "pretraining.train_encoder",
+        ".write_text(",
+        ".write_bytes(",
+        ".unlink(",
+        ".rename(",
+        ".replace(",
+        "shutil.rmtree",
+    ):
+        assert forbidden not in source
