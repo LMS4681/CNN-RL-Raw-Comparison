@@ -363,6 +363,30 @@ def test_live_log_helper_propagates_nonzero_exit(monkeypatch, tmp_path):
     assert captured.value.cmd is command
 
 
+def test_live_log_helper_repolls_before_reporting_running(
+    monkeypatch, tmp_path, capsys
+):
+    helpers = live_log_helpers()
+    process = FakeProcess(
+        [subprocess.TimeoutExpired(["python"], 30)],
+        poll_result=7,
+    )
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        helpers._run_training_with_live_logs(
+            ["python", "-u", "train.py"],
+            cwd=tmp_path,
+            env={"PYTHONUNBUFFERED": "1"},
+            state_path=tmp_path / "run_state.json",
+        )
+
+    output = capsys.readouterr().out
+    assert "process=running" not in output
+    assert "return_code=7" in output
+    assert process.wait_timeouts == [30]
+
+
 def test_live_log_helper_cleans_up_interrupted_child(monkeypatch, tmp_path):
     helpers = live_log_helpers()
     process = FakeProcess([
