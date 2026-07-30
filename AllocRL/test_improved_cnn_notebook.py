@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import signal
+import subprocess
+import types
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -59,6 +65,67 @@ def stage2_cell() -> str:
     ]
     assert len(matches) == 1
     return matches[0]
+
+
+def live_log_helpers() -> types.SimpleNamespace:
+    tree = ast.parse(stage2_cell())
+    selected = []
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            selected.append(node)
+        elif (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "PPO_LOG_INTERVAL_SECONDS"
+                for target in node.targets
+            )
+        ):
+            selected.append(node)
+        elif (
+            isinstance(node, ast.FunctionDef)
+            and node.name in {
+                "_durable_monitor_fields",
+                "_stop_training_process",
+                "_run_training_with_live_logs",
+            }
+        ):
+            selected.append(node)
+    namespace: dict = {}
+    module = ast.fix_missing_locations(
+        ast.Module(body=selected, type_ignores=[])
+    )
+    exec(compile(module, "<stage2-live-log-helpers>", "exec"), namespace)
+    return types.SimpleNamespace(**namespace)
+
+
+class FakeProcess:
+    def __init__(self, outcomes, *, poll_result=None):
+        self.outcomes = list(outcomes)
+        self.poll_result = poll_result
+        self.wait_timeouts = []
+        self.signals = []
+        self.terminated = False
+        self.killed = False
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def poll(self):
+        return self.poll_result
+
+    def send_signal(self, value):
+        self.signals.append(value)
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
 
 
 def test_frozen_six_hour_config_is_exact_and_self_hashable():
@@ -202,6 +269,7 @@ def test_stage2_cell_streams_logs_and_reports_durable_progress():
         "flush=True",
         "signal.SIGINT",
         "raise subprocess.CalledProcessError",
+        "_run_training_with_live_logs(",
     ):
         assert term in source
 
@@ -212,6 +280,124 @@ def test_stage2_cell_streams_logs_and_reports_durable_progress():
         "capture_output=True",
     ):
         assert forbidden not in source
+
+
+def test_stage2_command_and_resume_selection_match_v2_contract():
+    lines = stage2_cell().splitlines(keepends=True)
+    command = next(line for line in lines if line.startswith("ppo_command = "))
+    resume_start = next(
+        index for index, line in enumerate(lines)
+        if line.startswith('state_path = PPO_ROOT / "run_state.json"')
+    )
+    resume_end = next(
+        index for index, line in enumerate(lines)
+        if line.startswith("PPO_LOG_INTERVAL_SECONDS = ")
+    )
+    resume_source = "".join(lines[resume_start:resume_end])
+
+    assert hashlib.sha256(command.encode()).hexdigest() == (
+        "b0cd33f9c6618da5da96518df34ad50bb0263797b65d45137d785f442976df82"
+    )
+    assert hashlib.sha256(resume_source.encode()).hexdigest() == (
+        "9f284be6e10ac774be2b82eaa4525b26eff2d86505961649e38cc04531c920c4"
+    )
+
+
+def test_live_log_helper_inherits_streams_and_reports_durable_state(
+    monkeypatch, tmp_path, capsys
+):
+    helpers = live_log_helpers()
+    state_path = tmp_path / "run_state.json"
+    state_path.write_text(json.dumps({
+        "last_checkpoint_timestep": 12345,
+        "completed_training_seconds": 90.5,
+        "target_training_seconds": 21600,
+        "last_checkpoint_file": "checkpoint.zip",
+        "updated_at_utc": "2026-07-30T00:00:00Z",
+    }), encoding="utf-8")
+    process = FakeProcess([
+        subprocess.TimeoutExpired(["python"], 30),
+        0,
+    ])
+    observed = {}
+
+    def fake_popen(command, **kwargs):
+        observed["command"] = command
+        observed["kwargs"] = kwargs
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    command = ["python", "-u", "train.py"]
+    helpers._run_training_with_live_logs(
+        command,
+        cwd=tmp_path,
+        env={"PYTHONUNBUFFERED": "1"},
+        state_path=state_path,
+    )
+
+    output = capsys.readouterr().out
+    assert "durable_timestep=12345" in output
+    assert "recorded_training_seconds=90.5" in output
+    assert "return_code=0" in output
+    assert observed["command"] is command
+    assert observed["kwargs"]["stdout"] is None
+    assert observed["kwargs"]["stderr"] is None
+    assert process.wait_timeouts == [30, 30]
+
+
+def test_live_log_helper_propagates_nonzero_exit(monkeypatch, tmp_path):
+    helpers = live_log_helpers()
+    process = FakeProcess([7])
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+    command = ["python", "-u", "train.py"]
+
+    with pytest.raises(subprocess.CalledProcessError) as captured:
+        helpers._run_training_with_live_logs(
+            command,
+            cwd=tmp_path,
+            env={"PYTHONUNBUFFERED": "1"},
+            state_path=tmp_path / "run_state.json",
+        )
+
+    assert captured.value.returncode == 7
+    assert captured.value.cmd is command
+
+
+def test_live_log_helper_cleans_up_interrupted_child(monkeypatch, tmp_path):
+    helpers = live_log_helpers()
+    process = FakeProcess([
+        KeyboardInterrupt(),
+        subprocess.TimeoutExpired(["python"], 30),
+        subprocess.TimeoutExpired(["python"], 10),
+        -9,
+    ])
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+
+    with pytest.raises(KeyboardInterrupt):
+        helpers._run_training_with_live_logs(
+            ["python", "-u", "train.py"],
+            cwd=tmp_path,
+            env={"PYTHONUNBUFFERED": "1"},
+            state_path=tmp_path / "run_state.json",
+        )
+
+    assert process.signals == [signal.SIGINT]
+    assert process.terminated
+    assert process.killed
+    assert process.wait_timeouts == [30, 30, 10, None]
+
+
+def test_durable_monitor_tolerates_missing_and_malformed_state(tmp_path):
+    helpers = live_log_helpers()
+    state_path = tmp_path / "run_state.json"
+    assert helpers._durable_monitor_fields(state_path) == [
+        "durable_state=pending"
+    ]
+
+    state_path.write_text("{", encoding="utf-8")
+    fields = helpers._durable_monitor_fields(state_path)
+    assert len(fields) == 1
+    assert fields[0].startswith("durable_state=read_error:")
 
 
 def test_final_cell_is_standalone_read_only_resume_diagnostic():
