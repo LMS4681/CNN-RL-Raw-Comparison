@@ -73,4 +73,3 @@ Automated tests must verify that:
   progress checks are present;
 - forbidden write, delete, repair, and training operations are absent;
 - the notebook and README use the V2 immutable release URL.
-

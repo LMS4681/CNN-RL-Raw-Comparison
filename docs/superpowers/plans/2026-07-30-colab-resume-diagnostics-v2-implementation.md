@@ -153,7 +153,7 @@ git commit -m "fix: add Colab resume diagnostics"
 - [ ] **Step 1: Run regression checks**
 
 ```powershell
-py -3.12 -m pytest -q AllocRL/test_improved_cnn_notebook.py AllocRL/test_pretraining.py
+py -3.12 -m pytest -q AllocRL/test_improved_cnn_notebook.py AllocRL/test_pretraining_targets.py AllocRL/test_pretraining_dataset.py AllocRL/test_encoder_pretraining.py AllocRL/test_pretrained_ppo.py
 git diff --check origin/main...HEAD
 git status --short
 ```
@@ -184,4 +184,3 @@ git push origin scale-aware-cnn-6h-v2
 Confirm that `refs/heads/main` and `refs/tags/scale-aware-cnn-6h-v2^{}` point
 to the implementation commit, while `scale-aware-cnn-6h-v1` still points to
 its original commit.
-
