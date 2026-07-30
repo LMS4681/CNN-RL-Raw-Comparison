@@ -52,6 +52,15 @@ def code_cells() -> list[str]:
     ]
 
 
+def stage2_cell() -> str:
+    matches = [
+        source for source in code_cells()
+        if "ppo_command = [" in source
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
 def test_frozen_six_hour_config_is_exact_and_self_hashable():
     assert json.loads(CONFIG_PATH.read_text(encoding="utf-8")) == EXPECTED_CONFIG
     assert len(hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest()) == 64
@@ -92,7 +101,7 @@ def test_notebook_requires_l4_and_sufficient_cpu_ram_and_drive():
 def test_notebook_uses_clean_immutable_checkout_and_preserves_torch():
     source = "\n".join(code_cells())
     assert "https://github.com/LMS4681/CNN-RL-Raw-Comparison.git" in source
-    assert "scale-aware-cnn-6h-v2" in source
+    assert "scale-aware-cnn-6h-v3" in source
     assert '"--depth", "1"' in source
     assert '"status", "--porcelain"' in source
     assert "requirements-comparison.txt" in source
@@ -175,7 +184,34 @@ def test_readme_documents_l4_and_new_pinned_notebook_url():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "GPU type: L4" in readme
     assert "six PPO hours" in readme
-    assert "scale-aware-cnn-6h-v2/notebooks/improved_cnn_6h.ipynb" in readme
+    assert "scale-aware-cnn-6h-v3/notebooks/improved_cnn_6h.ipynb" in readme
+
+
+def test_stage2_cell_streams_logs_and_reports_durable_progress():
+    source = stage2_cell()
+
+    for term in (
+        "PPO_LOG_INTERVAL_SECONDS = 30",
+        "subprocess.Popen(",
+        "stdout=None",
+        "stderr=None",
+        ".wait(timeout=PPO_LOG_INTERVAL_SECONDS)",
+        "except subprocess.TimeoutExpired:",
+        "run_state.json",
+        "durable_timestep",
+        "flush=True",
+        "signal.SIGINT",
+        "raise subprocess.CalledProcessError",
+    ):
+        assert term in source
+
+    for forbidden in (
+        "subprocess.run(command_to_run",
+        "stdout=subprocess.PIPE",
+        "stderr=subprocess.PIPE",
+        "capture_output=True",
+    ):
+        assert forbidden not in source
 
 
 def test_final_cell_is_standalone_read_only_resume_diagnostic():
@@ -183,6 +219,7 @@ def test_final_cell_is_standalone_read_only_resume_diagnostic():
     source = "".join(final_cell["source"])
 
     assert final_cell["cell_type"] == "code"
+    assert "=== PPO RESUME DIAGNOSTIC V3 ===" in source
     for term in (
         'Path("/content/CNN-RL-Raw-Comparison")',
         'Path("/content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0")',
