@@ -24,7 +24,7 @@ The durable artifact root contains `manifest.json`, `environment.json`,
 
 ## Scale-aware CNN two-stage run
 
-[![Open improved CNN in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/scale-aware-cnn-6h-v3/notebooks/improved_cnn_6h.ipynb)
+[![Open improved CNN in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/scale-aware-cnn-6h-v4/notebooks/improved_cnn_6h.ipynb)
 
 For the new candidate model, select `Runtime -> Change runtime type -> GPU ->
 GPU type: L4` and run `notebooks/improved_cnn_6h.ipynb`. The notebook first
@@ -36,6 +36,7 @@ six-hour PPO budget. Rerunning all restores verified dataset shards,
 The durable root is
 `/content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0`; Stage 1 uses
 its `pretraining/` child and PPO uses its separate `ppo/` child. The pinned
-`scale-aware-cnn-6h-v3` notebook streams native PPO output and prints durable
+`scale-aware-cnn-6h-v4` notebook relays native PPO stdout and stderr into the
+cell, preserves the final child-output tail on failure, and prints durable
 checkpoint progress every 30 seconds. It ends with a standalone, read-only
-resume diagnostic cell. The V1 and V2 tags remain immutable.
+resume diagnostic cell. The V1 through V3 tags remain immutable.

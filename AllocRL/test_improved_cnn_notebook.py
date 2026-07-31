@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import json
 import signal
 import subprocess
@@ -77,7 +78,10 @@ def live_log_helpers() -> types.SimpleNamespace:
             isinstance(node, ast.Assign)
             and any(
                 isinstance(target, ast.Name)
-                and target.id == "PPO_LOG_INTERVAL_SECONDS"
+                and target.id in {
+                    "PPO_LOG_INTERVAL_SECONDS",
+                    "CHILD_OUTPUT_TAIL_LINES",
+                }
                 for target in node.targets
             )
         ):
@@ -86,6 +90,7 @@ def live_log_helpers() -> types.SimpleNamespace:
             isinstance(node, ast.FunctionDef)
             and node.name in {
                 "_durable_monitor_fields",
+                "_stream_child_output",
                 "_stop_training_process",
                 "_run_training_with_live_logs",
             }
@@ -100,9 +105,10 @@ def live_log_helpers() -> types.SimpleNamespace:
 
 
 class FakeProcess:
-    def __init__(self, outcomes, *, poll_result=None):
+    def __init__(self, outcomes, *, poll_result=None, stdout_text=""):
         self.outcomes = list(outcomes)
         self.poll_result = poll_result
+        self.stdout = io.StringIO(stdout_text)
         self.wait_timeouts = []
         self.signals = []
         self.terminated = False
@@ -168,7 +174,7 @@ def test_notebook_requires_l4_and_sufficient_cpu_ram_and_drive():
 def test_notebook_uses_clean_immutable_checkout_and_preserves_torch():
     source = "\n".join(code_cells())
     assert "https://github.com/LMS4681/CNN-RL-Raw-Comparison.git" in source
-    assert "scale-aware-cnn-6h-v3" in source
+    assert "scale-aware-cnn-6h-v4" in source
     assert '"--depth", "1"' in source
     assert '"status", "--porcelain"' in source
     assert "requirements-comparison.txt" in source
@@ -251,7 +257,7 @@ def test_readme_documents_l4_and_new_pinned_notebook_url():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "GPU type: L4" in readme
     assert "six PPO hours" in readme
-    assert "scale-aware-cnn-6h-v3/notebooks/improved_cnn_6h.ipynb" in readme
+    assert "scale-aware-cnn-6h-v4/notebooks/improved_cnn_6h.ipynb" in readme
 
 
 def test_stage2_cell_streams_logs_and_reports_durable_progress():
@@ -260,8 +266,12 @@ def test_stage2_cell_streams_logs_and_reports_durable_progress():
     for term in (
         "PPO_LOG_INTERVAL_SECONDS = 30",
         "subprocess.Popen(",
-        "stdout=None",
-        "stderr=None",
+        "stdout=subprocess.PIPE",
+        "stderr=subprocess.STDOUT",
+        "text=True",
+        "bufsize=1",
+        "threading.Thread",
+        "_stream_child_output",
         ".wait(timeout=PPO_LOG_INTERVAL_SECONDS)",
         "except subprocess.TimeoutExpired:",
         "run_state.json",
@@ -275,8 +285,8 @@ def test_stage2_cell_streams_logs_and_reports_durable_progress():
 
     for forbidden in (
         "subprocess.run(command_to_run",
-        "stdout=subprocess.PIPE",
-        "stderr=subprocess.PIPE",
+        "stdout=None",
+        "stderr=None",
         "capture_output=True",
     ):
         assert forbidden not in source
@@ -315,10 +325,10 @@ def test_live_log_helper_inherits_streams_and_reports_durable_state(
         "last_checkpoint_file": "checkpoint.zip",
         "updated_at_utc": "2026-07-30T00:00:00Z",
     }), encoding="utf-8")
-    process = FakeProcess([
-        subprocess.TimeoutExpired(["python"], 30),
-        0,
-    ])
+    process = FakeProcess(
+        [subprocess.TimeoutExpired(["python"], 30), 0],
+        stdout_text="native progress line\nnative traceback line\n",
+    )
     observed = {}
 
     def fake_popen(command, **kwargs):
@@ -336,18 +346,25 @@ def test_live_log_helper_inherits_streams_and_reports_durable_state(
     )
 
     output = capsys.readouterr().out
+    assert "native progress line" in output
+    assert "native traceback line" in output
     assert "durable_timestep=12345" in output
     assert "recorded_training_seconds=90.5" in output
     assert "return_code=0" in output
     assert observed["command"] is command
-    assert observed["kwargs"]["stdout"] is None
-    assert observed["kwargs"]["stderr"] is None
+    assert observed["kwargs"]["stdout"] is subprocess.PIPE
+    assert observed["kwargs"]["stderr"] is subprocess.STDOUT
+    assert observed["kwargs"]["text"] is True
+    assert observed["kwargs"]["bufsize"] == 1
+    assert process.stdout.closed
     assert process.wait_timeouts == [30, 30]
 
 
-def test_live_log_helper_propagates_nonzero_exit(monkeypatch, tmp_path):
+def test_live_log_helper_preserves_output_tail_on_nonzero_exit(
+    monkeypatch, tmp_path, capsys
+):
     helpers = live_log_helpers()
-    process = FakeProcess([7])
+    process = FakeProcess([7], stdout_text="actual child failure\n")
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
     command = ["python", "-u", "train.py"]
 
@@ -361,6 +378,8 @@ def test_live_log_helper_propagates_nonzero_exit(monkeypatch, tmp_path):
 
     assert captured.value.returncode == 7
     assert captured.value.cmd is command
+    assert captured.value.output == "actual child failure\n"
+    assert "actual child failure" in capsys.readouterr().out
 
 
 def test_live_log_helper_repolls_before_reporting_running(
@@ -429,7 +448,7 @@ def test_final_cell_is_standalone_read_only_resume_diagnostic():
     source = "".join(final_cell["source"])
 
     assert final_cell["cell_type"] == "code"
-    assert "=== PPO RESUME DIAGNOSTIC V3 ===" in source
+    assert "=== PPO RESUME DIAGNOSTIC V4 ===" in source
     for term in (
         'Path("/content/CNN-RL-Raw-Comparison")',
         'Path("/content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0")',
