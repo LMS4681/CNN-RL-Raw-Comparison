@@ -174,7 +174,7 @@ def test_notebook_requires_l4_and_sufficient_cpu_ram_and_drive():
 def test_notebook_uses_clean_immutable_checkout_and_preserves_torch():
     source = "\n".join(code_cells())
     assert "https://github.com/LMS4681/CNN-RL-Raw-Comparison.git" in source
-    assert "scale-aware-cnn-6h-v4" in source
+    assert "scale-aware-cnn-6h-v5" in source
     assert '"--depth", "1"' in source
     assert '"status", "--porcelain"' in source
     assert "requirements-comparison.txt" in source
@@ -186,6 +186,7 @@ def test_notebook_uses_clean_immutable_checkout_and_preserves_torch():
 def test_notebook_verifies_inputs_and_durable_stage1_artifacts():
     source = "\n".join(code_cells())
     for value in (
+        "cd4e14fc1725a4ff159e59d6874d3602f3b65a06",
         "913cac9046dec8164ef65da60275522f7127de5ea775b1c5a6b6aac255716271",
         "601bd6143ed8890577e5ff34921241d36fd6a0e99c4bdab4e26152ab168178f8",
         "37634576e34043d169cf24bfc0cc2261818dc65b9358d4b9b2e46ab614d0bdda",
@@ -257,7 +258,7 @@ def test_readme_documents_l4_and_new_pinned_notebook_url():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "GPU type: L4" in readme
     assert "six PPO hours" in readme
-    assert "scale-aware-cnn-6h-v4/notebooks/improved_cnn_6h.ipynb" in readme
+    assert "scale-aware-cnn-6h-v5/notebooks/improved_cnn_6h.ipynb" in readme
 
 
 def test_stage2_cell_streams_logs_and_reports_durable_progress():
@@ -292,9 +293,19 @@ def test_stage2_cell_streams_logs_and_reports_durable_progress():
         assert forbidden not in source
 
 
-def test_stage2_command_and_resume_selection_match_v2_contract():
+def test_stage2_command_includes_complete_immutable_provenance():
+    source = stage2_cell()
+    for term in (
+        '"--comparison-baseline-sha256", PPO_BASELINE_SHA',
+        '"--comparison-scenario-sha256", PPO_SCENARIO_SHA256',
+        '"--comparison-split-sha256", PPO_SPLIT_SHA256',
+        '"--comparison-lock-sha256", PPO_LOCK_SHA256',
+    ):
+        assert term in source
+
+
+def test_stage2_resume_selection_matches_v2_contract():
     lines = stage2_cell().splitlines(keepends=True)
-    command = next(line for line in lines if line.startswith("ppo_command = "))
     resume_start = next(
         index for index, line in enumerate(lines)
         if line.startswith('state_path = PPO_ROOT / "run_state.json"')
@@ -305,9 +316,6 @@ def test_stage2_command_and_resume_selection_match_v2_contract():
     )
     resume_source = "".join(lines[resume_start:resume_end])
 
-    assert hashlib.sha256(command.encode()).hexdigest() == (
-        "b0cd33f9c6618da5da96518df34ad50bb0263797b65d45137d785f442976df82"
-    )
     assert hashlib.sha256(resume_source.encode()).hexdigest() == (
         "9f284be6e10ac774be2b82eaa4525b26eff2d86505961649e38cc04531c920c4"
     )
@@ -448,7 +456,7 @@ def test_final_cell_is_standalone_read_only_resume_diagnostic():
     source = "".join(final_cell["source"])
 
     assert final_cell["cell_type"] == "code"
-    assert "=== PPO RESUME DIAGNOSTIC V4 ===" in source
+    assert "=== PPO RESUME DIAGNOSTIC V5 ===" in source
     for term in (
         'Path("/content/CNN-RL-Raw-Comparison")',
         'Path("/content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0")',
