@@ -286,6 +286,60 @@ def test_schema3_loader_remains_maskable_ppo():
     }) is MaskablePPO
 
 
+def test_timestep_reader_uses_recorded_scale_aware_model_class(tmp_path):
+    from train import model_num_timesteps, write_run_config
+
+    model = make_model()
+    archive = tmp_path / "checkpoints" / "model_10000_g1.sb3"
+    try:
+        model.num_timesteps = 10_000
+        archive.parent.mkdir(parents=True)
+        model.save(archive)
+        write_run_config(tmp_path, {
+            "observation_schema_version": 4,
+            "extractor": "candidate-cnn",
+            "model_class": "ScaleAwareMaskablePPO",
+        })
+
+        assert model_num_timesteps(archive) == 10_000
+    finally:
+        environment = model.get_env()
+        if environment is not None:
+            environment.close()
+
+
+def test_wall_clock_callback_persists_scale_aware_checkpoint(tmp_path):
+    from comparison.wall_clock_callback import WallClockBudgetCallback
+    from train import model_num_timesteps, write_run_config
+
+    model = make_model()
+    try:
+        model.num_timesteps = 10_000
+        write_run_config(tmp_path, {
+            "observation_schema_version": 4,
+            "extractor": "candidate-cnn",
+            "model_class": "ScaleAwareMaskablePPO",
+        })
+        callback = WallClockBudgetCallback(
+            tmp_path,
+            target_seconds=21_600,
+            checkpoint_freq=10_000,
+            heartbeat_seconds=300,
+            config_sha256="a" * 64,
+        )
+        callback.model = model
+
+        state = callback.persist_checkpoint(status="running")
+        checkpoint = tmp_path / "checkpoints" / state.last_checkpoint_file
+
+        assert state.last_checkpoint_timestep == 10_000
+        assert model_num_timesteps(checkpoint) == 10_000
+    finally:
+        environment = model.get_env()
+        if environment is not None:
+            environment.close()
+
+
 def test_checkpoint_evaluator_selects_loader_from_run_config(
     tmp_path, monkeypatch
 ):

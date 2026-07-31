@@ -200,6 +200,21 @@ def save_real_model(path: Path, timesteps: int) -> Path:
     return path
 
 
+def save_real_candidate_model(path: Path, timesteps: int) -> Path:
+    from test_pretrained_ppo import make_model
+
+    model = make_model()
+    try:
+        model.num_timesteps = timesteps
+        path.parent.mkdir(parents=True, exist_ok=True)
+        model.save(path)
+    finally:
+        env = model.get_env()
+        if env is not None:
+            env.close()
+    return path
+
+
 def write_wall_clock_state(
     output_dir: Path,
     checkpoint: Path,
@@ -680,7 +695,7 @@ def test_model_num_timesteps_does_not_swallow_unexpected_loader_errors(
 
 def test_wall_clock_resume_accepts_only_state_named_verified_archive(tmp_path):
     output_dir = tmp_path / "output"
-    checkpoint = save_real_model(
+    checkpoint = save_real_candidate_model(
         output_dir / "checkpoints" / "model_100_g1.sb3", 100
     )
     write_wall_clock_state(output_dir, checkpoint, timestep=100)
@@ -695,10 +710,10 @@ def test_wall_clock_resume_accepts_only_state_named_verified_archive(tmp_path):
 
 def test_wall_clock_resume_rejects_archive_not_named_by_state(tmp_path):
     output_dir = tmp_path / "output"
-    named = save_real_model(
+    named = save_real_candidate_model(
         output_dir / "checkpoints" / "model_100_g1.sb3", 100
     )
-    other = save_real_model(
+    other = save_real_candidate_model(
         output_dir / "checkpoints" / "model_100_g2.sb3", 100
     )
     write_wall_clock_state(output_dir, named, timestep=100)
@@ -712,7 +727,7 @@ def test_wall_clock_resume_rejects_archive_not_named_by_state(tmp_path):
 
 def test_wall_clock_resume_rejects_checkpoint_hash_mismatch(tmp_path):
     output_dir = tmp_path / "output"
-    checkpoint = save_real_model(
+    checkpoint = save_real_candidate_model(
         output_dir / "checkpoints" / "model_100_g1.sb3", 100
     )
     write_wall_clock_state(output_dir, checkpoint, timestep=100)
@@ -727,7 +742,7 @@ def test_wall_clock_resume_rejects_checkpoint_hash_mismatch(tmp_path):
 
 def test_wall_clock_resume_rejects_stored_timestep_mismatch(tmp_path):
     output_dir = tmp_path / "output"
-    checkpoint = save_real_model(
+    checkpoint = save_real_candidate_model(
         output_dir / "checkpoints" / "model_100_g1.sb3", 100
     )
     write_wall_clock_state(output_dir, checkpoint, timestep=99)
@@ -741,7 +756,7 @@ def test_wall_clock_resume_rejects_stored_timestep_mismatch(tmp_path):
 
 def test_wall_clock_auto_resume_uses_only_state_named_checkpoint(tmp_path):
     output_dir = tmp_path / "output"
-    checkpoint = save_real_model(
+    checkpoint = save_real_candidate_model(
         output_dir / "checkpoints" / "model_100_g1.sb3", 100
     )
     write_wall_clock_state(output_dir, checkpoint, timestep=100)
@@ -766,7 +781,7 @@ def test_wall_clock_auto_resume_without_state_starts_new_run(tmp_path):
 
 def test_wall_clock_state_requires_explicit_exact_resume_archive(tmp_path):
     output_dir = tmp_path / "output"
-    checkpoint = save_real_model(
+    checkpoint = save_real_candidate_model(
         output_dir / "checkpoints" / "model_100_g1.sb3", 100
     )
     write_wall_clock_state(output_dir, checkpoint, timestep=100)

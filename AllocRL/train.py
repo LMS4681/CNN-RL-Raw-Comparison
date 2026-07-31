@@ -962,12 +962,26 @@ def resolve_model_archive_path(path: str | Path) -> Path:
     raise FileNotFoundError(f"Saved model not found. Searched: {searched}")
 
 
+def _archive_loader_for_timestep_reader(path: str | Path):
+    """Select the saved model class, retaining legacy archive compatibility."""
+    try:
+        run_config = load_model_run_config(path)
+    except FileNotFoundError:
+        return MaskablePPO.load
+
+    from evaluation_runner import model_class_from_run_config
+
+    return model_class_from_run_config(run_config).load
+
+
 def model_num_timesteps(
     path: Path,
-    loader=MaskablePPO.load,
+    loader=None,
 ) -> int | None:
     """Read a training archive's stored timestep without attaching an env."""
     try:
+        if loader is None:
+            loader = _archive_loader_for_timestep_reader(path)
         model = loader(str(path), device="cpu")
         value = getattr(model, "num_timesteps", None)
         return int(value) if value is not None else None
@@ -991,7 +1005,7 @@ def model_num_timesteps(
 
 def find_resumable_model(
     output_dir,
-    loader=MaskablePPO.load,
+    loader=None,
 ) -> Path | None:
     """Select the readable training state with the greatest stored timestep."""
     root = Path(output_dir)
