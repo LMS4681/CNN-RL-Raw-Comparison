@@ -1,6 +1,6 @@
 # Raw observation vs CNN comparison: code and experiment handoff
 
-Updated: 2026-08-03 15:40 (Asia/Seoul)
+Updated: 2026-08-03 17:20 (Asia/Seoul)
 
 ## 2026-07-22 scale-aware two-stage CNN release
 
@@ -466,6 +466,131 @@ evaluation.
    observation schema 4 and break checkpoint compatibility.
 5. Dropout-focused investigation, since dropouts carry 78 per cent of the
    remaining score loss and PPO did not reduce them after 200k.
+
+## 2026-08-03 next-PC handoff
+
+Everything below is what a fresh assistant on another machine needs. The
+conversation that produced it does not travel between machines; this section
+does.
+
+### Repository state
+
+`main` is at `2c7a5c1`, pushed, with a clean working tree. Tags in play:
+
+```text
+scale-aware-cnn-6h-v7   candidate-CNN arm, complete, 833368 timesteps
+raw-direct-830k-v1      raw-direct arm, STOPS AT 830000 STEPS - this is the arm being run
+raw-direct-6h-v1        wall-clock variant of the same arm, not being run
+```
+
+The sibling repository `CNN-RL` (upstream baseline, commit
+`cd4e14fc1725a4ff159e59d6874d3602f3b65a06`) is unchanged and is referenced only
+as `--comparison-baseline-sha256`.
+
+### What is running right now
+
+The raw-direct arm trains in Colab from
+`https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/raw-direct-830k-v1/notebooks/raw_direct_830k.ipynb`
+into Drive at `MyDrive/CNN-RL-improved/raw-direct-830k-seed0/ppo`. It had
+40,000 timesteps when last observed and measured 44.4 steps per second. The
+notebook launches only `830000 - done` each session, so any number of
+interrupted sessions converges on 830,000. Roughly five hours remain.
+
+The completed candidate-CNN arm lives at
+`MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0` with `pretraining/` and
+`ppo/` children.
+
+### Completed run: measured numbers
+
+```text
+final_timestep 833368     recorded_training_seconds 21603.5     restarts 2
+steps_per_second 38.58    parameters 910123 (extractor 868192)
+final model, original CSV: terminal_score 0.3146, dropout_rate 0.1763,
+                           delayed 85, retained_choice 0.9820
+holdout best pick: 600000 with (0.2613, 0.1650, 1.0500)
+```
+
+Training-side score improved monotonically to the end (0.36 to 0.41 over the
+last 300k steps), so the budget stopped the run mid-learning. At 800k and later
+the per-episode decomposition is compliant +0.754, delay -0.081, dropout
+-0.280: dropouts carry 78 per cent of the remaining loss, and their count stayed
+flat at 128 to 135 from 200k onward while delayed count halved from 196 to 97.
+
+Holdout selection is noise-dominated. `FixedHoldoutEvalCallback` slices
+`scenarios[:selection_count]` and the run passed 5, so every holdout point
+averaged five of the twenty scenarios. The eleven evaluations after 300k have
+mean -0.02 and standard deviation 0.16, and 600k sits about 1.7 sigma above
+that mean. Never rank arms by `best_model.sb3`.
+
+A published chart of both curves is at
+`https://claude.ai/code/artifact/d21e3442-3332-4412-9192-7567ba2ebb75`.
+
+### Immediate next task: the comparison script
+
+Not yet written. The design is settled; do not rebuild what already exists.
+
+`comparison/checkpoint_evaluator.py` already provides
+`readable_checkpoint_inventory`, `select_common_timestep`, and
+`evaluate_checkpoint`, and it defines `SELECTION_SEEDS` (1000-1004) and
+`PRIMARY_TEST_SEEDS` (1005-1019). Those three functions read only the
+checkpoint archives and the `run_config.json` beside them, so they work for the
+step-bounded arm, which has no receipts.
+
+The script should: select the largest common regular checkpoint between the two
+Drive roots, expected 830,000; evaluate each arm there on all twenty fixed
+scenarios; report paired per-seed differences over the fifteen primary-test
+seeds as the headline, with the five selection seeds as a secondary view; and
+give an interval rather than a p-value, since `scipy` is not in the lock file
+and n is 15. A seeded percentile bootstrap over the paired differences is
+enough. Also overlay the two `training_log.csv` curves: episodes are paired by
+construction, because both arms use seed 0, eight environments, and a fixed
+913-decision episode, so the same block sequence appears at the same step.
+
+The marker-validated staged pipeline (`evaluate_arm_artifacts`,
+`validate_arm_evaluation_stage`, `report_builder.write_complete_report`) is
+unavailable for the step-bounded arm and must not be forced. `experiment_runner`
+trains both arms from scratch with a candidate CNN that has no Stage 1
+pretraining, which is a different experiment from v7; do not run it.
+
+The report must state that Stage 1 supervised pretraining sits outside the
+matched PPO budget, and that the comparison is step-for-step only because
+equal-wall-clock efficiency was explicitly out of scope.
+
+### Deferred backlog, in priority order
+
+1. Profile and speed up the environment step. `_get_obs` calls
+   `determine_placement_position` for all ten workspaces every step. GPU and RAM
+   sat near 10 per cent during training, so the environment is the constraint.
+2. `n_steps` 120 to 240-360 and `n_epochs` 5 to 3-4, or add `target_kl`. One
+   913-step episode is split across eight rollouts under `gamma=1.0`. One
+   observation is 640 KB (`grids` is 10x4x64x64 float32) and the rollout buffer
+   is about 614 MB at `n_steps=120`, so the RAM headroom pays for this now.
+   Shrinking the grid dtype would cut cost fourfold but changes observation
+   schema 4 and breaks checkpoint compatibility, so it belongs to a new
+   generation.
+3. Refresh the Stage 1 dataset from a mid-training policy; it is currently
+   collected only by random-valid and greedy-area policies.
+4. Attack dropouts, per the decomposition above.
+5. Raise `--holdout-selection-count` to 20 in future runs. The code currently
+   rejects any value but 5, so that is a code change too.
+
+Do not apply any of these before the raw-direct arm finishes: they would
+invalidate the comparison.
+
+### Local environment notes
+
+Tests run with `py -3 -m pytest <file> -q` from `AllocRL`. Notebook contract
+tests are `test_improved_cnn_notebook.py`, `test_raw_direct_830k_notebook.py`,
+and `test_raw_direct_notebook.py`; 38 pass.
+
+Two traps cost time on this machine:
+
+- `test_pretrained_ppo.py::test_release_rehearsal_uses_eight_subprocess_envs_and_resumes_twice`
+  deadlocks on Windows. Worker CPU time stops advancing and never recovers.
+  Every other test in that file passes. Skip it here and rely on Colab.
+- Pinned SHA-256 values in notebooks are of the LF content that Colab checks
+  out. This checkout is CRLF, so hashing the working copy gives the wrong value.
+  Compute them from the index instead: `git show :<path> | sha256sum`.
 
 The Stage 1 acceptance gate requires all finite metrics, held-out improvement
 over scalar-only/constant baselines, shuffled-grid degradation, and a
