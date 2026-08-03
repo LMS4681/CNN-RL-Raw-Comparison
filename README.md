@@ -45,3 +45,18 @@ resyncs the local dataset copy whenever the Drive copy is more advanced, and
 discards the rows a resume rolled back from `training_log.csv` and
 `loss_log.csv` so the completion receipt stays reachable. The V1 through V6
 tags remain immutable.
+
+## Raw-direct comparison arm
+
+[![Open raw-direct arm in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/raw-direct-830k-v1/notebooks/raw_direct_830k.ipynb)
+
+`notebooks/raw_direct_830k.ipynb` trains the comparison arm that feeds
+observations straight to the policy with no learned extractor
+(`--extractor raw-direct`). It stops on a timestep ceiling of **830,000** PPO
+steps rather than a wall clock, which matches the scale-aware run's 833,368
+final timestep to within one checkpoint interval, and it trains only the
+remaining budget on every resume. Because no wall-clock budget is set, this arm
+writes no completion receipt; `arm_timing.json` records its throughput instead.
+Stage 1 supervised pretraining is not part of this arm and is excluded from the
+matched budget. The design is in
+`docs/superpowers/specs/2026-08-03-raw-direct-830k-comparison-design.md`.
