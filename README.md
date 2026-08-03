@@ -48,17 +48,25 @@ tags remain immutable.
 
 ## Raw-direct comparison arm
 
-[![Open raw-direct arm in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/raw-direct-6h-v1/notebooks/raw_direct_6h.ipynb)
+[![Open raw-direct arm in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/raw-direct-830k-v1/notebooks/raw_direct_830k.ipynb)
 
-`notebooks/raw_direct_6h.ipynb` trains the comparison arm that feeds
+`notebooks/raw_direct_830k.ipynb` trains the comparison arm that feeds
 observations straight to the policy with no learned extractor
-(`--extractor raw-direct`) and no Stage 1 pretraining. It runs the same
-six-hour PPO wall-clock budget as `scale-aware-cnn-6h-v7`, pins its own
-`configs/raw_direct_6h_seed0.json`, and keeps that notebook's verified resume
-selection, durable monitor, and curve-log hygiene. Every other hyperparameter
-matches the scale-aware arm, so the extractor is the only changed variable.
+(`--extractor raw-direct`) and no Stage 1 pretraining. Every other
+hyperparameter matches `configs/improved_cnn_6h_seed0.json`, so the extractor
+is the only changed variable.
 
-Because both arms record regular checkpoints on exact 10,000-step boundaries,
+The arm stops on a timestep ceiling of **830,000** PPO steps rather than a wall
+clock, matching the scale-aware run's 833,368 final timestep to within one
+checkpoint interval, and it trains only the remaining budget on every resume.
+The comparison is step-for-step only; equal-wall-clock efficiency is
+deliberately out of scope. Because no wall-clock budget is set, this arm writes
+no `run_state.json`, `progress_timing.csv`, `runtime_metrics.json`, or
+`training_completion.json`; `arm_timing.json` records its throughput instead,
+and the marker-validated staged pipeline in `comparison/experiment_runner.py`
+does not apply to it.
+
+Both arms still record regular checkpoints on exact 10,000-step boundaries, so
 they are compared at their **largest common regular checkpoint**
 (`comparison.checkpoint_evaluator.select_common_timestep`), evaluated on the
 twenty fixed holdout scenarios, and reported as paired per-seed differences
@@ -67,6 +75,6 @@ supervised pretraining is outside the matched PPO budget and the report must
 say so. The design is in
 `docs/superpowers/specs/2026-08-03-raw-direct-830k-comparison-design.md`.
 
-The earlier `raw-direct-830k-v1` tag remains immutable. It stopped on a
-timestep ceiling instead of a wall clock, which produced no completion receipt
-and so could not feed the staged comparison pipeline.
+[`raw-direct-6h-v1/notebooks/raw_direct_6h.ipynb`](https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/raw-direct-6h-v1/notebooks/raw_direct_6h.ipynb)
+holds the wall-clock variant of the same arm, kept for the case where receipts
+and the staged pipeline are wanted; it is not the arm being run.
