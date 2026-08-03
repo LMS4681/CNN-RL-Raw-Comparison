@@ -1,6 +1,6 @@
 # Raw observation vs CNN comparison: code and experiment handoff
 
-Updated: 2026-07-22 10:40 (Asia/Seoul)
+Updated: 2026-08-03 15:40 (Asia/Seoul)
 
 ## 2026-07-22 scale-aware two-stage CNN release
 
@@ -383,6 +383,89 @@ success, dropout, and delay under a deterministic future-optionality teacher.
 These replay values are teacher-relative diagnostics, not globally optimal
 placement labels. Target generation must run only on isolated simulator clones
 and must never mutate the production episode.
+
+## 2026-08-03 v7 release, measured six-hour outcome, and next work
+
+`scale-aware-cnn-6h-v7` (commit `85b3175`) is released and immutable. It fixes
+the two failures that surfaced while running v6:
+
+1. Resumed runs appended to `training_log.csv` and `loss_log.csv` after the
+   model restarted from an earlier checkpoint, so `timestep` regressed and
+   `write_training_completion` refused the receipt after the wall-clock budget
+   had already been spent. `prune_rolled_back_rows` now discards exactly the
+   rolled-back rows before either log is reopened for append; retained records
+   keep their original bytes and the rewritten log is validated before it
+   replaces the original.
+2. The notebook only copied the Drive dataset when the local directory did not
+   exist, while itself creating that directory, so a rerun in the same runtime
+   silently restarted shard generation at index 0. The dataset cell now ranks
+   both copies and resyncs from Drive whenever Drive is more advanced.
+
+### Measured outcome of the completed six-hour candidate-CNN run
+
+```text
+final_timestep                833368        checkpoint model_833368_g85.sb3
+recorded_training_seconds     21603.5       target 21600, overrun 3.5
+restart_count                 2             generation 85
+steps_per_second              38.58         run_wall_span 271394 s
+parameters                    910123        extractor 868192
+final-model original CSV      terminal_score 0.3146, dropout 0.1763,
+                              delayed 85, retained_choice 0.9820
+```
+
+Training-side performance never plateaued. Per 100k-timestep bin over the 904
+logged episodes, `terminal_score` runs -0.082, 0.099, 0.307, 0.279, 0.267,
+0.362, 0.353, 0.377, 0.408 and `success_rate` runs 0.541 to 0.754. The budget
+stopped the run mid-learning, which is the strongest argument for the
+throughput work listed below.
+
+The remaining loss is dropout-dominated. At 800k and later the per-episode
+decomposition is compliant +0.754, delay -0.081, dropout -0.280. Delayed count
+halved from 196 to 97 across the run while dropout count stayed flat between
+128 and 135 from 200k onward: PPO learned to shorten delays and did not learn
+to avoid dropouts.
+
+### Holdout selection signal is noise-dominated
+
+`holdout_selection.csv` marks 600k as best with (0.2613, 0.1650, 1.0500). The
+eleven evaluations from 300k onward have mean -0.02 and standard deviation
+0.16, and adjacent checkpoints swing by up to 0.37 (600k to 650k). The best
+pick sits about 1.7 sigma above that mean, which noise alone explains.
+
+The cause is the sample size, not the metric. `FixedHoldoutEvalCallback` slices
+`scenarios[:selection_count]` (`holdout_model_selection.py:100`) and the run
+passed `--holdout-selection-count 5`, so every holdout point averaged five of
+the twenty available scenarios. `data/fixed_eval_scenarios.json` holds twenty
+913-block scenarios on seeds 1000-1019 built from the eleven holdout ships, so
+fifteen scenarios of genuine generalization signal were discarded at every
+evaluation.
+
+### Next work, in order
+
+1. `raw-direct` step-matched baseline. Run `--timesteps 833368` with no
+   `--max-training-seconds`, every other hyperparameter identical to
+   `configs/improved_cnn_6h_seed0.json`, and a separate Drive output root. The
+   arms differ in per-step observation cost, so a wall-clock budget would
+   confound algorithm quality with observation cost; report both axes.
+2. Comparison protocol. Do not compare `best_model.sb3` across arms while it is
+   selected from five scenarios. Evaluate each arm's final checkpoint on all
+   twenty fixed holdout scenarios and compare paired per-seed differences, which
+   cancels scenario difficulty. Optionally average each arm's last three
+   checkpoints to damp checkpoint noise.
+3. Raise `--holdout-selection-count` to 20 for future runs.
+4. Training-configuration backlog, deferred until after the baseline. Env step
+   throughput first: `_get_obs` runs `determine_placement_position` for all ten
+   workspaces every step. Then `n_steps` 120 to 240-360 with `n_epochs` 5 to 3-4
+   or an added `target_kl`, since a 913-step episode is currently split across
+   eight rollouts under `gamma=1.0`. Then refresh the Stage 1 dataset from a
+   mid-training policy, because it is collected only by random-valid and
+   greedy-area policies. Supporting measurements: GPU and RAM sat near 10 per
+   cent utilisation, one observation is 640 KB (`grids` is 10x4x64x64 float32),
+   and the rollout buffer is about 614 MB at `n_steps=120`, so raising
+   `n_steps` is affordable now while shrinking the grid dtype would change
+   observation schema 4 and break checkpoint compatibility.
+5. Dropout-focused investigation, since dropouts carry 78 per cent of the
+   remaining score loss and PPO did not reduce them after 200k.
 
 The Stage 1 acceptance gate requires all finite metrics, held-out improvement
 over scalar-only/constant baselines, shuffled-grid degradation, and a
