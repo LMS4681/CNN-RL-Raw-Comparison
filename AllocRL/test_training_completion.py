@@ -17,6 +17,10 @@ from comparison.training_completion import (
     validate_training_completion,
     write_training_completion,
 )
+from comparison.training_log_validation import (
+    prune_rolled_back_rows,
+    read_curve_log,
+)
 from comparison.wall_clock_callback import (
     ProgressTimingRow,
     WallClockState,
@@ -712,3 +716,89 @@ def test_finalize_durable_write_failure_reruns_without_learning(
     )
     assert receipt["finalization_mode"] == "recovered_complete_state"
     assert learn_calls == []
+
+
+def _training_row(episode: int, timestep: int) -> str:
+    return f"{episode},{timestep},0,0,0.2,0,3,1,4,0.5\n"
+
+
+def test_prune_removes_rows_a_resume_rolled_back(tmp_path):
+    path = tmp_path / "training_log.csv"
+    path.write_text(
+        TRAINING_LOG_HEADER
+        + _training_row(1, 100)
+        + _training_row(2, 200)
+        + _training_row(3, 300),
+        encoding="utf-8",
+        newline="",
+    )
+
+    discarded = prune_rolled_back_rows(
+        path, "training_log", resume_timestep=200
+    )
+
+    assert discarded == 1
+    assert [row["timestep"] for row in read_curve_log(path, "training_log")] == [
+        "100",
+        "200",
+    ]
+
+
+def test_prune_heals_a_log_that_already_regressed(tmp_path):
+    path = tmp_path / "training_log.csv"
+    path.write_text(
+        TRAINING_LOG_HEADER
+        + _training_row(1, 100)
+        + _training_row(2, 200)
+        + _training_row(3, 300)
+        + _training_row(4, 150)
+        + _training_row(5, 250),
+        encoding="utf-8",
+        newline="",
+    )
+    with pytest.raises(ValueError, match="timestep regresses"):
+        read_curve_log(path, "training_log")
+
+    discarded = prune_rolled_back_rows(path, "training_log")
+
+    assert discarded == 2
+    rows = read_curve_log(path, "training_log")
+    assert [row["timestep"] for row in rows] == ["100", "150", "250"]
+    assert [row["episode"] for row in rows] == ["1", "4", "5"]
+
+
+def test_prune_leaves_an_exact_log_byte_identical(tmp_path):
+    path = tmp_path / "loss_log.csv"
+    payload = (
+        LOSS_LOG_HEADER + "100,0,0,0,0,0,0,0,,,,\r\n200,0,0,0,0,0,0,0,,,,\r\n"
+    )
+    path.write_text(payload, encoding="utf-8", newline="")
+    original = path.read_bytes()
+
+    assert prune_rolled_back_rows(path, "loss_log", resume_timestep=200) == 0
+    assert path.read_bytes() == original
+
+
+def test_prune_preserves_retained_record_bytes(tmp_path):
+    path = tmp_path / "loss_log.csv"
+    path.write_text(
+        LOSS_LOG_HEADER
+        + "100,0,0,0,0,0,0,0,,,,\r\n"
+        + "300,0,0,0,0,0,0,0,,,,\r\n",
+        encoding="utf-8",
+        newline="",
+    )
+
+    assert prune_rolled_back_rows(path, "loss_log", resume_timestep=100) == 1
+    assert path.read_bytes() == (
+        LOSS_LOG_HEADER.encode("utf-8") + b"100,0,0,0,0,0,0,0,,,,\r\n"
+    )
+
+
+def test_prune_discards_only_an_unterminated_partial_tail(tmp_path):
+    path = tmp_path / "training_log.csv"
+    prefix = (TRAINING_LOG_HEADER + _training_row(1, 100)).encode("utf-8")
+    path.write_bytes(prefix + b"2,120")
+
+    assert prune_rolled_back_rows(path, "training_log") == 1
+    assert path.read_bytes() == prefix

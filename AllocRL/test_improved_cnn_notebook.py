@@ -174,7 +174,7 @@ def test_notebook_requires_l4_and_sufficient_cpu_ram_and_drive():
 def test_notebook_uses_clean_immutable_checkout_and_preserves_torch():
     source = "\n".join(code_cells())
     assert "https://github.com/LMS4681/CNN-RL-Raw-Comparison.git" in source
-    assert "scale-aware-cnn-6h-v6" in source
+    assert "scale-aware-cnn-6h-v7" in source
     assert '"--depth", "1"' in source
     assert '"status", "--porcelain"' in source
     assert "requirements-comparison.txt" in source
@@ -254,11 +254,31 @@ def test_notebook_uses_separate_drive_roots_and_displays_receipts():
     assert "resume command" in source.lower()
 
 
+def test_notebook_resyncs_the_dataset_when_drive_is_more_advanced():
+    source = "\n".join(code_cells())
+    assert "def dataset_progress_rank(root):" in source
+    assert "dataset_progress.json" in source and "dataset_manifest.json" in source
+    assert "if drive_rank > local_rank:" in source
+    assert "shutil.rmtree(LOCAL_DATASET, ignore_errors=True)" in source
+    assert "shutil.copytree(PRETRAINING_DATA_ROOT, LOCAL_DATASET)" in source
+    assert "not LOCAL_DATASET.exists()" not in source
+
+
+def test_notebook_discards_rolled_back_curve_rows_before_stage2():
+    source = "\n".join(code_cells())
+    assert "prune_rolled_back_rows" in source
+    assert "pre_prune_backup" in source
+    assert source.index("prune_rolled_back_rows") < source.index("ppo_command = [")
+    assert source.index("pretraining.two_stage_smoke") < source.index(
+        "prune_rolled_back_rows"
+    )
+
+
 def test_readme_documents_l4_and_new_pinned_notebook_url():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "GPU type: L4" in readme
     assert "six PPO hours" in readme
-    assert "scale-aware-cnn-6h-v6/notebooks/improved_cnn_6h.ipynb" in readme
+    assert "scale-aware-cnn-6h-v7/notebooks/improved_cnn_6h.ipynb" in readme
 
 
 def test_stage2_cell_streams_logs_and_reports_durable_progress():
@@ -456,7 +476,7 @@ def test_final_cell_is_standalone_read_only_resume_diagnostic():
     source = "".join(final_cell["source"])
 
     assert final_cell["cell_type"] == "code"
-    assert "=== PPO RESUME DIAGNOSTIC V6 ===" in source
+    assert "=== PPO RESUME DIAGNOSTIC V7 ===" in source
     for term in (
         'Path("/content/CNN-RL-Raw-Comparison")',
         'Path("/content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0")',

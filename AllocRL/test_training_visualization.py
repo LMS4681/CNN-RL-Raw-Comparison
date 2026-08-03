@@ -281,6 +281,47 @@ class TrainingVisualizationTests(unittest.TestCase):
 
         self.assertEqual(["7"], [row["episode"] for row in rows])
 
+    def test_allocation_log_resume_drops_rolled_back_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "training_log.csv"
+            with path.open("w", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                writer.writerow(AllocationCallback.CSV_COLUMNS)
+                for episode, timestep in ((7, 700), (8, 800), (9, 900)):
+                    writer.writerow(
+                        [episode, timestep, 0.1, 0.0, 0.1, 0.1, 0, 0, 0, 1.0]
+                    )
+
+            callback = AllocationCallback(tmpdir, verbose=0, append=True)
+            callback.model = SimpleNamespace(num_timesteps=800)
+            callback._on_training_start()
+            episode_count = callback._episode_count
+            callback._on_training_end()
+
+            with path.open(encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+
+        self.assertEqual(["700", "800"], [row["timestep"] for row in rows])
+        self.assertEqual(8, episode_count)
+
+    def test_training_metrics_resume_drops_rolled_back_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = TrainingMetricsCsvWriter(tmpdir)
+            first.write({"train/loss": 1.0}, {}, step=10)
+            first.write({"train/loss": 0.9}, {}, step=20)
+            first.close()
+
+            resumed = TrainingMetricsCsvWriter(
+                tmpdir, append=True, resume_timestep=10
+            )
+            resumed.write({"train/loss": 0.5}, {}, step=15)
+            resumed.close()
+
+            with open(Path(tmpdir) / "loss_log.csv", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+
+        self.assertEqual(["10", "15"], [row["timestep"] for row in rows])
+
     def test_plot_training_curves_creates_quality_axes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)

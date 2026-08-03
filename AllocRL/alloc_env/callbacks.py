@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-from comparison.training_log_validation import read_curve_log
+from comparison.training_log_validation import prune_rolled_back_rows
 import torch
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import KVWriter
@@ -24,6 +24,16 @@ from .simulator import SimulationResult
 
 DELAY_THRESHOLD = 2
 DROPOUT_THRESHOLD = 7
+
+
+def _resumed_timestep(model: Any) -> Optional[int]:
+    """Timestep a resumed model restarts from, or None when unavailable."""
+    value = getattr(model, "num_timesteps", None)
+    try:
+        timestep = int(value)
+    except (TypeError, ValueError):
+        return None
+    return timestep if timestep > 0 else None
 
 
 class CnnDiagnosticTracker:
@@ -126,7 +136,12 @@ class TrainingMetricsCsvWriter(KVWriter):
         ),
     ]
 
-    def __init__(self, log_dir: str, append: bool = False):
+    def __init__(
+        self,
+        log_dir: str,
+        append: bool = False,
+        resume_timestep: Optional[int] = None,
+    ):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._csv_path = self.log_dir / "loss_log.csv"
@@ -136,10 +151,10 @@ class TrainingMetricsCsvWriter(KVWriter):
             and self._csv_path.stat().st_size > 0
         )
         if append_existing:
-            read_curve_log(
+            prune_rolled_back_rows(
                 self._csv_path,
                 "loss_log",
-                repair_trailing_partial=True,
+                resume_timestep=resume_timestep,
             )
         expected_header = [
             "timestep", *[column for _, column in self.METRIC_COLUMNS]
@@ -202,7 +217,9 @@ class TrainingMetricsCallback(BaseCallback):
 
     def _on_training_start(self) -> None:
         self._writer = TrainingMetricsCsvWriter(
-            self.log_dir, append=self.append
+            self.log_dir,
+            append=self.append,
+            resume_timestep=_resumed_timestep(getattr(self, "model", None)),
         )
         self.model.logger.output_formats.append(self._writer)
         if self.verbose:
@@ -291,10 +308,10 @@ class AllocationCallback(BaseCallback):
             and self._csv_path.stat().st_size > 0
         )
         if append_existing:
-            read_curve_log(
+            prune_rolled_back_rows(
                 self._csv_path,
                 "training_log",
-                repair_trailing_partial=True,
+                resume_timestep=_resumed_timestep(getattr(self, "model", None)),
             )
         if append_existing:
             with self._csv_path.open(

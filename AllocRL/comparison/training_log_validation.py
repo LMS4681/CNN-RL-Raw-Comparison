@@ -63,7 +63,21 @@ def _finite(value: str, field: str, kind: CurveLogKind) -> None:
         raise ValueError(f"{kind}.{field} must be a finite number")
 
 
-def _physical_records(raw: bytes, kind: CurveLogKind) -> list[list[str]]:
+def _physical_record(line: str, kind: CurveLogKind) -> list[str]:
+    if line.endswith("\r"):
+        line = line[:-1]
+    if "\r" in line:
+        raise ValueError(f"{kind} contains an invalid physical record")
+    try:
+        parsed = list(csv.reader([line], strict=True))
+    except csv.Error as error:
+        raise ValueError(f"{kind} contains malformed CSV") from error
+    if len(parsed) != 1:
+        raise ValueError(f"{kind} contains malformed CSV")
+    return parsed[0]
+
+
+def _physical_lines(raw: bytes, kind: CurveLogKind) -> list[str]:
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -73,20 +87,13 @@ def _physical_records(raw: bytes, kind: CurveLogKind) -> list[list[str]]:
         physical.pop()
     if not physical or any(line == "" for line in physical):
         raise ValueError(f"{kind} contains a blank or missing physical record")
-    records: list[list[str]] = []
-    for line in physical:
-        if line.endswith("\r"):
-            line = line[:-1]
-        if "\r" in line:
-            raise ValueError(f"{kind} contains an invalid physical record")
-        try:
-            parsed = list(csv.reader([line], strict=True))
-        except csv.Error as error:
-            raise ValueError(f"{kind} contains malformed CSV") from error
-        if len(parsed) != 1:
-            raise ValueError(f"{kind} contains malformed CSV")
-        records.append(parsed[0])
-    return records
+    return physical
+
+
+def _physical_records(raw: bytes, kind: CurveLogKind) -> list[list[str]]:
+    return [
+        _physical_record(line, kind) for line in _physical_lines(raw, kind)
+    ]
 
 
 def _parse(raw: bytes, kind: CurveLogKind) -> list[dict[str, str]]:
@@ -195,3 +202,96 @@ def read_curve_log(
     raise ValueError(
         f"{kind} contains a valid but physically unterminated final record"
     )
+
+
+def _timestep_of(record: list[str], columns: tuple[str, ...], kind: CurveLogKind) -> int:
+    if len(record) != len(columns):
+        raise ValueError(f"{kind} has malformed row")
+    text = record[columns.index("timestep")]
+    if _CANONICAL_INTEGER.fullmatch(text) is None:
+        raise ValueError(f"{kind}.timestep must be a canonical integer")
+    return int(text)
+
+
+def prune_rolled_back_rows(
+    path: str | Path,
+    kind: CurveLogKind,
+    *,
+    resume_timestep: int | None = None,
+    repair_trailing_partial: bool = True,
+) -> int:
+    """Drop rolled-back rows so an append after resume stays monotonic.
+
+    A resumed run restarts from its last checkpoint, so rows already logged
+    past that timestep describe steps the resume discarded; appending after
+    them would make ``timestep`` regress. Rows above ``resume_timestep`` and
+    any row a later row undercuts are removed. Retained records keep their
+    original bytes, and the rewritten log is validated before replacement.
+    Returns the number of discarded rows.
+    """
+    if kind not in _COLUMNS:
+        raise ValueError(f"unknown curve log kind: {kind}")
+    columns = _COLUMNS[kind]
+    requested = Path(path)
+    try:
+        source = resolve_direct_regular_file(
+            requested.parent,
+            requested,
+            label=kind,
+        )
+        raw = source.read_bytes()
+    except (OSError, ValueError) as error:
+        if isinstance(error, ValueError) and str(error).startswith(kind):
+            raise
+        raise ValueError(f"{kind} cannot be read") from error
+
+    body = raw
+    discarded_partial = 0
+    if not raw.endswith(b"\n"):
+        split = raw.rfind(b"\n")
+        suffix = raw[split + 1 :]
+        complete_final = False
+        if split >= 0 and suffix and b"\r" not in suffix:
+            try:
+                _timestep_of(
+                    _physical_record(suffix.decode("utf-8"), kind),
+                    columns,
+                    kind,
+                )
+                complete_final = True
+            except (UnicodeDecodeError, ValueError):
+                complete_final = False
+        if complete_final:
+            body = raw + b"\n"
+        elif repair_trailing_partial and split >= 0:
+            body = raw[: split + 1]
+            discarded_partial = 1
+        else:
+            raise ValueError(f"{kind} has no exact-valid repair prefix")
+
+    lines = _physical_lines(body, kind)
+    if tuple(_physical_record(lines[0], kind)) != columns:
+        raise ValueError(f"{kind} has incompatible header")
+    timesteps = [
+        _timestep_of(_physical_record(line, kind), columns, kind)
+        for line in lines[1:]
+    ]
+
+    ceiling = float("inf")
+    if resume_timestep is not None and resume_timestep > 0:
+        ceiling = int(resume_timestep)
+    retained = [False] * len(timesteps)
+    minimum_right: float = ceiling
+    for index in reversed(range(len(timesteps))):
+        if timesteps[index] <= minimum_right:
+            retained[index] = True
+            minimum_right = timesteps[index]
+
+    payload = "\n".join(
+        [lines[0], *[line for line, keep in zip(lines[1:], retained) if keep]]
+    ).encode("utf-8") + b"\n"
+    if payload == raw:
+        return 0
+    _parse(payload, kind)
+    _atomic_replace_bytes(source, payload)
+    return retained.count(False) + discarded_partial
