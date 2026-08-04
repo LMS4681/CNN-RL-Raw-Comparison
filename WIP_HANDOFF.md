@@ -525,9 +525,33 @@ that mean. Never rank arms by `best_model.sb3`.
 A published chart of both curves is at
 `https://claude.ai/code/artifact/d21e3442-3332-4412-9192-7567ba2ebb75`.
 
-### Immediate next task: the comparison script
+### The comparison script
 
-Not yet written. The design is settled; do not rebuild what already exists.
+Written and unit-tested: `comparison/arm_comparison.py`, tests in
+`AllocRL/test_arm_comparison.py` (9 pass). It resolves the largest common
+regular checkpoint, evaluates both arms there on the twenty fixed scenarios,
+and reports paired per-seed differences with a seeded percentile bootstrap
+interval, headlining the fifteen primary-test seeds.
+
+Run it in Colab once the raw-direct arm reaches 830,000. The training
+notebook's checkout is pinned to a tag that predates this module, so clone
+`main` separately:
+
+```bash
+git clone https://github.com/LMS4681/CNN-RL-Raw-Comparison.git /content/compare
+cd /content/compare/AllocRL
+python -m comparison.arm_comparison \
+  --raw-dir /content/drive/MyDrive/CNN-RL-improved/raw-direct-830k-seed0/ppo \
+  --cnn-dir /content/drive/MyDrive/CNN-RL-improved/scale-aware-cnn-6h-seed0/ppo \
+  --scenarios ./data/fixed_eval_scenarios.json \
+  --output-dir /content/drive/MyDrive/CNN-RL-improved/comparison-830k
+```
+
+It writes `arm_comparison_rows.csv` and `arm_comparison_summary.json` and
+prints the paired report. Evaluation loads both models on CPU and runs forty
+913-decision episodes, so expect a few minutes.
+
+The rest of this subsection records why it is built this way.
 
 `comparison/checkpoint_evaluator.py` already provides
 `readable_checkpoint_inventory`, `select_common_timestep`, and

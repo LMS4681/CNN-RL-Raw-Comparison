@@ -135,7 +135,8 @@ zero overall, as v7 did.
 
 ## Comparison Protocol
 
-The comparison uses the low-level evaluator functions, which need no receipts:
+Implemented in `comparison/arm_comparison.py`, which orchestrates the
+low-level evaluator functions. They need no receipts:
 
 1. `select_common_timestep(raw_dir, cnn_dir)` fixes the shared checkpoint.
 2. `evaluate_checkpoint` evaluates each arm on all twenty fixed scenarios,
