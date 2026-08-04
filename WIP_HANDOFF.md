@@ -533,9 +533,16 @@ regular checkpoint, evaluates both arms there on the twenty fixed scenarios,
 and reports paired per-seed differences with a seeded percentile bootstrap
 interval, headlining the fifteen primary-test seeds.
 
-Run it in Colab once the raw-direct arm reaches 830,000. The training
-notebook's checkout is pinned to a tag that predates this module, so clone
-`main` separately:
+`notebooks/arm_comparison.ipynb` drives it from Colab and deliberately tracks
+`main` rather than a tag, because it is an analysis tool rather than part of an
+immutable training release:
+
+```text
+https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/main/notebooks/arm_comparison.ipynb
+```
+
+To run it by hand instead, clone `main` separately, since the training
+notebook's checkout is pinned to a tag that predates this module:
 
 ```bash
 git clone https://github.com/LMS4681/CNN-RL-Raw-Comparison.git /content/compare
