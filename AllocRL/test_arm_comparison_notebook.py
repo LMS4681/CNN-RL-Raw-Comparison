@@ -52,9 +52,18 @@ def test_notebook_uses_a_separate_main_checkout_with_the_locked_dependencies():
     assert "/content/CNN-RL-Raw-Comparison" not in source
 
 
-def test_notebook_reports_the_primary_test_partition_as_the_headline():
+def test_notebook_sweeps_several_checkpoints_in_one_inventory_pass():
+    source = "\n".join(code_cells())
+    assert "TIMESTEPS = [200_000, 400_000, 600_000, 830_000]" in source
+    assert 'command += ["--timestep", str(step)]' in source
+    assert source.count('"-m", "comparison.arm_comparison"') == 1
+
+
+def test_notebook_reports_the_primary_test_partition_and_the_trend():
     source = "\n".join(code_cells())
     assert 'summary["partitions"]["primary_test"]' in source
+    assert "terminal score trend" in source
+    assert "arm_comparison_summary_" in source
     assert "bootstrap_ci_95" in source
     assert "seeds_favouring_candidate" in source
     assert "excludes 0" in source

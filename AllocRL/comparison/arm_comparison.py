@@ -28,7 +28,6 @@ from comparison.checkpoint_evaluator import (
     PartialResultError,
     evaluate_checkpoint,
     readable_checkpoint_inventory,
-    select_common_timestep,
 )
 
 
@@ -45,29 +44,46 @@ BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_SEED = 20260803
 
 
-def resolve_common_checkpoints(
+def checkpoint_inventories(
     raw_dir: str | Path,
     cnn_dir: str | Path,
     *,
-    timestep: int | None = None,
     model_loader=None,
-) -> tuple[int, dict[str, Path]]:
-    """Fix the shared checkpoint both arms actually reached."""
+) -> dict[str, dict[int, Path]]:
+    """Read both arms' regular checkpoints once.
+
+    Every archive is opened to read its stored timestep, so this is the slow
+    step; callers comparing several timesteps must reuse one result.
+    """
     kwargs = {} if model_loader is None else {"model_loader": model_loader}
-    inventories = {
+    return {
         BASELINE_ARM: readable_checkpoint_inventory(Path(raw_dir), **kwargs),
         CANDIDATE_ARM: readable_checkpoint_inventory(Path(cnn_dir), **kwargs),
     }
-    if timestep is None:
-        common = select_common_timestep(Path(raw_dir), Path(cnn_dir), **kwargs)
-    else:
-        common = int(timestep)
-        missing = [arm for arm, found in inventories.items() if common not in found]
+
+
+def resolve_targets(
+    inventories: Mapping[str, Mapping[int, Path]],
+    timesteps: Sequence[int] | None = None,
+) -> list[tuple[int, dict[str, Path]]]:
+    """Fix the checkpoints to compare, defaulting to the largest shared one."""
+    shared = sorted(
+        set(inventories[BASELINE_ARM]) & set(inventories[CANDIDATE_ARM])
+    )
+    if not shared:
+        raise PartialResultError("no common readable regular checkpoint timestep")
+    requested = [max(shared)] if not timesteps else sorted({int(t) for t in timesteps})
+    targets = []
+    for timestep in requested:
+        missing = [arm for arm, found in inventories.items() if timestep not in found]
         if missing:
             raise PartialResultError(
-                f"requested timestep {common} is missing for: {', '.join(missing)}"
+                f"requested timestep {timestep} is missing for: {', '.join(missing)}"
             )
-    return common, {arm: found[common] for arm, found in inventories.items()}
+        targets.append(
+            (timestep, {arm: found[timestep] for arm, found in inventories.items()})
+        )
+    return targets
 
 
 def bootstrap_ci(
@@ -124,7 +140,8 @@ def summarize(rows: Sequence[Mapping]) -> dict:
         "candidate_arm": CANDIDATE_ARM,
         "checkpoints": {
             arm: {
-                "file": next(iter(seeds.values()))["checkpoint"],
+                "label": next(iter(seeds.values()))["checkpoint"],
+                "file": None,
                 "sha256": next(iter(seeds.values()))["checkpoint_sha256"],
             }
             for arm, seeds in indexed.items()
@@ -176,11 +193,15 @@ def write_rows(path: str | Path, rows: Sequence[Mapping]) -> None:
             writer.writerow({key: row[key] for key in EVALUATION_COLUMNS})
 
 
+def _checkpoint_name(reference: Mapping) -> str:
+    return reference.get("file") or reference["label"]
+
+
 def format_report(summary: Mapping) -> str:
     lines = [
         f"common checkpoint timestep: {summary['common_timestep']}",
-        f"  {BASELINE_ARM:<14} {summary['checkpoints'][BASELINE_ARM]['file']}",
-        f"  {CANDIDATE_ARM:<14} {summary['checkpoints'][CANDIDATE_ARM]['file']}",
+        f"  {BASELINE_ARM:<14} {_checkpoint_name(summary['checkpoints'][BASELINE_ARM])}",
+        f"  {CANDIDATE_ARM:<14} {_checkpoint_name(summary['checkpoints'][CANDIDATE_ARM])}",
         "",
         "candidate_cnn minus raw_direct, paired by scenario seed",
     ]
@@ -210,23 +231,44 @@ def compare_arms(
     cnn_dir: str | Path,
     scenarios: Sequence[dict],
     *,
-    timestep: int | None = None,
+    timesteps: Sequence[int] | None = None,
     evaluate: Callable[..., list[dict]] = evaluate_checkpoint,
     model_loader=None,
-) -> tuple[list[dict], dict]:
-    """Evaluate both arms at the common checkpoint and pair the results."""
-    common, checkpoints = resolve_common_checkpoints(
-        raw_dir, cnn_dir, timestep=timestep, model_loader=model_loader
-    )
+) -> list[dict]:
+    """Evaluate both arms at each requested checkpoint and pair the results."""
+    inventories = checkpoint_inventories(raw_dir, cnn_dir, model_loader=model_loader)
     from train import load_model_run_config
 
-    rows: list[dict] = []
-    for arm, checkpoint in checkpoints.items():
-        run_config = load_model_run_config(checkpoint)
-        rows.extend(
-            evaluate(checkpoint, run_config, list(scenarios), "common_step", arm)
-        )
-    return rows, summarize(rows)
+    results = []
+    for timestep, checkpoints in resolve_targets(inventories, timesteps):
+        rows: list[dict] = []
+        for arm, checkpoint in checkpoints.items():
+            run_config = load_model_run_config(checkpoint)
+            rows.extend(
+                evaluate(checkpoint, run_config, list(scenarios), "common_step", arm)
+            )
+        summary = summarize(rows)
+        for arm, checkpoint in checkpoints.items():
+            summary["checkpoints"][arm]["file"] = checkpoint.name
+        results.append({"timestep": timestep, "rows": rows, "summary": summary})
+    return results
+
+
+def format_trend(results: Sequence[Mapping]) -> str:
+    """One line per timestep, so a late-training artefact is visible at a glance."""
+    lines = ["timestep   metric               diff        95% CI                 cnn better"]
+    for result in results:
+        headline = result["summary"]["partitions"]["primary_test"]
+        for key in METRIC_KEYS:
+            values = headline["paired"][key]
+            low, high = values["bootstrap_ci_95"]
+            lines.append(
+                f"{result['timestep']:<10} {key:<20} {values['mean_difference']:+.4f}"
+                f"  [{low:+.4f}, {high:+.4f}]"
+                f"  {values['seeds_favouring_candidate']:>2}/{values['seed_count']}"
+                + ("" if values["excludes_zero"] else "  (includes 0)")
+            )
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -237,7 +279,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cnn-dir", type=Path, required=True)
     parser.add_argument("--scenarios", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--timestep", type=int, default=None)
+    parser.add_argument(
+        "--timestep",
+        type=int,
+        action="append",
+        default=None,
+        help="repeatable; defaults to the largest shared checkpoint",
+    )
     args = parser.parse_args(argv)
 
     from evaluation_scenarios import read_scenarios
@@ -246,15 +294,20 @@ def main(argv: list[str] | None = None) -> int:
     scenarios = read_scenarios(args.scenarios)
     validate_fixed_holdout_scenarios(scenarios)
 
-    rows, summary = compare_arms(
-        args.raw_dir, args.cnn_dir, scenarios, timestep=args.timestep
+    results = compare_arms(
+        args.raw_dir, args.cnn_dir, scenarios, timesteps=args.timestep
     )
     output_dir = Path(args.output_dir)
-    write_rows(output_dir / "arm_comparison_rows.csv", rows)
-    (output_dir / "arm_comparison_summary.json").write_text(
-        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-    )
-    print(format_report(summary))
+    for result in results:
+        timestep = result["timestep"]
+        write_rows(output_dir / f"arm_comparison_rows_{timestep}.csv", result["rows"])
+        (output_dir / f"arm_comparison_summary_{timestep}.json").write_text(
+            json.dumps(result["summary"], indent=2) + "\n", encoding="utf-8"
+        )
+        print(format_report(result["summary"]))
+        print()
+    if len(results) > 1:
+        print(format_trend(results))
     return 0
 
 
