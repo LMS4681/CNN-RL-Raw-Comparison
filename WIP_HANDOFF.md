@@ -1,6 +1,6 @@
 # Raw observation vs CNN comparison: code and experiment handoff
 
-Updated: 2026-08-03 17:20 (Asia/Seoul)
+Updated: 2026-08-27 (Asia/Seoul)
 
 ## 2026-07-22 scale-aware two-stage CNN release
 
@@ -722,3 +722,83 @@ https://colab.research.google.com/github/LMS4681/CNN-RL-Raw-Comparison/blob/scal
 
 That URL is not usable until the implementation is complete and the tag has
 been pushed. The existing r4 run and `overnight-v1` release remain untouched.
+
+## 2026-08-27 analysis handoff: is the CNN arm really behind, and what next
+
+This session was a code-only analysis on a machine without the Drive data. No
+source code changed. The user's provisional observation from the Colab runs is
+that the candidate-CNN/MLP arm learns more slowly than raw-direct; this section
+records how far that conclusion actually holds, and the agreed next steps.
+
+### Conclusions of the analysis
+
+Split "slower" into three axes; they have different answers.
+
+1. Wall-clock throughput: candidate-CNN is genuinely slower, 38.58 vs 44.4
+   steps/s (~13 per cent), plus Stage 1 pretraining time outside the PPO
+   budget. The environment observation cost is identical between arms:
+   `_get_obs` (`alloc_env/alloc_env.py:774`) always runs
+   `determine_placement_position` for all ten workspaces and renders the
+   640 KB `grids` tensor, and raw-direct merely discards `grids` inside
+   `RawDirectExtractor`. The whole gap is CNN forward/backward cost.
+2. Early sample efficiency: the raw-direct lead early in training is by
+   design, not a defect. The extractor is frozen for the first 50,000 PPO
+   timesteps and then fine-tuned at 0.1x the policy LR. The genuinely
+   pathological case was the earlier joint-from-scratch run (approx_kl
+   0.48-0.95, clip_fraction 0.67, negative explained_variance); the two-stage
+   pretraining already fixed that.
+3. Final performance: undecided. The v7 curve was still rising at 833k
+   (0.36 to 0.41 over the last 300k), the budget cut the run mid-learning,
+   and both arms are single-seed. Neither superiority claim is supported.
+
+The deepest code-level cause is a reward/information mismatch: the CNN's
+extra information targets spatial fragmentation and therefore dropout
+avoidance, but reward schema 2 never scores fragmentation directly, and
+dropout counts stayed flat at 128-135 from 200k onward while delays halved.
+The CNN pays its representation cost without a reward-visible payoff inside
+this budget. Secondary causes: 913-step episodes split across eight rollouts
+under gamma=1.0 (high-variance credit assignment hits the 910k-parameter arm
+harder), Stage 1 data collected only by random-valid/greedy-area policies,
+and holdout selection noise from slicing 5 of 20 scenarios (std 0.16,
+adjacent checkpoints swing up to 0.37).
+
+Correct wording for any report: raw-direct leads on wall-clock and early
+sample efficiency; "the CNN approach is inferior" is not established. If the
+paired comparison confirms a step-matched gap, say "the representation cost
+was not recovered under this reward structure and budget".
+
+### Decision: a design spec is required, but one step comes first
+
+Step 1 — verdict on the data. Fetch the committed comparison outputs from
+Drive (`arm_comparison_summary.json`, `arm_comparison_rows.csv`, and the
+multi-checkpoint sweep results under
+`MyDrive/CNN-RL-improved/comparison-830k` or its sibling roots) and judge,
+using the seeded bootstrap interval over the fifteen primary-test paired
+differences, whether the CNN deficit is a real effect or noise. This verdict
+is the premise of the spec.
+
+Step 2 — write the design spec in `docs/superpowers/specs/` (brainstorming
+first, then spec, then plan, per this repository's workflow). The spec must
+cover: goals and non-goals; which backlog items from the 2026-08-03 section
+are adopted and why; a one-variable-at-a-time ablation ladder so reward
+shaping, n_steps/n_epochs, Stage 1 data refresh, and env speedup never
+confound each other; the compatibility boundary (grid dtype or observation
+field changes mean schema 5 and orphan every existing checkpoint; any reward
+change invalidates all score comparisons to date); per-experiment success
+criteria; and the seed/budget protocol.
+
+Priority branches on the Step 1 verdict:
+
+- real deficit: learning-signal work first — dropout-directed shaping via the
+  existing resolved-reward path or keeping Stage 1 auxiliary heads as
+  auxiliary losses during PPO, then n_steps 120 to 240-360 with n_epochs 5 to
+  3-4 or target_kl;
+- noise: evaluation strengthening first — 20-scenario holdout selection (the
+  code currently rejects any value but 5) and multi-seed runs — plus env step
+  throughput, including skipping `grids` construction for the raw-direct arm,
+  which also makes the wall-clock axis honest.
+
+Rules that still bind: never move the immutable tags
+(`scale-aware-cnn-6h-v7`, `raw-direct-830k-v1`, `overnight-v1`); never rank
+arms by `best_model.sb3` while selection uses five scenarios; the marker-free
+step-bounded arm cannot go through the staged `experiment_runner` pipeline.
